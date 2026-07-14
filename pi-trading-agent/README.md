@@ -1,11 +1,12 @@
 # Raspberry Pi Trading Agent
 
-This project runs a small Lumibot strategy against an Alpaca account. It checks
-once per trading day whether **Asset B** has fallen by a configured percentage
-from its recent high. If that dip occurs and the account owns **Asset A**, the
-agent sells Asset A and uses the available cash to buy as much Asset B as
-possible (fractional shares by default; whole shares when
-`PORTFOLIO_FRACTIONAL_SHARES` is `false`).
+This project runs a small Lumibot strategy against an Alpaca account. By
+default it runs **portfolio mode**: it watches a small list of symbols for a
+configured percentage dip from their recent high and, when a comparable
+historical dip has reliably paid off, rotates cash into the best-qualifying
+one. A separate, simpler **asset-to-asset rotation** mode (Asset A → Asset B)
+is also available on its own, and portfolio mode also runs it internally as
+one labelled opportunity among its candidates.
 
 Start with Alpaca paper trading. Paper trading uses simulated money and is the
 appropriate place to learn how the agent behaves. Do not enable live trading
@@ -17,9 +18,131 @@ understand the risks.
 > worse price than expected. Software, internet, power, market-data, and broker
 > failures can all affect trading.
 
-## What the strategy does
+## Contents
 
-The default configuration uses:
+- [How the strategy trades](#how-the-strategy-trades)
+  - [Portfolio mode (default)](#portfolio-mode-default)
+  - [Asset-to-asset rotation mechanics](#asset-to-asset-rotation-mechanics)
+- [Project files](#project-files)
+- [Quick start](#quick-start)
+  - [What you need](#what-you-need)
+  - [Step 1: Create Alpaca paper credentials](#step-1-create-alpaca-paper-credentials)
+  - [Step 2: Prepare the Raspberry Pi](#step-2-prepare-the-raspberry-pi)
+  - [Step 3: Configure the agent](#step-3-configure-the-agent)
+  - [Step 4: Install and start the service](#step-4-install-and-start-the-service)
+  - [Step 5: Verify operation](#step-5-verify-operation)
+- [Optional features](#optional-features)
+  - [Daily email report](#daily-email-report)
+  - [World-event and news awareness](#world-event-and-news-awareness)
+  - [WallStreetBets context and discovery](#wallstreetbets-context-and-discovery)
+  - [Congressional-trading context](#congressional-trading-context)
+  - [LLM news assessment](#llm-news-assessment)
+  - [Adaptive news learning](#adaptive-news-learning)
+  - [Decision memory: learning from its own rotations](#decision-memory-learning-from-its-own-rotations)
+- [Operating the service](#operating-the-service)
+  - [Understanding common log messages](#understanding-common-log-messages)
+  - [Service commands](#service-commands)
+  - [Changing strategy settings](#changing-strategy-settings)
+- [Testing and going live](#testing-and-going-live)
+  - [Paper-trading test checklist](#paper-trading-test-checklist)
+  - [Live-trading warning](#live-trading-warning)
+- [Troubleshooting](#troubleshooting)
+- [Security guidance](#security-guidance)
+- [Maintenance](#maintenance)
+
+## How the strategy trades
+
+### Portfolio mode (default)
+
+Portfolio mode is the default. It only considers the
+symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
+its own. For every symbol it measures the current dip and the average
+next-session return after comparable historical dips. That average is reduced
+by `PORTFOLIO_ROUND_TRIP_COST_PERCENT` to account for estimated entry and exit
+costs. It also runs a chronological walk-forward check: each validation trade
+is selected only from earlier observations, never its own realised return. It
+opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
+historical estimate and the out-of-sample result meet their configured minimums
+with enough observations. Because that validation measures a next-session
+return, the default holding horizon is one trading-day interval; positions are
+sold after `PORTFOLIO_MAX_HOLDING_DAYS` unless a staged replacement sells them
+first. Cash is split among open slots.
+
+Once full, it replaces one holding only when a new candidate's historical
+expected return exceeds the weakest holding's by at least that same configured
+percentage. A holding that is not currently dipping is scored as a neutral
+`0%` expected edge (it is never force-rotated just because something else
+dipped).
+
+`PORTFOLIO_RISK_POSTURE` (`conservative` by default, or `risky`) reshapes how
+that ranking reads the same observations the agent already collects, without
+ever changing `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` itself or which
+candidates clear it in the first place. `conservative` favors a symbol with a
+steadier history — it penalizes return variance and a negative news-score day
+harder, and ignores WallStreetBets mentions as noise. `risky` favors raw
+historical edge — it barely discounts variance or a bad-news day, and adds a
+small bonus when a candidate is currently WSB-mentioned with bullish
+sentiment (a bearish WSB read is a small penalty either way). The adjustment
+is capped at ±3 percentage points, so it can reorder which qualifying
+candidate looks best and which holding looks weakest, but it can never turn a
+trade that fails the minimum-profit floor into one that passes.
+
+Replacements are staged like the A/B rotation described below: the old
+position sells first, the replacement is bought as soon as the sale fills
+(only its sale budget is spent), and the staged state clears only when the
+replacement purchase itself fills, so restarts, rejections, and network drops
+cannot strand the cash. The strategy manages only symbols explicitly listed in
+`PORTFOLIO_SYMBOLS` plus discovery symbols it previously persisted after they
+qualified; it never adopts or sells unrelated stocks in the same Alpaca
+account. Managed holdings always stay in the daily evaluation universe, so a
+position bought by the strategy can never become invisible to it. The
+world-event keyword guard, the optional LLM assessment, and the
+mature adaptive-news forecast can each veto a *new* portfolio purchase or
+replacement exactly as they veto an A/B rotation; completing an in-flight
+replacement is never vetoed. This estimated historical return is not a real or
+guaranteed profit; it is a filter for paper-trading and must be validated before
+any live use.
+
+Within portfolio mode, the A/B rotation mechanics described below are
+evaluated separately as an **Opportunistic Opportunity**. When Asset B has
+dipped and Asset A is held, the agent uses settled prior A/B observations to
+estimate the chance that B will beat A next session. Its probability is
+Laplace-smoothed: `(wins + 1) / (prior observations + 2)`. It can rotate A
+into B only after decision memory is mature, the predicted B-minus-A edge
+meets the normal profit threshold, and the probability meets
+`PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by default). It is reported
+separately from ordinary portfolio candidates, so it does not turn the two
+systems into interchangeable ranking signals.
+
+For a small account funded in roughly $50 increments, start with one position
+and fractional shares. The default portfolio settings reserve $2 for price
+movement and only submit an order of at least $5. When a later deposit arrives
+and the current top signal still qualifies, the agent adds fractional shares to
+that holding rather than leaving the deposit idle. Alpaca must support
+fractional trading for the account and symbol.
+
+`PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
+uses the Alpaca asset directory (the paper or live host matching the
+configured trading mode) to rotate through a small batch of active, tradable
+US-equity symbols each day. A symbol becomes part of the persisted learned
+watchlist only after it passes the same historical-dip criteria; it is not
+traded merely because Alpaca lists it. Currently held symbols are re-confirmed
+in that learned list every day, so a holding is never trimmed out of the
+universe while it is still owned. The market-wide news guard remains in force.
+Discovery failure is fail-safe: the agent falls back to the static watchlist
+and places no discovery-driven order.
+
+Enable both settings only after observing the behavior in paper trading:
+
+```json
+"PORTFOLIO_ENABLED": true,
+"PORTFOLIO_AUTONOMOUS_DISCOVERY": true
+```
+
+### Asset-to-asset rotation mechanics
+
+Set `PORTFOLIO_ENABLED` to `false` to run this as the entire strategy instead
+of one signal inside portfolio mode. The default configuration uses:
 
 - Asset A: `SPY`
 - Asset B: `QQQ`
@@ -57,92 +180,6 @@ The agent does **not** automatically create the initial Asset A position. It
 also does not rotate from Asset B back into Asset A. After a completed A-to-B
 rotation, it will take no further rotation action unless Asset A is held again.
 
-### Portfolio mode (default)
-
-Portfolio mode is the default. It only considers the
-symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
-its own. For every symbol it measures the current dip and the average
-next-session return after comparable historical dips. That average is reduced
-by `PORTFOLIO_ROUND_TRIP_COST_PERCENT` to account for estimated entry and exit
-costs. It also runs a chronological walk-forward check: each validation trade
-is selected only from earlier observations, never its own realised return. It
-opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
-historical estimate and the out-of-sample result meet their configured minimums
-with enough observations. Because that validation measures a next-session
-return, the default holding horizon is one trading-day interval; positions are
-sold after `PORTFOLIO_MAX_HOLDING_DAYS` unless a staged replacement sells them
-first. Cash is split among open slots.
-
-Once full, it replaces one holding only when a new candidate's historical
-expected return exceeds the weakest holding's by at least that same configured
-percentage. A holding that is not currently dipping is scored as a neutral
-`0%` expected edge (it is never force-rotated just because something else
-dipped).
-
-`PORTFOLIO_RISK_POSTURE` (`conservative` by default, or `risky`) reshapes how
-that ranking reads the same observations the agent already collects, without
-ever changing `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` itself or which
-candidates clear it in the first place. `conservative` favors a symbol with a
-steadier history — it penalizes return variance and a negative news-score day
-harder, and ignores WallStreetBets mentions as noise. `risky` favors raw
-historical edge — it barely discounts variance or a bad-news day, and adds a
-small bonus when a candidate is currently WSB-mentioned with bullish
-sentiment (a bearish WSB read is a small penalty either way). The adjustment
-is capped at ±3 percentage points, so it can reorder which qualifying
-candidate looks best and which holding looks weakest, but it can never turn a
-trade that fails the minimum-profit floor into one that passes.
-
-Replacements are staged like the A/B rotation: the old position sells
-first, the replacement is bought as soon as the sale fills (only its sale
-budget is spent), and the staged state clears only when the replacement
-purchase itself fills, so restarts, rejections, and network drops cannot
-strand the cash. The strategy manages only symbols explicitly listed in
-`PORTFOLIO_SYMBOLS` plus discovery symbols it previously persisted after they
-qualified; it never adopts or sells unrelated stocks in the same Alpaca
-account. Managed holdings always stay in the daily evaluation universe, so a
-position bought by the strategy can never become invisible to it. The
-world-event keyword guard, the optional LLM assessment, and the
-mature adaptive-news forecast can each veto a *new* portfolio purchase or
-replacement exactly as they veto an A/B rotation; completing an in-flight
-replacement is never vetoed. This estimated historical return is not a real or
-guaranteed profit; it is a filter for paper-trading and must be validated before
-any live use.
-
-Within portfolio mode, the former A/B rotation is evaluated separately as an
-**Opportunistic Opportunity**. When Asset B has dipped and Asset A is held, the
-agent uses settled prior A/B observations to estimate the chance that B will
-beat A next session. Its probability is Laplace-smoothed: `(wins + 1) / (prior
-observations + 2)`. It can rotate A into B only after decision memory is mature,
-the predicted B-minus-A edge meets the normal profit threshold, and the
-probability meets `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by default).
-It is reported separately from ordinary portfolio candidates, so it does not
-turn the two systems into interchangeable ranking signals.
-
-For a small account funded in roughly $50 increments, start with one position
-and fractional shares. The default portfolio settings reserve $2 for price
-movement and only submit an order of at least $5. When a later deposit arrives
-and the current top signal still qualifies, the agent adds fractional shares to
-that holding rather than leaving the deposit idle. Alpaca must support
-fractional trading for the account and symbol.
-
-`PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
-uses the Alpaca asset directory (the paper or live host matching the
-configured trading mode) to rotate through a small batch of active, tradable
-US-equity symbols each day. A symbol becomes part of the persisted learned
-watchlist only after it passes the same historical-dip criteria; it is not
-traded merely because Alpaca lists it. Currently held symbols are re-confirmed
-in that learned list every day, so a holding is never trimmed out of the
-universe while it is still owned. The market-wide news guard remains in force.
-Discovery failure is fail-safe: the agent falls back to the static watchlist
-and places no discovery-driven order.
-
-Enable both settings only after observing the behavior in paper trading:
-
-```json
-"PORTFOLIO_ENABLED": true,
-"PORTFOLIO_AUTONOMOUS_DISCOVERY": true
-```
-
 ## Project files
 
 ```text
@@ -177,7 +214,9 @@ mode keeps its own equivalents: `.portfolio_rotation_state.json` for a staged
 replacement and `.autonomous_universe.json` for the discovery cursor and
 learned watchlist.
 
-## What you need
+## Quick start
+
+### What you need
 
 Before beginning, you need:
 
@@ -190,7 +229,7 @@ Before beginning, you need:
 The Pi should use reliable storage and power. An uninterruptible power supply
 is worth considering for a machine that may place real orders.
 
-## Step 1: Create Alpaca paper credentials
+### Step 1: Create Alpaca paper credentials
 
 1. Sign in to the Alpaca dashboard.
 2. Select the **paper trading** account, not the live account.
@@ -201,7 +240,7 @@ is worth considering for a machine that may place real orders.
 Paper and live accounts use different credentials. A paper key cannot trade the
 live account.
 
-## Step 2: Prepare the Raspberry Pi
+### Step 2: Prepare the Raspberry Pi
 
 Update the package lists and install Python's virtual-environment support:
 
@@ -216,7 +255,7 @@ Confirm that Python is available:
 python3 --version
 ```
 
-## Step 3: Configure the agent
+### Step 3: Configure the agent
 
 Move into the project directory:
 
@@ -302,7 +341,7 @@ Protect the file so only its owner can read and write it:
 chmod 600 config.json
 ```
 
-### Configuration reference
+#### Configuration reference
 
 | Setting | Meaning | Valid example |
 |---|---|---|
@@ -395,461 +434,7 @@ JSON is strict:
 The lookback is a number of market-data bars, not necessarily calendar days.
 Weekends and exchange holidays do not produce normal stock-market daily bars.
 
-## Optional daily email report
-
-Email reporting is initially disabled. Leaving it disabled does not affect
-trading. When enabled, the agent attempts to send one summary after its daily
-market evaluation. The report includes:
-
-- Evaluation date and time.
-- Asset A and Asset B symbols, prices, quantities, recent high, and calculated
-  dip when available (A/B mode), or current holdings, signal candidates, and
-  discovered symbols (portfolio mode).
-- The configured dip threshold.
-- News, LLM, and adaptive-learning summaries.
-- The action taken or the reason no action was taken.
-- Any caught evaluation error.
-
-For stock and ETF strategies, “once a day” means once on a day when Lumibot runs
-the scheduled market evaluation. A report is not normally expected on weekends
-or exchange holidays. Email delivery timing depends on the market schedule,
-internet connection, and mail provider.
-
-### Email setup using Gmail
-
-Do not place your normal Google account password in `config.json`. Google
-typically requires two-step verification and a separately generated app
-password for SMTP clients. Account menus and eligibility can vary, so consult
-Google's current account help if the App Passwords option is unavailable.
-
-With a Gmail app password, settings usually have this form:
-
-```json
-"EMAIL_REPORT_ENABLED": true,
-"EMAIL_SMTP_HOST": "smtp.gmail.com",
-"EMAIL_SMTP_PORT": 587,
-"EMAIL_SMTP_USERNAME": "your.address@gmail.com",
-"EMAIL_SMTP_PASSWORD": "YOUR_GOOGLE_APP_PASSWORD",
-"EMAIL_FROM_ADDRESS": "your.address@gmail.com",
-"EMAIL_TO_ADDRESS": "where.to.send@example.com",
-"EMAIL_USE_TLS": true
-```
-
-An app password is still a secret. Enter the actual provider-generated value,
-not the example above, and keep `config.json` protected with mode `600`.
-
-### Using another email provider
-
-Find the provider's authenticated SMTP settings. This implementation supports
-ordinary SMTP upgraded with STARTTLS, most commonly on port 587. Enter its SMTP
-hostname, port, username, password or app password, and sender address. Do not
-assume Gmail's settings work for a different provider.
-
-If the provider requires implicit SSL from the beginning of the connection,
-commonly associated with port 465, the current implementation is not configured
-for that mode. Use the provider's STARTTLS endpoint instead.
-
-### Enable email safely
-
-Stop the service, edit the settings, and restart:
-
-```bash
-sudo systemctl stop trading-agent.service
-nano config.json
-chmod 600 config.json
-sudo systemctl start trading-agent.service
-sudo journalctl -u trading-agent.service -f
-```
-
-Look for `Daily email report sent`. The agent does not send a test message at
-startup; it sends after the next scheduled daily evaluation. Check the spam or
-junk folder if the log reports success but the message is not in the inbox.
-
-The `.last_email_report` file is updated only after SMTP reports successful
-delivery. If sending fails, the error is logged and trading continues. The agent
-can try again on another iteration. It will not intentionally send another
-summary for a date already stored in that file.
-
-To disable reports, set this value and restart the service:
-
-```json
-"EMAIL_REPORT_ENABLED": false
-```
-
-## World-event and news awareness
-
-The agent has a basic news-awareness layer. Before evaluating a rotation, it
-asks Alpaca for recent general market news. It examines each headline and
-summary for explicit risk and opportunity phrases, calculates an aggregate
-score, and records the most influential headlines in the system log and daily
-email.
-
-This is **not machine learning**, artificial general intelligence, or an
-understanding of geopolitics. It is a small, auditable rule system. It does not
-learn facts permanently, predict the truth of a story, read articles behind
-links, or understand irony and subtle context. Its useful property is that a
-novice can inspect exactly which words affected a decision.
-
-### How scoring works
-
-The rules are in `news_context.py`:
-
-- Severe risk phrases such as `invasion`, `bank failure`, and `terrorist attack`
-  contribute `-3` each.
-- Ordinary risk phrases such as `recession`, `sanctions`, `rate hike`, and
-  `supply disruption` contribute `-1` each.
-- Constructive phrases such as `ceasefire`, `rate cut`, `stimulus`, and `trade
-  agreement` contribute `+1` each.
-
-Each phrase is counted no more than once per article. Scores from all retrieved
-articles are added together. With the default `NEWS_HIGH_RISK_SCORE` of `-6`, a
-score of `-6`, `-7`, or lower is classified as high risk.
-
-The daily log can look like:
-
-```text
-World-event context: risk=high, score=-7, articles=50.
-News evidence: [-3] Example headline text (matched: invasion)
-Dip signal met, but rotation was blocked by the configured world-event risk guard.
-```
-
-Headlines in that example are illustrative. Actual output comes from Alpaca.
-
-### How news changes a trade decision
-
-News does not create a buy signal by itself. The normal price-dip test still has
-to pass, and the account must still own Asset A.
-
-When all normal trading conditions pass:
-
-1. If the news score is above the high-risk threshold, rotation proceeds.
-2. If the score is at or below the threshold and
-   `NEWS_BLOCK_ON_HIGH_RISK` is `true`, the agent does not sell Asset A that day.
-3. The blocked decision, score, and matching headlines are logged and included
-   in the email report.
-4. The agent evaluates conditions again on its next scheduled iteration.
-
-If Alpaca news or the internet is unavailable, news status becomes
-`unavailable`. The error is logged and the original price strategy continues.
-This is called **fail-open** behavior. It prevents a news-provider outage from
-silently shutting down the price strategy, but it also means news protection is
-absent during that outage.
-
-### Advisory-only mode
-
-To see news context without allowing it to block trades, use:
-
-```json
-"NEWS_CONTEXT_ENABLED": true,
-"NEWS_BLOCK_ON_HIGH_RISK": false
-```
-
-This is a sensible first paper-trading mode. Headlines, scores, and risk levels
-still appear in logs and emails, but the score cannot veto a rotation.
-
-To disable news fetching entirely:
-
-```json
-"NEWS_CONTEXT_ENABLED": false
-```
-
-Restart the service after changing either setting.
-
-### Important news limitations
-
-- Alpaca news is a financial-news feed, not a complete record of every event in
-  every country.
-- Breaking events may appear late, be absent, or change after publication.
-- Multiple articles about the same event can make its score larger.
-- Keyword matching can misread context or classify an irrelevant story.
-- A constructive keyword does not mean an asset will rise.
-- A negative score does not mean an asset will fall.
-- The configured threshold has not been proven profitable merely because it is
-  included in the software.
-
-Use paper mode to compare the logged scores with actual headlines and market
-behavior before relying on the guard.
-
-## Optional WallStreetBets context and discovery
-
-AltIndex publishes a public tracker of WallStreetBets ticker mentions and
-sentiment from the preceding 24 hours. Enable `WSB_CONTEXT_ENABLED` to add
-matching mentions to the log and daily email. Enable
-`WSB_DISCOVERY_ENABLED` to add the tracker’s top symbols to that day’s
-portfolio research universe; symbols still need to pass the existing price
-history, walk-forward, risk, and order checks before they can be bought.
-The agent fetches one snapshot during initialization before trade evaluations,
-persists it in `.wsb_context_snapshot.json`, and reuses it for 24 hours. It
-does not repeatedly poll AltIndex during the day.
-
-```json
-"WSB_CONTEXT_ENABLED": true,
-"WSB_DISCOVERY_ENABLED": true,
-"WSB_DISCOVERY_MAX_SYMBOLS": 10,
-"WSB_CONTEXT_TIMEOUT_SECONDS": 10.0
-```
-
-WSB data is not a buy signal and never changes position size or bypasses the
-validated portfolio filters. If the tracker cannot be reached or its public
-markup changes, the agent fails open and evaluates its regular universe.
-
-## Optional congressional-trading context
-
-When enabled, the agent retrieves Kadoa's open-source ticker summary assembled
-from House, Senate, and executive-branch STOCK Act disclosures. For each asset
-being evaluated it reports the disclosed trade count, unique filers, purchases,
-and sales in the log and daily email.
-
-This is deliberately **research context only**. STOCK Act reports can be filed
-well after the transaction, and Kadoa's aggregate ticker file does not turn a
-disclosure into a timely recommendation. It cannot create a trade, choose a
-symbol, change order size, or veto a price-based decision. If Kadoa or GitHub
-is unavailable, the agent records the failure and continues normally.
-
-Enable it after reviewing the delayed-data limitation:
-
-```json
-"CONGRESS_CONTEXT_ENABLED": true,
-"CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0
-```
-
-## Optional LLM news assessment
-
-In addition to the fixed keyword rules, the agent can send the same daily
-Alpaca headlines to a language model for one risk assessment per trading day.
-Unlike the keyword scorer, the model reads the articles with genuine language
-understanding: it can recognize that ten articles describe one event, that a
-headline is speculation rather than fact, or that a negative-sounding story
-is irrelevant to broad US equity markets.
-
-Like every other news feature, this layer can only **veto** a rotation. It
-never creates a buy signal, and if the API is unreachable the price strategy
-continues without it (the same fail-open behavior as the rest of the news
-stack).
-
-### Getting a free API key (Gemini, the default)
-
-The default provider is Google's Gemini API, which has a genuinely free,
-rate-limited tier that comfortably covers this agent's one request per
-trading day. Chat subscriptions such as Claude Pro or ChatGPT Plus **cannot**
-be used here; those products do not include API access.
-
-1. Sign in at `aistudio.google.com` with a Google account.
-2. Create an API key (no credit card is required for the free tier).
-3. Paste it into `LLM_NEWS_API_KEY` in `config.json`.
-
-One caveat of the free tier: Google may use free-tier prompts to improve its
-products. This agent only ever sends **public news headlines and summaries**
-to the model — never your credentials, positions, balances, or account data —
-so there is nothing sensitive in those prompts.
-
-Treat the API key like every other secret in `config.json`: never commit it,
-keep the file at mode `600`, and rotate the key if exposure is suspected.
-
-### Enabling it
-
-Stop the service, edit the settings, and restart:
-
-```json
-"LLM_NEWS_ENABLED": true,
-"LLM_NEWS_PROVIDER": "gemini",
-"LLM_NEWS_API_KEY": "YOUR_GEMINI_API_KEY",
-"LLM_NEWS_MODEL": "gemini-2.5-flash",
-"LLM_NEWS_BASE_URL": "",
-"LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
-"LLM_NEWS_BLOCK_SCORE": -6
-```
-
-With `LLM_NEWS_BLOCK_ON_HIGH_RISK` set to `false` (the default), the
-assessment is **advisory only**: the score, risk level, and reasoning appear
-in the logs and the daily email, but cannot block a trade. This is the
-recommended starting mode. Review several weeks of paper-trading logs and
-compare the model's assessments with what actually happened before setting it
-to `true`.
-
-### Other providers
-
-| Provider setting | What it is | Key settings |
-|---|---|---|
-| `"gemini"` | Google Gemini API (free tier available) | Model such as `"gemini-2.5-flash"`; leave `LLM_NEWS_BASE_URL` empty |
-| `"anthropic"` | Claude API (paid, a few cents per month here) | Key from `platform.claude.com`; model such as `"claude-opus-4-8"` or the cheaper `"claude-haiku-4-5"` |
-| `"openai_compatible"` | Any OpenAI-compatible endpoint (Groq, OpenRouter, a local server, ...) | Set `LLM_NEWS_BASE_URL`, e.g. `"https://api.groq.com/openai/v1"`, plus that provider's key and model name |
-
-Free tiers are rate-limited and their terms can change; if a provider starts
-failing, the agent logs the error and continues on price logic and the
-keyword guard alone.
-
-### How it works
-
-1. The existing news layer fetches up to `NEWS_MAX_ARTICLES` recent articles
-   from Alpaca (so `NEWS_CONTEXT_ENABLED` must remain `true`).
-2. The headlines and summaries are sent to the configured model with
-   instructions to score aggregate near-term market risk from `-10` (severe,
-   market-wide danger) to `+10` (strongly constructive), scoring
-   conservatively and treating duplicate coverage as one event.
-3. The model must reply in a fixed JSON format containing the score, a risk
-   level, and two or three sentences of reasoning that cite the headlines.
-4. The score, level, and reasoning are logged and included in the email
-   report. When blocking is enabled and all normal trading conditions pass, a
-   score at or below `LLM_NEWS_BLOCK_SCORE` vetoes that day's rotation.
-
-The log line looks like:
-
-```text
-LLM news assessment: risk=elevated, score=-3. Several articles describe ...
-```
-
-### Limitations
-
-- The model sees only headlines and short summaries, not full articles.
-- A language model can misjudge significance in either direction; its
-  reasoning is plausible-sounding even when wrong.
-- The assessment depends on an external API: an outage means no LLM
-  protection that day (trading continues on price logic and the keyword
-  guard).
-- Scores are not comparable to the keyword score; the two guards use separate
-  thresholds and either can veto independently once enabled.
-
-## Adaptive news learning
-
-In addition to fixed headline rules, the agent now learns a simple relationship
-from its own daily observations. This is genuine statistical adaptation, but it
-is intentionally much smaller and more explainable than an AI language model.
-
-Each daily evaluation records:
-
-1. The date.
-2. That day's aggregate news score.
-3. Asset B's current price.
-
-At the next evaluation, it calculates Asset B's percentage return since the
-previous observation and pairs that return with the previous news score. After
-the configured minimum number of completed observations, it fits a stabilized
-linear regression:
-
-```text
-predicted next return = baseline return + learned sensitivity × current news score
-```
-
-The model reports its observation count, predicted next-session return,
-news-score sensitivity, and historical correlation. These values appear in the
-system log and email summary.
-
-### Warm-up period
-
-The default minimum is 20 completed observations. Until then, logs say something
-like:
-
-```text
-Learning safely: 7/20 required completed observations collected.
-```
-
-During warm-up, the adaptive forecast cannot block a trade. At roughly one
-observation per trading day, 20 observations usually require about four market
-weeks. Restarts do not erase progress because observations are stored in
-`.news_learning_state.json`.
-
-### Learned risk veto
-
-Once mature, the adaptive model can block a rotation when its forecast is at or
-below `NEWS_PREDICTED_RETURN_BLOCK_PERCENT`. With the default `-1.0`, a predicted
-next-session Asset B return of `-1.00%` or lower blocks that day's rotation. The
-absolute historical correlation must also meet `NEWS_LEARNING_MIN_CORRELATION`;
-the default requires at least `0.15`. If news scores do not vary enough, the
-model remains non-authoritative even after collecting the minimum sample count.
-
-This veto is separate from the fixed high-risk keyword veto. Either can block a
-trade, in both A/B and portfolio mode (in portfolio mode the model keeps
-learning from Asset B as a market proxy and its veto applies to new portfolio
-purchases and replacements). To collect learning data without allowing learned
-forecasts to affect orders, temporarily use:
-
-```json
-"NEWS_LEARNING_ENABLED": true,
-"NEWS_LEARNING_BLOCK_ENABLED": false
-```
-
-To stop collection as well, set `NEWS_LEARNING_ENABLED` to `false`. Existing
-state is preserved and becomes available again if learning is re-enabled.
-
-### Rolling and bounded behavior
-
-- Only the newest configured number of completed observations is retained.
-- The default rolling maximum is 120 observations.
-- Single-session returns stored for training are capped to the range `-25%` to
-  `+25%` to reduce the influence of corrupt prices or extreme outliers.
-- Forecasts are capped to `-10%` through `+10%`.
-- A small ridge stabilizer prevents huge coefficients when news scores barely
-  change.
-- The model uses only information available at each daily observation; it does
-  not use future prices when producing that day's forecast.
-
-### Learning limitations
-
-- Twenty observations is only a safety minimum, not proof of accuracy.
-- Correlation does not establish that headlines caused later returns.
-- Market relationships change, so previously learned behavior can stop working.
-- One daily Asset B price cannot measure intraday reactions or execution prices.
-- The model has only one predictor: the aggregate news score.
-- A statistically produced forecast can still be completely wrong.
-
-Keep the agent in paper mode throughout warm-up and review many mature forecasts
-before considering whether this feature is useful.
-
-## Decision memory: learning from its own rotations
-
-The news learner estimates Asset B's absolute return. Decision memory adds the
-question this strategy needs to answer: after a comparable dip, would owning
-Asset B have done better than continuing to own Asset A? Because it models the
-A/B pair specifically, portfolio mode uses it only for the separately labelled
-Opportunistic Opportunity; it is not mixed into ordinary portfolio rankings.
-
-For each evaluable day, its local DuckDB database records the two prices, dip,
-available news score, signal state, and final decision. At the next market
-evaluation it settles the earlier record using `Asset B return - Asset A
-return`. A record is only settled when the next evaluation happens within a
-few calendar days; after a longer outage the stale record is left unsettled
-rather than recording a multi-day return as if it were one session. Only prior
-dip signals train its conservative, ridge-stabilized model; the inputs are dip
-size and news score. Broker-confirmed fills are recorded separately for
-auditability.
-
-It is advisory by default. After at least 40 comparable settled signals, you
-may enable `DECISION_MEMORY_BLOCK_ENABLED` in paper trading after reviewing its
-forecasts. A veto requires both a negative predicted edge and the configured
-minimum fit correlation. It never creates a trade, increases order size, or
-overrides the existing safeguards. Delete `.trade_memory.duckdb` only if you
-intend to reset this learning history.
-
-### Startup catch-up
-
-On its first valid evaluation after a start, the agent imports up to
-`DECISION_MEMORY_BACKFILL_DAYS` of daily price bars (default: 1,000). It
-calculates each historical dip using the configured lookback and stores only
-next-session outcomes that were already complete. Existing dates are never
-overwritten, so restarts are safe; a transient data failure is retried on the
-next daily evaluation. Set the value to `0` to disable this request.
-
-The adaptive news learner is not backfilled: it needs the actual news score
-known on each historical date. Reusing today's score for earlier prices would
-produce misleading training data. Its daily warm-up therefore remains intact.
-
-### Resetting learned history
-
-Normally, do not edit the learning-state file. To deliberately start learning
-from zero, stop the service, preserve a backup, and restart:
-
-```bash
-sudo systemctl stop trading-agent.service
-cp .news_learning_state.json .news_learning_state.json.backup
-rm .news_learning_state.json
-sudo systemctl start trading-agent.service
-```
-
-If the state file becomes invalid JSON, the model moves it to a `.corrupt` file
-and starts clean rather than trusting damaged observations.
-
-## Step 4: Install and start the service
+### Step 4: Install and start the service
 
 Make sure the installer is executable, then run it with administrator rights:
 
@@ -870,7 +455,7 @@ The installer:
 Package installation can take several minutes on a Raspberry Pi. Do not turn
 off the Pi while it is running.
 
-## Step 5: Verify operation
+### Step 5: Verify operation
 
 Check the service state:
 
@@ -898,7 +483,465 @@ sudo journalctl -u trading-agent.service -n 100 --no-pager
 Also sign in to the Alpaca paper dashboard and confirm that you are viewing the
 paper account. Review its positions, orders, buying power, and activity.
 
-## Understanding common log messages
+Once the service is installed and running, everything below is optional
+tuning and day-to-day operation.
+
+## Optional features
+
+Enabling or disabling any setting in this section requires stopping the
+service, editing `config.json`, and restarting it:
+
+```bash
+sudo systemctl stop trading-agent.service
+nano config.json
+chmod 600 config.json
+sudo systemctl start trading-agent.service
+sudo journalctl -u trading-agent.service -f
+```
+
+### Daily email report
+
+Email reporting is initially disabled. Leaving it disabled does not affect
+trading. When enabled, the agent attempts to send one summary after its daily
+market evaluation. The report includes:
+
+- Evaluation date and time.
+- Asset A and Asset B symbols, prices, quantities, recent high, and calculated
+  dip when available (A/B mode), or current holdings, signal candidates, and
+  discovered symbols (portfolio mode).
+- The configured dip threshold.
+- News, LLM, and adaptive-learning summaries.
+- The action taken or the reason no action was taken.
+- Any caught evaluation error.
+
+For stock and ETF strategies, “once a day” means once on a day when Lumibot runs
+the scheduled market evaluation. A report is not normally expected on weekends
+or exchange holidays. Email delivery timing depends on the market schedule,
+internet connection, and mail provider.
+
+#### Email setup using Gmail
+
+Do not place your normal Google account password in `config.json`. Google
+typically requires two-step verification and a separately generated app
+password for SMTP clients. Account menus and eligibility can vary, so consult
+Google's current account help if the App Passwords option is unavailable.
+
+With a Gmail app password, settings usually have this form:
+
+```json
+"EMAIL_REPORT_ENABLED": true,
+"EMAIL_SMTP_HOST": "smtp.gmail.com",
+"EMAIL_SMTP_PORT": 587,
+"EMAIL_SMTP_USERNAME": "your.address@gmail.com",
+"EMAIL_SMTP_PASSWORD": "YOUR_GOOGLE_APP_PASSWORD",
+"EMAIL_FROM_ADDRESS": "your.address@gmail.com",
+"EMAIL_TO_ADDRESS": "where.to.send@example.com",
+"EMAIL_USE_TLS": true
+```
+
+An app password is still a secret. Enter the actual provider-generated value,
+not the example above, and keep `config.json` protected with mode `600`.
+
+#### Using another email provider
+
+Find the provider's authenticated SMTP settings. This implementation supports
+ordinary SMTP upgraded with STARTTLS, most commonly on port 587. Enter its SMTP
+hostname, port, username, password or app password, and sender address. Do not
+assume Gmail's settings work for a different provider.
+
+If the provider requires implicit SSL from the beginning of the connection,
+commonly associated with port 465, the current implementation is not configured
+for that mode. Use the provider's STARTTLS endpoint instead.
+
+#### Verifying delivery
+
+Look for `Daily email report sent`. The agent does not send a test message at
+startup; it sends after the next scheduled daily evaluation. Check the spam or
+junk folder if the log reports success but the message is not in the inbox.
+
+The `.last_email_report` file is updated only after SMTP reports successful
+delivery. If sending fails, the error is logged and trading continues. The agent
+can try again on another iteration. It will not intentionally send another
+summary for a date already stored in that file.
+
+To disable reports, set this value and restart the service:
+
+```json
+"EMAIL_REPORT_ENABLED": false
+```
+
+### World-event and news awareness
+
+The agent has a basic news-awareness layer. Before evaluating a rotation, it
+asks Alpaca for recent general market news. It examines each headline and
+summary for explicit risk and opportunity phrases, calculates an aggregate
+score, and records the most influential headlines in the system log and daily
+email.
+
+This is **not machine learning**, artificial general intelligence, or an
+understanding of geopolitics. It is a small, auditable rule system. It does not
+learn facts permanently, predict the truth of a story, read articles behind
+links, or understand irony and subtle context. Its useful property is that a
+novice can inspect exactly which words affected a decision.
+
+#### How scoring works
+
+The rules are in `news_context.py`:
+
+- Severe risk phrases such as `invasion`, `bank failure`, and `terrorist attack`
+  contribute `-3` each.
+- Ordinary risk phrases such as `recession`, `sanctions`, `rate hike`, and
+  `supply disruption` contribute `-1` each.
+- Constructive phrases such as `ceasefire`, `rate cut`, `stimulus`, and `trade
+  agreement` contribute `+1` each.
+
+Each phrase is counted no more than once per article. Scores from all retrieved
+articles are added together. With the default `NEWS_HIGH_RISK_SCORE` of `-6`, a
+score of `-6`, `-7`, or lower is classified as high risk.
+
+The daily log can look like:
+
+```text
+World-event context: risk=high, score=-7, articles=50.
+News evidence: [-3] Example headline text (matched: invasion)
+Dip signal met, but rotation was blocked by the configured world-event risk guard.
+```
+
+Headlines in that example are illustrative. Actual output comes from Alpaca.
+
+#### How news changes a trade decision
+
+News does not create a buy signal by itself. The normal price-dip test still has
+to pass, and the account must still own Asset A.
+
+When all normal trading conditions pass:
+
+1. If the news score is above the high-risk threshold, rotation proceeds.
+2. If the score is at or below the threshold and
+   `NEWS_BLOCK_ON_HIGH_RISK` is `true`, the agent does not sell Asset A that day.
+3. The blocked decision, score, and matching headlines are logged and included
+   in the email report.
+4. The agent evaluates conditions again on its next scheduled iteration.
+
+If Alpaca news or the internet is unavailable, news status becomes
+`unavailable`. The error is logged and the original price strategy continues.
+This is called **fail-open** behavior. It prevents a news-provider outage from
+silently shutting down the price strategy, but it also means news protection is
+absent during that outage.
+
+#### Advisory-only mode
+
+To see news context without allowing it to block trades, use:
+
+```json
+"NEWS_CONTEXT_ENABLED": true,
+"NEWS_BLOCK_ON_HIGH_RISK": false
+```
+
+This is a sensible first paper-trading mode. Headlines, scores, and risk levels
+still appear in logs and emails, but the score cannot veto a rotation.
+
+To disable news fetching entirely:
+
+```json
+"NEWS_CONTEXT_ENABLED": false
+```
+
+#### Important news limitations
+
+- Alpaca news is a financial-news feed, not a complete record of every event in
+  every country.
+- Breaking events may appear late, be absent, or change after publication.
+- Multiple articles about the same event can make its score larger.
+- Keyword matching can misread context or classify an irrelevant story.
+- A constructive keyword does not mean an asset will rise.
+- A negative score does not mean an asset will fall.
+- The configured threshold has not been proven profitable merely because it is
+  included in the software.
+
+Use paper mode to compare the logged scores with actual headlines and market
+behavior before relying on the guard.
+
+### WallStreetBets context and discovery
+
+AltIndex publishes a public tracker of WallStreetBets ticker mentions and
+sentiment from the preceding 24 hours. Enable `WSB_CONTEXT_ENABLED` to add
+matching mentions to the log and daily email. Enable
+`WSB_DISCOVERY_ENABLED` to add the tracker’s top symbols to that day’s
+portfolio research universe; symbols still need to pass the existing price
+history, walk-forward, risk, and order checks before they can be bought.
+The agent fetches one snapshot during initialization before trade evaluations,
+persists it in `.wsb_context_snapshot.json`, and reuses it for 24 hours. It
+does not repeatedly poll AltIndex during the day.
+
+```json
+"WSB_CONTEXT_ENABLED": true,
+"WSB_DISCOVERY_ENABLED": true,
+"WSB_DISCOVERY_MAX_SYMBOLS": 10,
+"WSB_CONTEXT_TIMEOUT_SECONDS": 10.0
+```
+
+WSB data is not a buy signal and never changes position size or bypasses the
+validated portfolio filters. If the tracker cannot be reached or its public
+markup changes, the agent fails open and evaluates its regular universe.
+
+### Congressional-trading context
+
+When enabled, the agent retrieves Kadoa's open-source ticker summary assembled
+from House, Senate, and executive-branch STOCK Act disclosures. For each asset
+being evaluated it reports the disclosed trade count, unique filers, purchases,
+and sales in the log and daily email.
+
+This is deliberately **research context only**. STOCK Act reports can be filed
+well after the transaction, and Kadoa's aggregate ticker file does not turn a
+disclosure into a timely recommendation. It cannot create a trade, choose a
+symbol, change order size, or veto a price-based decision. If Kadoa or GitHub
+is unavailable, the agent records the failure and continues normally.
+
+Enable it after reviewing the delayed-data limitation:
+
+```json
+"CONGRESS_CONTEXT_ENABLED": true,
+"CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0
+```
+
+### LLM news assessment
+
+In addition to the fixed keyword rules, the agent can send the same daily
+Alpaca headlines to a language model for one risk assessment per trading day.
+Unlike the keyword scorer, the model reads the articles with genuine language
+understanding: it can recognize that ten articles describe one event, that a
+headline is speculation rather than fact, or that a negative-sounding story
+is irrelevant to broad US equity markets.
+
+Like every other news feature, this layer can only **veto** a rotation. It
+never creates a buy signal, and if the API is unreachable the price strategy
+continues without it (the same fail-open behavior as the rest of the news
+stack).
+
+#### Getting a free API key (Gemini, the default)
+
+The default provider is Google's Gemini API, which has a genuinely free,
+rate-limited tier that comfortably covers this agent's one request per
+trading day. Chat subscriptions such as Claude Pro or ChatGPT Plus **cannot**
+be used here; those products do not include API access.
+
+1. Sign in at `aistudio.google.com` with a Google account.
+2. Create an API key (no credit card is required for the free tier).
+3. Paste it into `LLM_NEWS_API_KEY` in `config.json`.
+
+One caveat of the free tier: Google may use free-tier prompts to improve its
+products. This agent only ever sends **public news headlines and summaries**
+to the model — never your credentials, positions, balances, or account data —
+so there is nothing sensitive in those prompts.
+
+Treat the API key like every other secret in `config.json`: never commit it,
+keep the file at mode `600`, and rotate the key if exposure is suspected.
+
+#### Enabling it
+
+```json
+"LLM_NEWS_ENABLED": true,
+"LLM_NEWS_PROVIDER": "gemini",
+"LLM_NEWS_API_KEY": "YOUR_GEMINI_API_KEY",
+"LLM_NEWS_MODEL": "gemini-2.5-flash",
+"LLM_NEWS_BASE_URL": "",
+"LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
+"LLM_NEWS_BLOCK_SCORE": -6
+```
+
+With `LLM_NEWS_BLOCK_ON_HIGH_RISK` set to `false` (the default), the
+assessment is **advisory only**: the score, risk level, and reasoning appear
+in the logs and the daily email, but cannot block a trade. This is the
+recommended starting mode. Review several weeks of paper-trading logs and
+compare the model's assessments with what actually happened before setting it
+to `true`.
+
+#### Other providers
+
+| Provider setting | What it is | Key settings |
+|---|---|---|
+| `"gemini"` | Google Gemini API (free tier available) | Model such as `"gemini-2.5-flash"`; leave `LLM_NEWS_BASE_URL` empty |
+| `"anthropic"` | Claude API (paid, a few cents per month here) | Key from `platform.claude.com`; model such as `"claude-opus-4-8"` or the cheaper `"claude-haiku-4-5"` |
+| `"openai_compatible"` | Any OpenAI-compatible endpoint (Groq, OpenRouter, a local server, ...) | Set `LLM_NEWS_BASE_URL`, e.g. `"https://api.groq.com/openai/v1"`, plus that provider's key and model name |
+
+Free tiers are rate-limited and their terms can change; if a provider starts
+failing, the agent logs the error and continues on price logic and the
+keyword guard alone.
+
+#### How it works
+
+1. The existing news layer fetches up to `NEWS_MAX_ARTICLES` recent articles
+   from Alpaca (so `NEWS_CONTEXT_ENABLED` must remain `true`).
+2. The headlines and summaries are sent to the configured model with
+   instructions to score aggregate near-term market risk from `-10` (severe,
+   market-wide danger) to `+10` (strongly constructive), scoring
+   conservatively and treating duplicate coverage as one event.
+3. The model must reply in a fixed JSON format containing the score, a risk
+   level, and two or three sentences of reasoning that cite the headlines.
+4. The score, level, and reasoning are logged and included in the email
+   report. When blocking is enabled and all normal trading conditions pass, a
+   score at or below `LLM_NEWS_BLOCK_SCORE` vetoes that day's rotation.
+
+The log line looks like:
+
+```text
+LLM news assessment: risk=elevated, score=-3. Several articles describe ...
+```
+
+#### LLM limitations
+
+- The model sees only headlines and short summaries, not full articles.
+- A language model can misjudge significance in either direction; its
+  reasoning is plausible-sounding even when wrong.
+- The assessment depends on an external API: an outage means no LLM
+  protection that day (trading continues on price logic and the keyword
+  guard).
+- Scores are not comparable to the keyword score; the two guards use separate
+  thresholds and either can veto independently once enabled.
+
+### Adaptive news learning
+
+In addition to fixed headline rules, the agent now learns a simple relationship
+from its own daily observations. This is genuine statistical adaptation, but it
+is intentionally much smaller and more explainable than an AI language model.
+
+Each daily evaluation records:
+
+1. The date.
+2. That day's aggregate news score.
+3. Asset B's current price.
+
+At the next evaluation, it calculates Asset B's percentage return since the
+previous observation and pairs that return with the previous news score. After
+the configured minimum number of completed observations, it fits a stabilized
+linear regression:
+
+```text
+predicted next return = baseline return + learned sensitivity × current news score
+```
+
+The model reports its observation count, predicted next-session return,
+news-score sensitivity, and historical correlation. These values appear in the
+system log and email summary.
+
+#### Warm-up period
+
+The default minimum is 20 completed observations. Until then, logs say something
+like:
+
+```text
+Learning safely: 7/20 required completed observations collected.
+```
+
+During warm-up, the adaptive forecast cannot block a trade. At roughly one
+observation per trading day, 20 observations usually require about four market
+weeks. Restarts do not erase progress because observations are stored in
+`.news_learning_state.json`.
+
+#### Learned risk veto
+
+Once mature, the adaptive model can block a rotation when its forecast is at or
+below `NEWS_PREDICTED_RETURN_BLOCK_PERCENT`. With the default `-1.0`, a predicted
+next-session Asset B return of `-1.00%` or lower blocks that day's rotation. The
+absolute historical correlation must also meet `NEWS_LEARNING_MIN_CORRELATION`;
+the default requires at least `0.15`. If news scores do not vary enough, the
+model remains non-authoritative even after collecting the minimum sample count.
+
+This veto is separate from the fixed high-risk keyword veto. Either can block a
+trade, in both A/B and portfolio mode (in portfolio mode the model keeps
+learning from Asset B as a market proxy and its veto applies to new portfolio
+purchases and replacements). To collect learning data without allowing learned
+forecasts to affect orders, temporarily use:
+
+```json
+"NEWS_LEARNING_ENABLED": true,
+"NEWS_LEARNING_BLOCK_ENABLED": false
+```
+
+To stop collection as well, set `NEWS_LEARNING_ENABLED` to `false`. Existing
+state is preserved and becomes available again if learning is re-enabled.
+
+#### Rolling and bounded behavior
+
+- Only the newest configured number of completed observations is retained.
+- The default rolling maximum is 120 observations.
+- Single-session returns stored for training are capped to the range `-25%` to
+  `+25%` to reduce the influence of corrupt prices or extreme outliers.
+- Forecasts are capped to `-10%` through `+10%`.
+- A small ridge stabilizer prevents huge coefficients when news scores barely
+  change.
+- The model uses only information available at each daily observation; it does
+  not use future prices when producing that day's forecast.
+
+#### Learning limitations
+
+- Twenty observations is only a safety minimum, not proof of accuracy.
+- Correlation does not establish that headlines caused later returns.
+- Market relationships change, so previously learned behavior can stop working.
+- One daily Asset B price cannot measure intraday reactions or execution prices.
+- The model has only one predictor: the aggregate news score.
+- A statistically produced forecast can still be completely wrong.
+
+Keep the agent in paper mode throughout warm-up and review many mature forecasts
+before considering whether this feature is useful.
+
+### Decision memory: learning from its own rotations
+
+The news learner estimates Asset B's absolute return. Decision memory adds the
+question this strategy needs to answer: after a comparable dip, would owning
+Asset B have done better than continuing to own Asset A? Because it models the
+A/B pair specifically, portfolio mode uses it only for the separately labelled
+Opportunistic Opportunity; it is not mixed into ordinary portfolio rankings.
+
+For each evaluable day, its local DuckDB database records the two prices, dip,
+available news score, signal state, and final decision. At the next market
+evaluation it settles the earlier record using `Asset B return - Asset A
+return`. A record is only settled when the next evaluation happens within a
+few calendar days; after a longer outage the stale record is left unsettled
+rather than recording a multi-day return as if it were one session. Only prior
+dip signals train its conservative, ridge-stabilized model; the inputs are dip
+size and news score. Broker-confirmed fills are recorded separately for
+auditability.
+
+It is advisory by default. After at least 40 comparable settled signals, you
+may enable `DECISION_MEMORY_BLOCK_ENABLED` in paper trading after reviewing its
+forecasts. A veto requires both a negative predicted edge and the configured
+minimum fit correlation. It never creates a trade, increases order size, or
+overrides the existing safeguards. Delete `.trade_memory.duckdb` only if you
+intend to reset this learning history.
+
+#### Startup catch-up
+
+On its first valid evaluation after a start, the agent imports up to
+`DECISION_MEMORY_BACKFILL_DAYS` of daily price bars (default: 1,000). It
+calculates each historical dip using the configured lookback and stores only
+next-session outcomes that were already complete. Existing dates are never
+overwritten, so restarts are safe; a transient data failure is retried on the
+next daily evaluation. Set the value to `0` to disable this request.
+
+The adaptive news learner is not backfilled: it needs the actual news score
+known on each historical date. Reusing today's score for earlier prices would
+produce misleading training data. Its daily warm-up therefore remains intact.
+
+#### Resetting learned history
+
+Normally, do not edit the learning-state file. To deliberately start learning
+from zero, stop the service, preserve a backup, and restart:
+
+```bash
+sudo systemctl stop trading-agent.service
+cp .news_learning_state.json .news_learning_state.json.backup
+rm .news_learning_state.json
+sudo systemctl start trading-agent.service
+```
+
+If the state file becomes invalid JSON, the model moves it to a `.corrupt` file
+and starts clean rather than trusting damaged observations.
+
+## Operating the service
+
+### Understanding common log messages
 
 `Starting paper trading for SPY/QQQ`
 
@@ -954,7 +997,7 @@ that article's score and the matching terms are shown afterward.
 : The news request failed. No news veto is applied, but the price strategy and
 daily email continue where possible.
 
-## Service commands
+### Service commands
 
 Stop the agent before editing its configuration:
 
@@ -991,7 +1034,7 @@ usually indicate invalid configuration, bad credentials, unavailable packages,
 or a startup error. Inspect the journal rather than repeatedly rerunning the
 installer.
 
-## Changing strategy settings
+### Changing strategy settings
 
 Always stop the service before changing `config.json`:
 
@@ -1013,7 +1056,9 @@ strategy is designed for ordinary whole-share stock or ETF symbols. It is not
 configured for options, short positions, leveraged borrowing logic, or crypto
 pairs.
 
-## Paper-trading test checklist
+## Testing and going live
+
+### Paper-trading test checklist
 
 Before even considering live trading, verify all of the following:
 
@@ -1033,7 +1078,7 @@ Before even considering live trading, verify all of the following:
 Paper execution does not reproduce every live-market condition. It may differ
 from live trading in fills, slippage, liquidity, and delays.
 
-## Live-trading warning
+### Live-trading warning
 
 Setting `IS_PAPER_TRADING` to `false` can submit real-money orders when used with
 live credentials. Do not make that change merely to test whether the service
@@ -1207,7 +1252,9 @@ ls -l config.json
 
 The beginning should resemble `-rw-------`.
 
-## Updating Python dependencies
+## Maintenance
+
+### Updating Python dependencies
 
 Dependency updates can change behavior. Stop the service and preserve the
 working environment before updating intentionally:
@@ -1220,7 +1267,7 @@ sudo systemctl status trading-agent.service
 
 Review the logs and repeat paper-mode validation after every update.
 
-## Removing the service
+### Removing the service
 
 This stops and removes the systemd unit but leaves the project and configuration
 files in place:
@@ -1235,7 +1282,7 @@ sudo systemctl reset-failed
 The project directory remains available for inspection or later reinstallation.
 Delete it only after securely handling the API credentials in `config.json`.
 
-## Operational routine
+### Operational routine
 
 Even an automated service needs supervision. A sensible routine is to:
 
