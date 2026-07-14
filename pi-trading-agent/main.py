@@ -5,8 +5,10 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta as datetime_timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
@@ -17,6 +19,36 @@ from strategy import AssetRotationStrategy
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+EASTERN_TIME = ZoneInfo("America/New_York")
+
+
+def format_market_open_time(open_time: datetime) -> str:
+    """Format a market-calendar timestamp for the market-wait log message."""
+    return open_time.astimezone(EASTERN_TIME).strftime("%-I:%M %p ET")
+
+
+class MarketOpenLoggingAlpaca(Alpaca):
+    """Alpaca broker with a more useful pre-market wait message.
+
+    Lumibot normally logs only that it is sleeping.  Keep its wait behavior
+    unchanged while including the next calendar-derived market-open time.
+    """
+
+    def _await_market_to_open(self, timedelta=None, strategy=None):
+        if self.is_market_open():
+            return
+
+        time_to_open = self.get_time_to_open()
+        market_open = datetime.now(timezone.utc) + datetime_timedelta(
+            seconds=max(0, time_to_open)
+        )
+        if timedelta is not None:
+            time_to_open -= 60 * timedelta
+
+        self.logger.info(
+            "Sleeping until the market opens (%s)", format_market_open_time(market_open)
+        )
+        self.sleep(max(0, time_to_open))
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -320,6 +352,16 @@ class _DropTelemetry(logging.Filter):
             return True
 
 
+class _DropOptionalLumiwealthWarning(logging.Filter):
+    """Hide the optional Lumiwealth cloud-registration reminder."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "LUMIWEALTH_API_KEY not set." not in record.getMessage()
+        except Exception:
+            return True
+
+
 class _DropLumibotDuplicates(logging.Filter):
     """Keep Lumibot records off the root handler; Lumibot's own handler prints them.
 
@@ -338,9 +380,12 @@ def _tidy_logging() -> None:
         handler.addFilter(_DropLumibotDuplicates())
         handler.addFilter(_DropTelemetry())
     # Logger-level filters run before any handler (Lumibot's included) and
-    # survive Lumibot recreating its handlers, so telemetry is silenced at
-    # the source.
+    # survive Lumibot recreating its handlers, so noise is silenced at the
+    # source.
     logging.getLogger("lumibot.brokers.broker").addFilter(_DropTelemetry())
+    logging.getLogger("lumibot.strategies._strategy").addFilter(
+        _DropOptionalLumiwealthWarning()
+    )
 
 
 def main() -> int:
@@ -364,7 +409,7 @@ def main() -> int:
         if llm_key and not llm_key.startswith("REPLACE_WITH_"):
             os.environ["LLM_NEWS_API_KEY"] = llm_key
 
-        broker = Alpaca(
+        broker = MarketOpenLoggingAlpaca(
             {
                 "API_KEY": config["ALPACA_API_KEY"],
                 "API_SECRET": config["ALPACA_SECRET_KEY"],

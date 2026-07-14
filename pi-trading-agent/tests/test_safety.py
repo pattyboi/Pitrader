@@ -1,9 +1,23 @@
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import date
+from datetime import date, datetime, timezone
+import logging
 
 from adaptive_news_model import AdaptiveNewsModel
 from strategy import AssetRotationStrategy
+from main import _DropOptionalLumiwealthWarning, format_market_open_time
+
+
+def test_market_open_time_is_logged_in_eastern_time() -> None:
+    assert format_market_open_time(datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
+    assert format_market_open_time(datetime(2026, 1, 14, 14, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
+
+
+def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
+    noise_filter = _DropOptionalLumiwealthWarning()
+
+    assert not noise_filter.filter(logging.makeLogRecord({"msg": "LUMIWEALTH_API_KEY not set. Not sending an update to the cloud"}))
+    assert noise_filter.filter(logging.makeLogRecord({"msg": "Alpaca API authentication failed"}))
 
 
 def test_news_model_discards_stale_pending_return(tmp_path: Path) -> None:
