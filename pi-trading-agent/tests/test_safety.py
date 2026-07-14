@@ -1,11 +1,13 @@
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import logging
 import sqlite3
 
 from adaptive_news_model import AdaptiveNewsModel
 from congress_context import CongressTradeAnalyzer
+from news_context import NewsContext, WorldEventAnalyzer
+from symbol_reference import SymbolReference
 from wsb_context import WallStreetBetsAnalyzer, WallStreetBetsSnapshot
 from strategy import AssetRotationStrategy
 from trade_memory import TradeMemory
@@ -219,3 +221,159 @@ def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
     conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10, "bearish")
 
     assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
+
+
+def test_score_articles_attributes_score_to_only_the_tagged_symbol() -> None:
+    articles = [
+        {"headline": "Company reports layoffs", "summary": "", "symbols": ["TSLA"]},
+        {"headline": "Ceasefire reached in the region", "summary": "", "symbols": ["XYZ"]},
+        {"headline": "A quiet update with no news content", "summary": "", "symbols": ["ACME"]},
+    ]
+
+    scoring = WorldEventAnalyzer.score_articles(articles, lookback_hours=24, refine=False)
+
+    assert scoring.total_score == 0  # -1 (layoffs) + 1 (ceasefire) + 0
+    assert scoring.per_symbol_scores == {"TSLA": -1, "XYZ": 1, "ACME": 0}
+
+
+def test_score_articles_with_refine_off_matches_score_text_exactly() -> None:
+    articles = [
+        {"headline": "Recession fears grow amid tariff threats", "summary": "layoffs expected"},
+        {"headline": "Stimulus and rate cut announced", "summary": "trade agreement reached"},
+    ]
+
+    scoring = WorldEventAnalyzer.score_articles(articles, lookback_hours=24, refine=False)
+    manual_total = sum(
+        WorldEventAnalyzer.score_text(f"{a['headline']} {a.get('summary', '')}")[0] for a in articles
+    )
+
+    assert scoring.total_score == manual_total
+
+
+def test_score_articles_refine_decays_older_articles_toward_the_floor() -> None:
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    fresh = [{"headline": "Recession warning", "summary": "", "created_at": now}]
+    stale = [{"headline": "Recession warning", "summary": "", "created_at": now - timedelta(hours=24)}]
+
+    fresh_score = WorldEventAnalyzer.score_articles(fresh, lookback_hours=24, refine=True, now=now).total_score
+    stale_score = WorldEventAnalyzer.score_articles(stale, lookback_hours=24, refine=True, now=now).total_score
+
+    assert fresh_score == -1
+    assert stale_score == 0  # -1 * floor(0.4) rounds to 0, weaker than the fresh copy
+
+
+def test_score_articles_refine_dampens_duplicate_phrase_occurrences() -> None:
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    articles = [
+        {"headline": "Layoffs announced at Company A", "summary": "", "created_at": now},
+        {"headline": "Layoffs announced at Company B", "summary": "", "created_at": now},
+        {"headline": "Layoffs announced at Company C", "summary": "", "created_at": now},
+    ]
+
+    refined = WorldEventAnalyzer.score_articles(articles, lookback_hours=24, refine=True, now=now)
+    unrefined = WorldEventAnalyzer.score_articles(articles, lookback_hours=24, refine=False, now=now)
+
+    assert unrefined.total_score == -3  # three full -1 hits
+    assert refined.total_score == -2  # -1 + -0.6 + -0.3 rounded
+
+
+def test_symbol_reference_verifies_only_when_both_sources_agree(tmp_path: Path) -> None:
+    alpaca_names = {"AAPL": "Apple Inc. Common Stock", "MYST": "Mystery Co"}
+    sec_names = {"AAPL": "Apple Inc.", "ACME": "Acme Corp"}
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=lambda url, headers: (
+            {"symbol": url.rsplit("/", 1)[-1], "name": alpaca_names[url.rsplit("/", 1)[-1]]}
+            if url.rsplit("/", 1)[-1] in alpaca_names
+            else None
+        ),
+        sec_fetcher=lambda url, timeout: [{"ticker": k, "title": v} for k, v in sec_names.items()],
+    )
+
+    assert reference.refresh(["AAPL", "MYST", "ACME", "GARBAGE"], "key", "secret") is True
+    assert reference.verified_symbols() == {"AAPL", "MYST", "ACME"}  # GARBAGE dropped, others kept
+
+
+def test_symbol_reference_refresh_is_gated_by_the_interval(tmp_path: Path) -> None:
+    calls = {"count": 0}
+
+    def counting_fetcher(url: str, headers: dict) -> dict:
+        calls["count"] += 1
+        return {"symbol": "AAPL", "name": "Apple Inc."}
+
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=counting_fetcher,
+        sec_fetcher=lambda url, timeout: [{"ticker": "AAPL", "title": "Apple Inc."}],
+    )
+
+    assert reference.refresh(["AAPL"], "key", "secret") is True
+    assert reference.refresh(["AAPL"], "key", "secret") is False
+    assert calls["count"] == 1
+
+
+def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=lambda url, headers: {"symbol": "AAPL", "name": "Apple Inc. Common Stock"},
+        sec_fetcher=lambda url, timeout: [{"ticker": "AAPL", "title": "Apple Inc."}],
+    )
+    reference.refresh(["AAPL"], "key", "secret")
+
+    found = reference.scan_text_for_symbols("Apple reported record quarterly earnings", {"AAPL"})
+
+    assert found == {"AAPL"}
+    assert reference.scan_text_for_symbols("Nothing relevant here", {"AAPL"}) == set()
+
+
+def test_symbol_news_scores_filters_unverified_tags_and_falls_back_when_empty() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"symbol_reference_enabled": True}
+    strategy.log_message = lambda *args, **kwargs: None
+
+    class FakeReference:
+        def verified_symbols(self) -> set[str]:
+            return {"TSLA"}  # SPURIOUS was never recognized by either source
+
+        def scan_text_for_symbols(self, text: str, candidates) -> set[str]:
+            return set()
+
+    strategy._symbol_reference = lambda: FakeReference()
+    news_context = NewsContext(
+        available=True,
+        score=-4,
+        per_symbol_scores={"TSLA": -2, "SPURIOUS": -5},
+        per_article=[],
+    )
+
+    scores = strategy._symbol_news_scores(news_context, {"TSLA", "SPURIOUS", "UNCOVERED"})
+
+    assert scores == {"TSLA": -2}  # SPURIOUS dropped; UNCOVERED absent (caller falls back to market-wide)
+
+
+def test_symbol_news_scores_extends_coverage_via_text_scan() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"symbol_reference_enabled": True}
+    strategy.log_message = lambda *args, **kwargs: None
+
+    class FakeReference:
+        def verified_symbols(self) -> set[str]:
+            return set()  # nothing cached yet: fail open, no filtering
+
+        def scan_text_for_symbols(self, text: str, candidates) -> set[str]:
+            return {"AAPL"} if "Apple" in text else set()
+
+    strategy._symbol_reference = lambda: FakeReference()
+    news_context = NewsContext(
+        available=True,
+        score=1,
+        per_symbol_scores={},
+        per_article=[{"headline": "Apple beats earnings", "summary": "", "symbols": [], "score": 1}],
+    )
+
+    scores = strategy._symbol_news_scores(news_context, {"AAPL"})
+
+    assert scores == {"AAPL": 1}

@@ -21,6 +21,7 @@ from news_context import NewsContext, WorldEventAnalyzer
 from congress_context import CongressContext, CongressTradeAnalyzer
 from wsb_context import WSBContext, WallStreetBetsAnalyzer, WallStreetBetsSnapshot
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
+from symbol_reference import SymbolReference
 
 
 class AssetRotationStrategy(Strategy):
@@ -383,6 +384,7 @@ class AssetRotationStrategy(Strategy):
                 lookback_hours=int(self.parameters["news_lookback_hours"]),
                 max_articles=int(self.parameters["news_max_articles"]),
                 block_score=int(self.parameters["news_high_risk_score"]),
+                refine_scoring=bool(self.parameters.get("news_score_refinement_enabled", False)),
             )
             context = analyzer.analyze()
             self.log_message(
@@ -1022,6 +1024,47 @@ class AssetRotationStrategy(Strategy):
             "win_probability": (wins + 1) / (len(net_returns) + 2),
         }
 
+    def _symbol_news_scores(
+        self, news_context: NewsContext, candidates: set[str]
+    ) -> dict[str, int]:
+        """Per-symbol news severity, cross-checked against the local symbol reference.
+
+        Starts from NewsContext.per_symbol_scores (built from Alpaca's own
+        article symbol tags), drops any tag the local reference has never
+        seen from either source (catching a spurious tag), then extends
+        coverage using scan_text_for_symbols for a company mentioned by name
+        but missed by Alpaca's tagging -- bounded to today's evaluated
+        `candidates`, never the whole market. A symbol with neither an
+        Alpaca tag nor a text match is intentionally absent here -- callers
+        fall back to the market-wide score for it, exactly as before this
+        feature.
+        """
+        if not news_context.available:
+            return {}
+        scores = dict(news_context.per_symbol_scores)
+        if not bool(self.parameters.get("symbol_reference_enabled", True)):
+            return scores
+        try:
+            reference = self._symbol_reference()
+            verified = reference.verified_symbols()
+            if verified:
+                scores = {symbol: value for symbol, value in scores.items() if symbol in verified}
+            for article in news_context.per_article:
+                tagged = {str(symbol) for symbol in article.get("symbols", [])}
+                untagged_candidates = candidates - tagged
+                if not untagged_candidates:
+                    continue
+                text = f"{article.get('headline', '')} {article.get('summary', '')}"
+                for symbol in reference.scan_text_for_symbols(text, untagged_candidates):
+                    scores[symbol] = scores.get(symbol, 0) + int(article.get("score", 0))
+            return scores
+        except Exception as exc:
+            self.log_message(
+                f"Symbol-aware news scoring failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return dict(news_context.per_symbol_scores)
+
     @staticmethod
     def _posture_adjusted_edge(
         signal: dict[str, float | int | str | None],
@@ -1065,6 +1108,38 @@ class AssetRotationStrategy(Strategy):
             int(self.parameters["portfolio_discovery_batch_size"]),
             paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
         )
+
+    def _symbol_reference(self) -> SymbolReference:
+        return SymbolReference(
+            Path(str(self.parameters["symbol_reference_database_file"])),
+            int(self.parameters["symbol_reference_refresh_days"]),
+            paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
+        )
+
+    def _refresh_symbol_reference(self, symbols: list[str]) -> None:
+        """Keep the local cross-checked symbol mapping current, off the critical path.
+
+        A refresh failure must not affect trading: it only ever narrows or
+        widens which per-symbol news attributions are trusted, never
+        creates a trade or veto.
+        """
+        if not bool(self.parameters.get("symbol_reference_enabled", True)):
+            return
+        try:
+            refreshed = self._symbol_reference().refresh(
+                symbols,
+                os.environ.get("ALPACA_API_KEY", ""),
+                os.environ.get("ALPACA_API_SECRET", ""),
+            )
+            if refreshed:
+                self.log_message(
+                    f"Symbol reference refreshed for {len(symbols)} symbols.", color="blue"
+                )
+        except Exception as exc:
+            self.log_message(
+                f"Symbol reference refresh failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
 
     def _portfolio_symbols(
         self,
@@ -1141,6 +1216,7 @@ class AssetRotationStrategy(Strategy):
             wsb_explanation=wsb_context.explanation,
             wsb_highlights=wsb_context.highlights,
         )
+        self._refresh_symbol_reference(symbols)
         congress_context = self._get_congress_context(symbols)
         report.update(
             congress_symbols_matched=(
@@ -1292,13 +1368,19 @@ class AssetRotationStrategy(Strategy):
         # tie-breaking below; the eligibility floor two lines down still
         # gates on the raw historical expected_profit, unaffected by posture.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
-        current_news_score = news_context.score if news_context.available else None
+        market_wide_news_score = news_context.score if news_context.available else None
+        symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
         wsb_sentiment_by_symbol = (
             {item.symbol: item.sentiment for item in wsb_context.mentions} if wsb_context.available else {}
         )
         for signal in signals:
+            symbol = str(signal["symbol"])
+            # A symbol with dedicated coverage today (even a genuinely
+            # neutral 0) is trusted over the market-wide score; only a
+            # symbol with no coverage at all falls back to it.
+            news_score = symbol_news_scores.get(symbol, market_wide_news_score)
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
-                signal, risk_posture, current_news_score, wsb_sentiment_by_symbol.get(str(signal["symbol"]))
+                signal, risk_posture, news_score, wsb_sentiment_by_symbol.get(symbol)
             )
         report["portfolio_risk_posture"] = risk_posture
         eligible = [

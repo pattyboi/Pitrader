@@ -34,6 +34,7 @@ understand the risks.
 - [Optional features](#optional-features)
   - [Daily email report](#daily-email-report)
   - [World-event and news awareness](#world-event-and-news-awareness)
+  - [Local symbol cross-reference](#local-symbol-cross-reference)
   - [WallStreetBets context and discovery](#wallstreetbets-context-and-discovery)
   - [Congressional-trading context](#congressional-trading-context)
   - [LLM news assessment](#llm-news-assessment)
@@ -192,6 +193,7 @@ pi-trading-agent/
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── trade_memory.py      DuckDB journal and learning from past rotation signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
+├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── congress_context.py Public STOCK Act disclosure context (research-only)
 ├── wsb_context.py      Public AltIndex WallStreetBets context and discovery
 ├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
@@ -207,7 +209,8 @@ adaptive model creates `.news_learning_state.json` to preserve its observations.
 Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances).
 On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
-requiring a DuckDB extension download.
+requiring a DuckDB extension download. The local symbol cross-reference keeps
+its own small DuckDB database, `.symbol_reference.duckdb`.
 `.rotation_state.json` remembers a rotation that is partway through (sold
 Asset A, not yet bought Asset B) so restarts cannot strand the cash. Portfolio
 mode keeps its own equivalents: `.portfolio_rotation_state.json` for a staged
@@ -393,6 +396,9 @@ chmod 600 config.json
 | `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
+| `NEWS_SCORE_REFINEMENT_ENABLED` | Applies recency decay and duplicate-event dampening to the keyword score; changes its exact value, so off by default | `false` |
+| `SYMBOL_REFERENCE_ENABLED` | Cross-checks Alpaca's per-article symbol tags against a second source before trusting them for per-symbol ranking | `true` |
+| `SYMBOL_REFERENCE_REFRESH_DAYS` | Days between local symbol-mapping refreshes | `7` |
 | `CONGRESS_CONTEXT_ENABLED` | Adds Kadoa public disclosure context to logs/email; never affects orders | `false` |
 | `CONGRESS_CONTEXT_TIMEOUT_SECONDS` | Maximum wait for the public Kadoa dataset | `10.0` |
 | `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
@@ -609,6 +615,29 @@ Dip signal met, but rotation was blocked by the configured world-event risk guar
 
 Headlines in that example are illustrative. Actual output comes from Alpaca.
 
+#### Per-symbol relevance and score refinement
+
+In portfolio mode, Alpaca tags each article with the symbols it mentions.
+When [Local symbol cross-reference](#local-symbol-cross-reference) is
+enabled (the default), that per-symbol coverage — cross-checked against the
+local reference, and extended with a bounded company-name text scan for a
+mention Alpaca's own tagging missed — replaces the market-wide score when
+ranking candidates in `_posture_adjusted_edge`: a headline about one
+company's layoffs no longer discounts an unrelated symbol as much as it
+discounts the company it is actually about. A symbol with no dedicated
+coverage still falls back to the market-wide score exactly as before. This
+never changes the market-wide `NEWS_BLOCK_ON_HIGH_RISK` veto itself, which
+still reads the same aggregate score it always has.
+
+Separately, `NEWS_SCORE_REFINEMENT_ENABLED` (`false` by default) applies
+recency decay — an article near the edge of `NEWS_LOOKBACK_HOURS` counts for
+less than one from minutes ago — and duplicate-event dampening — repeated
+wire-service copies of the same matched phrase count for progressively less.
+This changes the exact value of the aggregate score, which feeds
+`NEWS_HIGH_RISK_SCORE` and the adaptive model's training target, so it ships
+off by default; review several weeks of paper-trading logs with it enabled
+before trusting it the same way you would the existing threshold.
+
 #### How news changes a trade decision
 
 News does not create a buy signal by itself. The normal price-dip test still has
@@ -652,7 +681,8 @@ To disable news fetching entirely:
 - Alpaca news is a financial-news feed, not a complete record of every event in
   every country.
 - Breaking events may appear late, be absent, or change after publication.
-- Multiple articles about the same event can make its score larger.
+- Multiple articles about the same event can make its score larger, unless
+  `NEWS_SCORE_REFINEMENT_ENABLED` is on.
 - Keyword matching can misread context or classify an irrelevant story.
 - A constructive keyword does not mean an asset will rise.
 - A negative score does not mean an asset will fall.
@@ -661,6 +691,34 @@ To disable news fetching entirely:
 
 Use paper mode to compare the logged scores with actual headlines and market
 behavior before relying on the guard.
+
+### Local symbol cross-reference
+
+`SYMBOL_REFERENCE_ENABLED` (`true` by default) builds a small local mapping
+of ticker to company name from two independent public sources — Alpaca's own
+asset directory and the SEC's public `company_tickers.json` dataset — and
+cross-checks them against each other before trusting a symbol association.
+Like every other context feature, it never creates a trade, chooses a
+symbol, or vetoes a decision on its own; it only decides whether an
+already-collected news-to-symbol association (see
+[Per-symbol relevance](#per-symbol-relevance-and-score-refinement)) is
+trustworthy enough to use.
+
+A ticker recognized by both sources is treated as cross-verified; a ticker
+only one source knows about is still used, just without that extra
+confirmation; a ticker neither source recognizes is dropped, which catches a
+stray or malformed tag before it can skew a symbol's ranking. The mapping is
+refreshed at most every `SYMBOL_REFERENCE_REFRESH_DAYS` (7 by default) and
+only for symbols currently on the watchlist or held, not the whole market,
+so this stays cheap: roughly one request per watched symbol plus one SEC
+fetch, once a week, persisted in `.symbol_reference.duckdb`. If nothing has
+been cached yet or both sources are unreachable, the agent fails open and
+trusts Alpaca's raw article tags unfiltered — exactly today's behavior.
+
+```json
+"SYMBOL_REFERENCE_ENABLED": true,
+"SYMBOL_REFERENCE_REFRESH_DAYS": 7
+```
 
 ### WallStreetBets context and discovery
 

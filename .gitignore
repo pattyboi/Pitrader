@@ -21,6 +21,8 @@ pi-trading-agent/config.json
 .trade_memory.sqlite3
 .trade_memory.duckdb
 .trade_memory.duckdb.*
+.symbol_reference.duckdb
+.symbol_reference.duckdb.*
 
 # Python bytecode
 __pycache__/

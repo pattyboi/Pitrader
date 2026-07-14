@@ -373,6 +373,23 @@ def load_config(path: Path) -> dict[str, Any]:
     config["DECISION_MEMORY_MIN_CORRELATION"] = decision_correlation
     config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"] = decision_edge
     config["DECISION_MEMORY_BACKFILL_DAYS"] = decision_backfill_days
+
+    symbol_reference_defaults = {
+        "SYMBOL_REFERENCE_ENABLED": True,
+        "SYMBOL_REFERENCE_REFRESH_DAYS": 7,
+        "NEWS_SCORE_REFINEMENT_ENABLED": False,
+    }
+    for key, default in symbol_reference_defaults.items():
+        config.setdefault(key, default)
+    if not isinstance(config["SYMBOL_REFERENCE_ENABLED"], bool):
+        raise TypeError("SYMBOL_REFERENCE_ENABLED must be true or false")
+    if not isinstance(config["NEWS_SCORE_REFINEMENT_ENABLED"], bool):
+        raise TypeError("NEWS_SCORE_REFINEMENT_ENABLED must be true or false")
+    symbol_reference_refresh_days = int(config["SYMBOL_REFERENCE_REFRESH_DAYS"])
+    if not 1 <= symbol_reference_refresh_days <= 30:
+        raise ValueError("SYMBOL_REFERENCE_REFRESH_DAYS must be between 1 and 30")
+    config["SYMBOL_REFERENCE_REFRESH_DAYS"] = symbol_reference_refresh_days
+
     return config
 
 
@@ -516,6 +533,10 @@ def main() -> int:
                     "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
                 ],
                 "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
+                "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
+                "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
+                "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],
+                "symbol_reference_database_file": str(BASE_DIR / ".symbol_reference.duckdb"),
                 "decision_memory_enabled": config["DECISION_MEMORY_ENABLED"],
                 "decision_memory_block_enabled": config["DECISION_MEMORY_BLOCK_ENABLED"],
                 "decision_memory_min_observations": config["DECISION_MEMORY_MIN_OBSERVATIONS"],
