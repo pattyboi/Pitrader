@@ -6,6 +6,7 @@ import os
 import smtplib
 import ssl
 import threading
+from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from email.message import EmailMessage
 from pathlib import Path
@@ -38,6 +39,7 @@ class AssetRotationStrategy(Strategy):
         "portfolio_oos_min_observations": 10,
         "portfolio_oos_min_net_profit_percent": 0.0,
         "portfolio_round_trip_cost_percent": 0.20,
+        "portfolio_max_holding_days": 1,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -67,6 +69,7 @@ class AssetRotationStrategy(Strategy):
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
+        self.vars.portfolio_holding_dates = self._load_portfolio_holding_dates()
         if self.vars.pending_rotation and bool(self.parameters.get("portfolio_enabled", False)):
             # The A/B rotation flag is meaningless in portfolio mode and the
             # portfolio branch never reconciles it; clear it so a later switch
@@ -153,6 +156,67 @@ class AssetRotationStrategy(Strategy):
             temporary_path.replace(path)
         except OSError as exc:
             self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
+
+    def _portfolio_holding_state_path(self) -> Path | None:
+        raw = self.parameters.get("portfolio_holding_state_file")
+        return Path(str(raw)) if raw else None
+
+    def _load_portfolio_holding_dates(self) -> dict[str, str]:
+        """Restore broker-confirmed portfolio entry dates after a restart."""
+        path = self._portfolio_holding_state_path()
+        if path is None or not path.exists():
+            return {}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return {}
+            return {
+                str(symbol).upper(): value
+                for symbol, value in state.items()
+                if isinstance(value, str)
+                and str(symbol).strip()
+                and self._valid_iso_date(value)
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _valid_iso_date(value: str) -> bool:
+        try:
+            date_type.fromisoformat(value)
+            return True
+        except ValueError:
+            return False
+
+    def _set_portfolio_holding_dates(self, dates: dict[str, str]) -> None:
+        self.vars.portfolio_holding_dates = dates
+        path = self._portfolio_holding_state_path()
+        if path is None:
+            return
+        try:
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(dates, sort_keys=True) + "\n", encoding="utf-8")
+            temporary_path.replace(path)
+        except OSError as exc:
+            self.log_message(f"Could not persist portfolio holding dates: {exc}", color="red")
+
+    def _record_portfolio_entry(self, symbol: str) -> None:
+        dates = dict(self.vars.portfolio_holding_dates)
+        dates[str(symbol).upper()] = self.get_datetime().date().isoformat()
+        self._set_portfolio_holding_dates(dates)
+
+    def _remove_portfolio_entry(self, symbol: str) -> None:
+        dates = dict(self.vars.portfolio_holding_dates)
+        dates.pop(str(symbol).upper(), None)
+        self._set_portfolio_holding_dates(dates)
+
+    @staticmethod
+    def _holding_is_due(entry_date: str, today: date_type, maximum_days: int) -> bool:
+        """Return whether a confirmed entry has reached its configured horizon."""
+        try:
+            return today - date_type.fromisoformat(entry_date) >= timedelta(days=maximum_days)
+        except ValueError:
+            return False
 
     def _has_active_order(self, symbol: str, side: str) -> bool:
         """Best-effort check for a working order; unknown states count as active."""
@@ -948,6 +1012,44 @@ class AssetRotationStrategy(Strategy):
                 report["status"] = f"Portfolio {target} purchase submitted after {source} sale"
             return
 
+        # The portfolio signal is validated against next-session returns. Keep
+        # actual holding duration aligned with that measured horizon, including
+        # after restarts. A configured managed holding with no fill record is
+        # conservatively dated today on first observation rather than sold
+        # immediately.
+        holding_dates = dict(self.vars.portfolio_holding_dates)
+        today = self.get_datetime().date()
+        new_dates = False
+        for symbol in held:
+            if symbol not in holding_dates:
+                holding_dates[symbol] = today.isoformat()
+                new_dates = True
+        for symbol in list(holding_dates):
+            if symbol not in held:
+                holding_dates.pop(symbol)
+                new_dates = True
+        if new_dates:
+            self._set_portfolio_holding_dates(holding_dates)
+        maximum_holding_days = int(self.parameters.get("portfolio_max_holding_days", 1))
+        due_symbols = sorted(
+            symbol
+            for symbol in held
+            if self._holding_is_due(holding_dates[symbol], today, maximum_holding_days)
+        )
+        if due_symbols:
+            source = due_symbols[0]
+            if self._has_active_order(source, "sell"):
+                report["status"] = f"Portfolio exit pending: waiting for {source} sale"
+                return
+            self.submit_order(
+                self.create_order(source, quantity=held[source], side="sell", order_type="market")
+            )
+            report["status"] = (
+                f"Portfolio exit submitted: {source} reached its "
+                f"{maximum_holding_days}-day holding horizon"
+            )
+            return
+
         signals = [self._portfolio_signal(symbol) for symbol in symbols]
         signals = [signal for signal in signals if signal is not None]
         eligible = [
@@ -1353,6 +1455,11 @@ class AssetRotationStrategy(Strategy):
         # a full day for the next iteration), and clear the pending flag only
         # when the replacement purchase itself fills.
         portfolio_pending = self.vars.portfolio_pending_rotation
+        if bool(self.parameters.get("portfolio_enabled", False)):
+            if side_text == "buy":
+                self._record_portfolio_entry(str(symbol))
+            elif side_text == "sell":
+                self._remove_portfolio_entry(str(symbol))
         if portfolio_pending:
             if symbol == portfolio_pending["to"] and side_text == "buy":
                 self._set_portfolio_rotation(None)

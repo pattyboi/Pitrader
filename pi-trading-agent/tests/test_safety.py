@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import date
 
 from adaptive_news_model import AdaptiveNewsModel
 from strategy import AssetRotationStrategy
@@ -55,3 +56,8 @@ def test_walk_forward_validation_accounts_for_costs_before_selection() -> None:
     )
 
     assert outcomes == []
+
+
+def test_holding_horizon_is_due_on_the_next_trading_day_interval() -> None:
+    assert AssetRotationStrategy._holding_is_due("2026-01-02", date(2026, 1, 5), 1)
+    assert not AssetRotationStrategy._holding_is_due("2026-01-05", date(2026, 1, 5), 1)

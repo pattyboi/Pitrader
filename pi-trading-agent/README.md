@@ -68,7 +68,10 @@ costs. It also runs a chronological walk-forward check: each validation trade
 is selected only from earlier observations, never its own realised return. It
 opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
 historical estimate and the out-of-sample result meet their configured minimums
-with enough observations. Cash is split among open slots.
+with enough observations. Because that validation measures a next-session
+return, the default holding horizon is one trading-day interval; positions are
+sold after `PORTFOLIO_MAX_HOLDING_DAYS` unless a staged replacement sells them
+first. Cash is split among open slots.
 
 Once full, it replaces one holding only when a new candidate's historical
 expected return exceeds the weakest holding's by at least that same configured
@@ -292,6 +295,7 @@ chmod 600 config.json
 | `PORTFOLIO_OOS_MIN_OBSERVATIONS` | Minimum walk-forward, prior-only validation trades | `10` |
 | `PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT` | Minimum net average return in walk-forward validation | `0.0` |
 | `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return | `0.20` |
+| `PORTFOLIO_MAX_HOLDING_DAYS` | Maximum holding horizon, aligned to the next-session validation target | `1` |
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
 | `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
