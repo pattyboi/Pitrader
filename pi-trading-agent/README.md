@@ -77,7 +77,22 @@ Once full, it replaces one holding only when a new candidate's historical
 expected return exceeds the weakest holding's by at least that same configured
 percentage. A holding that is not currently dipping is scored as a neutral
 `0%` expected edge (it is never force-rotated just because something else
-dipped). Replacements are staged like the A/B rotation: the old position sells
+dipped).
+
+`PORTFOLIO_RISK_POSTURE` (`conservative` by default, or `risky`) reshapes how
+that ranking reads the same observations the agent already collects, without
+ever changing `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` itself or which
+candidates clear it in the first place. `conservative` favors a symbol with a
+steadier history — it penalizes return variance and a negative news-score day
+harder, and ignores WallStreetBets mentions as noise. `risky` favors raw
+historical edge — it barely discounts variance or a bad-news day, and adds a
+small bonus when a candidate is currently WSB-mentioned with bullish
+sentiment (a bearish WSB read is a small penalty either way). The adjustment
+is capped at ±3 percentage points, so it can reorder which qualifying
+candidate looks best and which holding looks weakest, but it can never turn a
+trade that fails the minimum-profit floor into one that passes.
+
+Replacements are staged like the A/B rotation: the old position sells
 first, the replacement is bought as soon as the sale fills (only its sale
 budget is spent), and the staged state clears only when the replacement
 purchase itself fills, so restarts, rejections, and network drops cannot
@@ -315,6 +330,7 @@ chmod 600 config.json
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity | `0.55` |
+| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news, ignores WSB hype); `risky` favors raw historical edge and leans into WSB-bullish mentions. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
 | `WSB_CONTEXT_ENABLED` | Reports public AltIndex WallStreetBets mentions for monitored symbols | `false` |
 | `WSB_DISCOVERY_ENABLED` | Adds top public WSB symbols to the portfolio research universe | `false` |
 | `WSB_DISCOVERY_MAX_SYMBOLS` | Maximum WSB symbols evaluated per cycle | `10` |

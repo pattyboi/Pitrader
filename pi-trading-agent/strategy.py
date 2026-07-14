@@ -45,11 +45,27 @@ class AssetRotationStrategy(Strategy):
         "portfolio_oos_min_net_profit_percent": 0.0,
         "portfolio_round_trip_cost_percent": 0.20,
         "portfolio_max_holding_days": 1,
+        "portfolio_risk_posture": "conservative",
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
     # rejected (or filled into a deficit) if the price moves before execution.
     CASH_BUFFER_FRACTION = 0.01
+
+    # How strongly the risky/conservative reasoning pattern reshapes a
+    # symbol's historical edge in _posture_adjusted_edge: conservative leans
+    # on consistency (penalizing variance and bad-news days harder, ignoring
+    # WSB hype), risky leans on raw edge (barely discounting variance or
+    # negative news, and leaning into WSB-bullish momentum). These never
+    # change PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself, only which
+    # already-qualifying candidate looks best and which holding looks
+    # weakest.
+    _POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
+    _POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
+    _POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
+    _POSTURE_WSB_BULLISH_BONUS = {"conservative": 0.0, "risky": 0.25}
+    _POSTURE_WSB_BEARISH_PENALTY = {"conservative": 0.20, "risky": 0.05}
+    _POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
 
     # Order statuses that mean an order can no longer fill. Anything else is
     # treated as still working so the agent never submits a duplicate.
@@ -272,6 +288,7 @@ class AssetRotationStrategy(Strategy):
             if portfolio_mode:
                 lines += [
                     "Mode: portfolio",
+                    f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
                     f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
                     f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
                     f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
@@ -979,6 +996,9 @@ class AssetRotationStrategy(Strategy):
             int(self.parameters.get("portfolio_oos_min_observations", 10)),
             float(self.parameters["portfolio_min_expected_profit_percent"]),
         )
+        mean_net_return = sum(net_returns) / len(net_returns)
+        variance = sum((value - mean_net_return) ** 2 for value in net_returns) / len(net_returns)
+        wins = sum(1 for value in net_returns if value > 0)
         return {
             "symbol": symbol,
             "price": float(price),
@@ -986,7 +1006,7 @@ class AssetRotationStrategy(Strategy):
             # This net historical mean is a coarse current estimate. It is
             # never enough by itself: _run_portfolio_iteration also requires
             # the chronological walk-forward result below.
-            "expected_profit": sum(net_returns) / len(net_returns),
+            "expected_profit": mean_net_return,
             "observations": len(returns),
             "oos_expected_profit": (
                 sum(walk_forward_returns) / len(walk_forward_returns)
@@ -994,7 +1014,49 @@ class AssetRotationStrategy(Strategy):
                 else None
             ),
             "oos_observations": len(walk_forward_returns),
+            # Feed the risky/conservative reasoning pattern in
+            # _posture_adjusted_edge: how spread out this symbol's past
+            # dip-signal outcomes were, and a Laplace-smoothed win rate
+            # (matches TradeMemory.opportunity_probability's convention).
+            "return_stdev": math.sqrt(variance),
+            "win_probability": (wins + 1) / (len(net_returns) + 2),
         }
+
+    @staticmethod
+    def _posture_adjusted_edge(
+        signal: dict[str, float | int | str | None],
+        posture: str,
+        news_score: float | int | None,
+        wsb_sentiment: str | None,
+    ) -> float:
+        """Reshape a symbol's historical edge through a risky or conservative lens.
+
+        Conservative leans on consistency: it penalizes return variance and a
+        negative news day harder, and ignores WSB mentions as noise. Risky
+        leans on raw edge: it barely discounts variance or bad news, and
+        leans into WSB-bullish momentum while shrugging off bearish chatter.
+        This never changes PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself; it
+        only reweights which already-qualifying candidate looks best and
+        which current holding looks weakest.
+        """
+        posture = posture if posture in ("conservative", "risky") else "conservative"
+        expected_profit = float(signal["expected_profit"])
+        stdev = float(signal.get("return_stdev") or 0.0)
+        win_probability = float(signal.get("win_probability") or 0.5)
+        adjustment = -AssetRotationStrategy._POSTURE_VARIANCE_PENALTY[posture] * stdev
+        adjustment += (
+            (win_probability - 0.5) * 2.0 * AssetRotationStrategy._POSTURE_CONSISTENCY_WEIGHT[posture]
+        )
+        if news_score is not None:
+            capped_score = max(-10.0, min(10.0, float(news_score)))
+            adjustment -= max(0.0, -capped_score) * AssetRotationStrategy._POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
+        if wsb_sentiment == "bullish":
+            adjustment += AssetRotationStrategy._POSTURE_WSB_BULLISH_BONUS[posture]
+        elif wsb_sentiment == "bearish":
+            adjustment -= AssetRotationStrategy._POSTURE_WSB_BEARISH_PENALTY[posture]
+        max_adjustment = AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
+        adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
+        return expected_profit + adjustment
 
     def _autonomous_universe(self) -> AutonomousUniverse:
         return AutonomousUniverse(
@@ -1226,6 +1288,19 @@ class AssetRotationStrategy(Strategy):
 
         signals = [self._portfolio_signal(symbol) for symbol in symbols]
         signals = [signal for signal in signals if signal is not None]
+        # The risky/conservative reasoning pattern only reshapes ranking and
+        # tie-breaking below; the eligibility floor two lines down still
+        # gates on the raw historical expected_profit, unaffected by posture.
+        risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
+        current_news_score = news_context.score if news_context.available else None
+        wsb_sentiment_by_symbol = (
+            {item.symbol: item.sentiment for item in wsb_context.mentions} if wsb_context.available else {}
+        )
+        for signal in signals:
+            signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
+                signal, risk_posture, current_news_score, wsb_sentiment_by_symbol.get(str(signal["symbol"]))
+            )
+        report["portfolio_risk_posture"] = risk_posture
         eligible = [
             signal
             for signal in signals
@@ -1235,7 +1310,7 @@ class AssetRotationStrategy(Strategy):
             and signal["oos_expected_profit"] is not None
             and float(signal["oos_expected_profit"]) >= oos_minimum_profit
         ]
-        eligible.sort(key=lambda signal: (float(signal["expected_profit"]), float(signal["dip"])), reverse=True)
+        eligible.sort(key=lambda signal: (float(signal["posture_adjusted_edge"]), float(signal["dip"])), reverse=True)
         opportunity_probability = opportunity.get("probability")
         opportunity_edge = opportunity.get("predicted_edge")
         opportunity_is_eligible = (
@@ -1254,7 +1329,8 @@ class AssetRotationStrategy(Strategy):
             list(dict.fromkeys([str(signal["symbol"]) for signal in eligible] + sorted(held)))
         )
         report["portfolio_candidates"] = ", ".join(
-            f"{s['symbol']} net {s['expected_profit']:+.2f}%/{s['observations']}; "
+            f"{s['symbol']} net {s['expected_profit']:+.2f}%/{s['observations']} "
+            f"(posture {s['posture_adjusted_edge']:+.2f}%); "
             f"OOS {float(s['oos_expected_profit']):+.2f}%/{s['oos_observations']}"
             for s in eligible
         ) or "none"
@@ -1319,12 +1395,19 @@ class AssetRotationStrategy(Strategy):
         held_signals = {str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held}
         # A holding with no current dip signal is scored neutral (0% expected
         # edge), not punished: rotation happens only when the target's
-        # historical edge beats holding by the configured margin. The old
-        # -100% default force-rotated any recovered holding every time some
-        # other symbol dipped, churning the portfolio.
-        source = min(held, key=lambda symbol: float(held_signals.get(symbol, {"expected_profit": 0.0})["expected_profit"]))
-        source_score = float(held_signals.get(source, {"expected_profit": 0.0})["expected_profit"])
-        advantage = float(target["expected_profit"]) - source_score
+        # posture-adjusted edge beats holding by the configured margin. The
+        # old -100% default force-rotated any recovered holding every time
+        # some other symbol dipped, churning the portfolio. The posture lens
+        # only changes which holding looks weakest and by how much; the
+        # PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT floor below is unchanged.
+        source = min(
+            held,
+            key=lambda symbol: float(
+                held_signals.get(symbol, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
+            ),
+        )
+        source_score = float(held_signals.get(source, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"])
+        advantage = float(target["posture_adjusted_edge"]) - source_score
         if advantage < minimum_profit:
             report["status"] = f"No portfolio rotation: {target['symbol']} advantage {advantage:+.2f}% is below threshold"
             return

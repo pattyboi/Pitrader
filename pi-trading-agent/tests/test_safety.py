@@ -175,3 +175,47 @@ def test_decision_memory_uses_duckdb_and_imports_legacy_sqlite(tmp_path: Path) -
     assert (tmp_path / ".trade_memory.duckdb").is_file()
     assert result.observations == 1
     memory.record_execution("2026-01-05", "SPY", "buy", 102.0, 1.0)
+
+
+def test_posture_adjusted_edge_keeps_the_expected_profit_floor_unchanged() -> None:
+    # A signal exactly at the minimum-profit floor must still read as exactly
+    # that floor before any posture adjustment is layered on: the floor
+    # itself is never touched by the reasoning pattern, only what gets added
+    # or subtracted around it.
+    signal = {"expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5}
+
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None, None) == 1.0
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None, None) == 1.0
+
+
+def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
+    volatile = {"expected_profit": 3.0, "return_stdev": 4.0, "win_probability": 0.5}
+
+    conservative = AssetRotationStrategy._posture_adjusted_edge(volatile, "conservative", None, None)
+    risky = AssetRotationStrategy._posture_adjusted_edge(volatile, "risky", None, None)
+
+    assert conservative < risky < 3.0
+
+
+def test_conservative_posture_discounts_bad_news_harder_than_risky() -> None:
+    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
+
+    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -8, None)
+    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8, None)
+
+    assert conservative < risky < 2.0
+
+
+def test_risky_posture_leans_into_wsb_bullish_momentum_conservative_ignores_it() -> None:
+    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
+
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None, "bullish") > 2.0
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None, "bullish") == 2.0
+
+
+def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
+    extreme = {"expected_profit": 5.0, "return_stdev": 1000.0, "win_probability": 1.0}
+
+    conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10, "bearish")
+
+    assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT

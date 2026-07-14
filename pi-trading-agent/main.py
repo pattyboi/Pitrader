@@ -137,6 +137,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_CASH_RESERVE_DOLLARS": 2.0,
         "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
         "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
+        "PORTFOLIO_RISK_POSTURE": "conservative",
         "WSB_CONTEXT_ENABLED": False,
         "WSB_DISCOVERY_ENABLED": False,
         "WSB_DISCOVERY_MAX_SYMBOLS": 10,
@@ -205,6 +206,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("PORTFOLIO_MIN_ORDER_DOLLARS must be between 1 and 1000")
     if not 0.5 <= opportunity_min_probability <= 0.95:
         raise ValueError("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY must be between 0.5 and 0.95")
+    risk_posture = str(config["PORTFOLIO_RISK_POSTURE"]).strip().lower()
+    if risk_posture not in ("conservative", "risky"):
+        raise ValueError("PORTFOLIO_RISK_POSTURE must be conservative or risky")
+    config["PORTFOLIO_RISK_POSTURE"] = risk_posture
     if not 1 <= wsb_max_symbols <= 20:
         raise ValueError("WSB_DISCOVERY_MAX_SYMBOLS must be between 1 and 20")
     if not 1.0 <= wsb_timeout <= 30.0:
@@ -481,6 +486,7 @@ def main() -> int:
                 "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
                 "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
                 "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
+                "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
                 "wsb_context_enabled": config["WSB_CONTEXT_ENABLED"],
                 "wsb_discovery_enabled": config["WSB_DISCOVERY_ENABLED"],
                 "wsb_discovery_max_symbols": config["WSB_DISCOVERY_MAX_SYMBOLS"],
