@@ -58,6 +58,9 @@ class AssetRotationStrategy(Strategy):
         self.sleeptime = "1D"
         self._rotation_lock = threading.Lock()
         self.vars.pending_rotation = self._load_pending_rotation()
+        # Historical bars are fetched during the first evaluation, after the
+        # broker has supplied current market data.
+        self.vars.decision_memory_backfill_attempted = False
         if self.vars.pending_rotation:
             self.log_message(
                 "Restored an in-progress rotation from disk; it will be "
@@ -372,6 +375,69 @@ class AssetRotationStrategy(Strategy):
                 f"Decision memory failed: {type(exc).__name__}: {exc}",
             )
 
+    def _backfill_decision_memory(self, asset_a: str, asset_b: str) -> None:
+        """Seed decision memory from settled daily bars once per process start."""
+        if self.vars.decision_memory_backfill_attempted:
+            return
+        days = int(self.parameters.get("decision_memory_backfill_days", 0))
+        if not bool(self.parameters.get("decision_memory_enabled", True)) or days < 2:
+            self.vars.decision_memory_backfill_attempted = True
+            return
+        try:
+            bars_a = self.get_historical_prices(asset_a, days, "day")
+            bars_b = self.get_historical_prices(asset_b, days, "day")
+            if (
+                bars_a is None
+                or bars_b is None
+                or bars_a.df is None
+                or bars_b.df is None
+                or bars_a.df.empty
+                or bars_b.df.empty
+                or not {"close"}.issubset(bars_a.df.columns)
+                or not {"close", "high"}.issubset(bars_b.df.columns)
+            ):
+                self.log_message("Decision-memory historical backfill unavailable; continuing normally.", color="yellow")
+                return
+
+            a_closes = {
+                str(index.date() if hasattr(index, "date") else index): float(value)
+                for index, value in bars_a.df["close"].dropna().items()
+                if math.isfinite(float(value)) and float(value) > 0
+            }
+            b_rows = [
+                (str(index.date() if hasattr(index, "date") else index), float(row["close"]), float(row["high"]))
+                for index, row in bars_b.df[["close", "high"]].dropna().iterrows()
+                if math.isfinite(float(row["close"]))
+                and math.isfinite(float(row["high"]))
+                and float(row["close"]) > 0
+                and float(row["high"]) > 0
+            ]
+            lookback = int(self.parameters["recent_high_lookback_days"])
+            threshold = float(self.parameters["dip_threshold_percent"])
+            history = []
+            for position, (date, close_b, high_b) in enumerate(b_rows):
+                close_a = a_closes.get(date)
+                if close_a is None:
+                    continue
+                recent_high = max(row[2] for row in b_rows[max(0, position - lookback + 1) : position + 1])
+                dip = ((recent_high - close_b) / recent_high) * 100.0
+                history.append((date, close_a, close_b, dip, dip >= threshold))
+            inserted = TradeMemory(
+                Path(str(self.parameters["decision_memory_database_file"])),
+                1,
+                int(self.parameters["decision_memory_max_observations"]),
+            ).backfill_history(history)
+            self.log_message(
+                f"Decision-memory historical backfill added {inserted} settled daily observations.",
+                color="blue",
+            )
+            self.vars.decision_memory_backfill_attempted = True
+        except Exception as exc:
+            self.log_message(
+                f"Decision-memory historical backfill failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+
     def _record_memory_decision(self, report: dict[str, Any]) -> None:
         """Persist the final decision label after an observation was recorded."""
         if not report.get("decision_memory_recorded"):
@@ -506,6 +572,8 @@ class AssetRotationStrategy(Strategy):
                 report["status"] = "No trade: invalid non-positive price received"
                 self.log_message("Invalid non-positive market price received; no trade made.", color="red")
                 return
+
+            self._backfill_decision_memory(asset_a, asset_b)
 
             learning_result = self._update_adaptive_learning(price_b, news_context)
             report.update(

@@ -199,6 +199,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "DECISION_MEMORY_MAX_OBSERVATIONS": 180,
         "DECISION_MEMORY_MIN_CORRELATION": 0.25,
         "DECISION_MEMORY_EDGE_BLOCK_PERCENT": -0.75,
+        "DECISION_MEMORY_BACKFILL_DAYS": 1000,
     }
     for key, default in decision_defaults.items():
         config.setdefault(key, default)
@@ -208,14 +209,18 @@ def load_config(path: Path) -> dict[str, Any]:
     decision_maximum = int(config["DECISION_MEMORY_MAX_OBSERVATIONS"])
     decision_correlation = float(config["DECISION_MEMORY_MIN_CORRELATION"])
     decision_edge = float(config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"])
+    decision_backfill_days = int(config["DECISION_MEMORY_BACKFILL_DAYS"])
     if not 20 <= decision_minimum <= 500 or not decision_minimum <= decision_maximum <= 1000:
         raise ValueError("DECISION_MEMORY observation limits must be from 20 to 1000")
     if not 0.0 <= decision_correlation <= 1.0 or not -25.0 <= decision_edge < 0.0:
         raise ValueError("DECISION_MEMORY correlation must be 0..1 and edge block must be -25..<0")
+    if not 0 <= decision_backfill_days <= 5000:
+        raise ValueError("DECISION_MEMORY_BACKFILL_DAYS must be between 0 and 5000")
     config["DECISION_MEMORY_MIN_OBSERVATIONS"] = decision_minimum
     config["DECISION_MEMORY_MAX_OBSERVATIONS"] = decision_maximum
     config["DECISION_MEMORY_MIN_CORRELATION"] = decision_correlation
     config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"] = decision_edge
+    config["DECISION_MEMORY_BACKFILL_DAYS"] = decision_backfill_days
     return config
 
 
@@ -290,6 +295,7 @@ def main() -> int:
                 "decision_memory_max_observations": config["DECISION_MEMORY_MAX_OBSERVATIONS"],
                 "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
                 "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
+                "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
                 "decision_memory_database_file": str(BASE_DIR / ".trade_memory.sqlite3"),
                 "llm_news_enabled": config["LLM_NEWS_ENABLED"],
                 "llm_news_provider": config["LLM_NEWS_PROVIDER"],

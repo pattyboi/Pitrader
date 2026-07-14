@@ -68,6 +68,53 @@ class TradeMemory:
             ).fetchall()
         return self._fit(list(reversed(rows)), dip_percent, news_score)
 
+    def backfill_history(
+        self,
+        rows: list[tuple[str, float, float, float, bool]],
+    ) -> int:
+        """Import completed daily observations without changing existing records.
+
+        Each row is ``(date, asset_a_close, asset_b_close, dip, signal)``.
+        The following row supplies the already-known next-session outcome, so
+        only rows with a subsequent valid close are stored as settled.  This is
+        deliberately price-only: inventing historic news scores would make the
+        learned relationship look more certain than it is.
+        """
+        if len(rows) < 2:
+            return 0
+        inserted = 0
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.database_path) as conn:
+            self._create_schema(conn)
+            for (date, price_a, price_b, dip, signal), (_, next_a, next_b, _, _) in zip(
+                rows, rows[1:]
+            ):
+                if min(price_a, price_b, next_a, next_b) <= 0:
+                    continue
+                edge = ((next_b - price_b) / price_b - (next_a - price_a) / price_a) * 100.0
+                if not math.isfinite(edge):
+                    continue
+                result = conn.execute(
+                    """
+                    INSERT INTO observations
+                        (evaluation_date, price_a, price_b, dip_percent, news_score,
+                         signal_present, relative_return_percent)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?)
+                    ON CONFLICT(evaluation_date) DO NOTHING
+                    """,
+                    (
+                        date,
+                        price_a,
+                        price_b,
+                        dip,
+                        int(signal),
+                        max(-25.0, min(25.0, edge)),
+                    ),
+                )
+                inserted += max(result.rowcount, 0)
+            conn.commit()
+        return inserted
+
     def record_decision(self, evaluation_date: str, decision: str, reason: str) -> None:
         """Attach the final decision to today's already-recorded snapshot."""
         with sqlite3.connect(self.database_path) as conn:

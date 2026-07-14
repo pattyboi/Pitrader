@@ -178,6 +178,7 @@ The initial file is:
   "DECISION_MEMORY_MAX_OBSERVATIONS": 180,
   "DECISION_MEMORY_MIN_CORRELATION": 0.25,
   "DECISION_MEMORY_EDGE_BLOCK_PERCENT": -0.75,
+  "DECISION_MEMORY_BACKFILL_DAYS": 1000,
   "LLM_NEWS_ENABLED": false,
   "LLM_NEWS_PROVIDER": "gemini",
   "LLM_NEWS_API_KEY": "REPLACE_WITH_YOUR_LLM_API_KEY",
@@ -242,6 +243,7 @@ chmod 600 config.json
 | `DECISION_MEMORY_MAX_OBSERVATIONS` | Rolling comparable-signal history retained | `180` |
 | `DECISION_MEMORY_MIN_CORRELATION` | Fit strength required for a decision-memory veto | `0.25` |
 | `DECISION_MEMORY_EDGE_BLOCK_PERCENT` | B-minus-A forecast at or below which rotation is blocked | `-0.75` |
+| `DECISION_MEMORY_BACKFILL_DAYS` | Daily bars imported at startup to shorten decision-memory warm-up (`0` disables) | `1000` |
 | `LLM_NEWS_ENABLED` | Sends the day's headlines to an LLM for one risk assessment | `false` |
 | `LLM_NEWS_PROVIDER` | `gemini`, `openai_compatible`, or `anthropic` | `"gemini"` |
 | `LLM_NEWS_API_KEY` | API key for the chosen provider | Your API key |
@@ -648,6 +650,19 @@ forecasts. A veto requires both a negative predicted edge and the configured
 minimum fit correlation. It never creates a trade, increases order size, or
 overrides the existing safeguards. Delete `.trade_memory.sqlite3` only if you
 intend to reset this learning history.
+
+### Startup catch-up
+
+On its first valid evaluation after a start, the agent imports up to
+`DECISION_MEMORY_BACKFILL_DAYS` of daily price bars (default: 1,000). It
+calculates each historical dip using the configured lookback and stores only
+next-session outcomes that were already complete. Existing dates are never
+overwritten, so restarts are safe; a transient data failure is retried on the
+next daily evaluation. Set the value to `0` to disable this request.
+
+The adaptive news learner is not backfilled: it needs the actual news score
+known on each historical date. Reusing today's score for earlier prices would
+produce misleading training data. Its daily warm-up therefore remains intact.
 
 ### Resetting learned history
 
