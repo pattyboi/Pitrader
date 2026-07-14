@@ -117,10 +117,10 @@ def load_config(path: Path) -> dict[str, Any]:
     if lookback_days < 2:
         raise ValueError("RECENT_HIGH_LOOKBACK_DAYS must be at least 2")
 
-    # Portfolio mode is deliberately opt-in. Autonomous discovery, when also
-    # enabled, expands the configured seed watchlist through a bounded scan.
+    # Portfolio mode is the default. Autonomous discovery, when also enabled,
+    # expands the configured seed watchlist through a bounded scan.
     portfolio_defaults = {
-        "PORTFOLIO_ENABLED": False,
+        "PORTFOLIO_ENABLED": True,
         "PORTFOLIO_SYMBOLS": [asset_a, asset_b],
         "PORTFOLIO_MAX_POSITIONS": 1,
         "PORTFOLIO_ANALYSIS_DAYS": 252,
@@ -136,6 +136,13 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_FRACTIONAL_SHARES": True,
         "PORTFOLIO_CASH_RESERVE_DOLLARS": 2.0,
         "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
+        "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
+        "WSB_CONTEXT_ENABLED": False,
+        "WSB_DISCOVERY_ENABLED": False,
+        "WSB_DISCOVERY_MAX_SYMBOLS": 10,
+        "WSB_CONTEXT_TIMEOUT_SECONDS": 10.0,
+        "CONGRESS_CONTEXT_ENABLED": False,
+        "CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0,
     }
     for key, default in portfolio_defaults.items():
         config.setdefault(key, default)
@@ -165,6 +172,13 @@ def load_config(path: Path) -> dict[str, Any]:
         raise TypeError("PORTFOLIO_FRACTIONAL_SHARES must be true or false")
     portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
     portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
+    opportunity_min_probability = float(config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"])
+    if not isinstance(config["WSB_CONTEXT_ENABLED"], bool):
+        raise TypeError("WSB_CONTEXT_ENABLED must be true or false")
+    if not isinstance(config["WSB_DISCOVERY_ENABLED"], bool):
+        raise TypeError("WSB_DISCOVERY_ENABLED must be true or false")
+    wsb_max_symbols = int(config["WSB_DISCOVERY_MAX_SYMBOLS"])
+    wsb_timeout = float(config["WSB_CONTEXT_TIMEOUT_SECONDS"])
     if not 1 <= portfolio_max_positions <= len(portfolio_symbols):
         raise ValueError("PORTFOLIO_MAX_POSITIONS must be between 1 and the number of portfolio symbols")
     if not 30 <= portfolio_analysis_days <= 2000:
@@ -189,6 +203,17 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("PORTFOLIO_CASH_RESERVE_DOLLARS must be between 0 and 1000")
     if not 1.0 <= portfolio_min_order <= 1000.0:
         raise ValueError("PORTFOLIO_MIN_ORDER_DOLLARS must be between 1 and 1000")
+    if not 0.5 <= opportunity_min_probability <= 0.95:
+        raise ValueError("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY must be between 0.5 and 0.95")
+    if not 1 <= wsb_max_symbols <= 20:
+        raise ValueError("WSB_DISCOVERY_MAX_SYMBOLS must be between 1 and 20")
+    if not 1.0 <= wsb_timeout <= 30.0:
+        raise ValueError("WSB_CONTEXT_TIMEOUT_SECONDS must be between 1 and 30")
+    if not isinstance(config["CONGRESS_CONTEXT_ENABLED"], bool):
+        raise TypeError("CONGRESS_CONTEXT_ENABLED must be true or false")
+    congress_timeout = float(config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"])
+    if not 1.0 <= congress_timeout <= 30.0:
+        raise ValueError("CONGRESS_CONTEXT_TIMEOUT_SECONDS must be between 1 and 30")
     config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
     config["PORTFOLIO_MAX_POSITIONS"] = portfolio_max_positions
     config["PORTFOLIO_ANALYSIS_DAYS"] = portfolio_analysis_days
@@ -202,6 +227,10 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"] = discovery_refresh_days
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
     config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
+    config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
+    config["WSB_DISCOVERY_MAX_SYMBOLS"] = wsb_max_symbols
+    config["WSB_CONTEXT_TIMEOUT_SECONDS"] = wsb_timeout
+    config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"] = congress_timeout
 
     if not isinstance(config["EMAIL_REPORT_ENABLED"], bool):
         raise TypeError("EMAIL_REPORT_ENABLED must be true or false")
@@ -451,6 +480,14 @@ def main() -> int:
                 "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
                 "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
                 "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
+                "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
+                "wsb_context_enabled": config["WSB_CONTEXT_ENABLED"],
+                "wsb_discovery_enabled": config["WSB_DISCOVERY_ENABLED"],
+                "wsb_discovery_max_symbols": config["WSB_DISCOVERY_MAX_SYMBOLS"],
+                "wsb_context_timeout_seconds": config["WSB_CONTEXT_TIMEOUT_SECONDS"],
+                "wsb_context_state_file": str(BASE_DIR / ".wsb_context_snapshot.json"),
+                "congress_context_enabled": config["CONGRESS_CONTEXT_ENABLED"],
+                "congress_context_timeout_seconds": config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"],
                 "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
                 "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
                 "news_max_articles": config["NEWS_MAX_ARTICLES"],

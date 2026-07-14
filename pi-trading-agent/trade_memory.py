@@ -26,6 +26,15 @@ class RotationForecast:
     explanation: str
 
 
+@dataclass
+class OpportunityProbability:
+    """Historical chance that a prior A-to-B dip rotation beat holding A."""
+
+    observations: int
+    wins: int
+    probability: float | None
+
+
 class TradeMemory:
     """Record decisions and estimate next-session Asset-B minus Asset-A edge."""
 
@@ -141,6 +150,37 @@ class TradeMemory:
                 (evaluation_date, symbol[:32], side[:12], price, quantity),
             )
             conn.commit()
+
+    def opportunity_probability(self) -> OpportunityProbability:
+        """Return a smoothed win probability using settled, prior dip signals.
+
+        The estimate is (wins + 1) / (observations + 2), a simple Laplace
+        correction that avoids claiming 0% or 100% certainty from a small
+        sample. It only reads outcomes recorded before the current decision.
+        """
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
+            observations, wins = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(CASE WHEN relative_return_percent > 0 THEN 1 ELSE 0 END), 0)
+                FROM (
+                    SELECT relative_return_percent
+                    FROM observations
+                    WHERE signal_present = 1 AND relative_return_percent IS NOT NULL
+                    ORDER BY evaluation_date DESC
+                    LIMIT ?
+                )
+                """,
+                (self.maximum_observations,),
+            ).fetchone()
+        observations, wins = int(observations), int(wins)
+        return OpportunityProbability(
+            observations=observations,
+            wins=wins,
+            probability=(wins + 1) / (observations + 2) if observations else None,
+        )
 
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:

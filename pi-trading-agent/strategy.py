@@ -18,11 +18,13 @@ from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
+from congress_context import CongressContext, CongressTradeAnalyzer
+from wsb_context import WSBContext, WallStreetBetsAnalyzer, WallStreetBetsSnapshot
 from trade_memory import RotationForecast, TradeMemory
 
 
 class AssetRotationStrategy(Strategy):
-    """Run either the original A/B rotation or an opt-in dip-signal portfolio."""
+    """Run the default dip-signal portfolio with a learned A/B opportunity."""
 
     parameters = {
         "asset_a": "SPY",
@@ -32,10 +34,13 @@ class AssetRotationStrategy(Strategy):
         "email_report_enabled": False,
         "news_context_enabled": True,
         "news_learning_enabled": True,
+        "congress_context_enabled": False,
+        "wsb_context_enabled": False,
+        "wsb_discovery_enabled": False,
         "llm_news_enabled": False,
         "decision_memory_enabled": True,
         "decision_memory_block_enabled": False,
-        "portfolio_enabled": False,
+        "portfolio_enabled": True,
         "portfolio_oos_min_observations": 10,
         "portfolio_oos_min_net_profit_percent": 0.0,
         "portfolio_round_trip_cost_percent": 0.20,
@@ -91,6 +96,7 @@ class AssetRotationStrategy(Strategy):
                 f"Restored portfolio rotation {pending['from']} to {pending['to']}; it will be reconciled next cycle.",
                 color="yellow",
             )
+        self._refresh_wsb_snapshot_before_trading()
 
     def _rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("rotation_state_file")
@@ -269,6 +275,7 @@ class AssetRotationStrategy(Strategy):
                     f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
                     f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
                     f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
+                    f"WSB discovery symbols: {report.get('wsb_discovered_symbols', 'none')}",
                     f"Discovery status: {report.get('discovery_status', 'ok')}",
                     f"Dip threshold: {report['threshold']:.2f}%",
                 ]
@@ -295,6 +302,11 @@ class AssetRotationStrategy(Strategy):
                 f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                 f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                 f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
+                f"Congressional-trading context: {report.get('congress_explanation', 'unavailable')}",
+                f"WallStreetBets context: {report.get('wsb_explanation', 'unavailable')}",
+                f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
+                f"Opportunistic Opportunity probability: {report.get('opportunistic_opportunity_probability', 'unavailable')}",
+                f"Opportunistic Opportunity evidence: {report.get('opportunistic_opportunity_explanation', 'unavailable')}",
             ]
             if not portfolio_mode:
                 # Decision memory models the A/B rotation edge specifically.
@@ -306,6 +318,10 @@ class AssetRotationStrategy(Strategy):
             lines += [
                 "Notable scored headlines:",
                 *[f"- {headline}" for headline in report.get("news_headlines", [])],
+                "Congressional-trading highlights:",
+                *[f"- {highlight}" for highlight in report.get("congress_highlights", [])],
+                "WallStreetBets highlights:",
+                *[f"- {highlight}" for highlight in report.get("wsb_highlights", [])],
                 f"Result: {report['status']}",
                 "",
                 "Review all orders and positions in the Alpaca dashboard.",
@@ -371,6 +387,66 @@ class AssetRotationStrategy(Strategy):
                 available=False,
                 risk_level="unavailable",
                 explanation=f"News retrieval failed: {type(exc).__name__}: {exc}",
+            )
+
+    def _get_congress_context(self, symbols: list[str]) -> CongressContext:
+        """Return delayed public-disclosure context without affecting orders."""
+        if not bool(self.parameters.get("congress_context_enabled", False)):
+            return CongressContext(
+                available=False,
+                explanation="Congressional-trading context is disabled in config.json.",
+            )
+        context = CongressTradeAnalyzer(
+            timeout_seconds=float(self.parameters.get("congress_context_timeout_seconds", 10.0))
+        ).analyze(symbols)
+        self.log_message(context.explanation, color="blue")
+        for highlight in context.highlights:
+            self.log_message(f"Congressional-trading evidence: {highlight}", color="blue")
+        return context
+
+    def _get_wsb_context(self, symbols: list[str]) -> WSBContext:
+        """Return public WSB context, failing open when the tracker is unavailable."""
+        if not (
+            bool(self.parameters.get("wsb_context_enabled", False))
+            or bool(self.parameters.get("wsb_discovery_enabled", False))
+        ):
+            return WSBContext(
+                available=False,
+                explanation="WallStreetBets context and discovery are disabled in config.json.",
+            )
+        context = self._wsb_snapshot().context(symbols)
+        self.log_message(context.explanation, color="blue")
+        for highlight in context.highlights:
+            self.log_message(f"WallStreetBets evidence: {highlight}", color="blue")
+        return context
+
+    def _wsb_snapshot(self) -> WallStreetBetsSnapshot:
+        return WallStreetBetsSnapshot(
+            Path(str(self.parameters["wsb_context_state_file"])),
+            WallStreetBetsAnalyzer(
+                timeout_seconds=float(self.parameters.get("wsb_context_timeout_seconds", 10.0))
+            ),
+        )
+
+    def _refresh_wsb_snapshot_before_trading(self) -> None:
+        """Refresh the single WSB snapshot before the day's trade evaluations."""
+        if not (
+            bool(self.parameters.get("wsb_context_enabled", False))
+            or bool(self.parameters.get("wsb_discovery_enabled", False))
+        ):
+            return
+        try:
+            refreshed = self._wsb_snapshot().refresh_if_due()
+            self.log_message(
+                "WallStreetBets snapshot refreshed before trading."
+                if refreshed
+                else "WallStreetBets snapshot is within its 24-hour refresh window.",
+                color="blue",
+            )
+        except Exception as exc:
+            self.log_message(
+                f"WallStreetBets pre-trade refresh failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
             )
 
     def _get_llm_news_assessment(self, news_context: NewsContext) -> LLMNewsAssessment:
@@ -474,6 +550,7 @@ class AssetRotationStrategy(Strategy):
             return RotationForecast(
                 0, False, None, None, "Decision memory is disabled in config.json."
             )
+
         try:
             memory = TradeMemory(
                 database_path=Path(
@@ -508,6 +585,45 @@ class AssetRotationStrategy(Strategy):
                 None,
                 f"Decision memory failed: {type(exc).__name__}: {exc}",
             )
+
+    def _opportunistic_opportunity(
+        self,
+        asset_a: str,
+        asset_b: str,
+        price_a: float | None,
+        price_b: float | None,
+        news_context: NewsContext,
+    ) -> dict[str, float | int | str | None]:
+        """Evaluate the A/B rotation as a portfolio-only, data-backed option."""
+        unavailable: dict[str, float | int | str | None] = {
+            "status": "unavailable", "probability": None
+        }
+        if price_a is None or price_b is None or min(float(price_a), float(price_b)) <= 0:
+            return unavailable
+        bars = self.get_historical_prices(
+            asset_b, int(self.parameters["recent_high_lookback_days"]), "day"
+        )
+        if bars is None or bars.df is None or bars.df.empty or "high" not in bars.df:
+            return unavailable
+        highs = [float(value) for value in bars.df["high"].dropna() if math.isfinite(float(value)) and float(value) > 0]
+        if not highs:
+            return unavailable
+        recent_high = max(highs)
+        dip = ((recent_high - float(price_b)) / recent_high) * 100.0
+        self._backfill_decision_memory(asset_a, asset_b)
+        forecast = self._update_decision_memory(float(price_a), float(price_b), dip, news_context)
+        probability = TradeMemory(
+            Path(str(self.parameters["decision_memory_database_file"])), 1, 1
+        ).opportunity_probability()
+        return {
+            "status": "ready" if forecast.ready else "warming up",
+            "dip": dip,
+            "predicted_edge": forecast.predicted_edge_percent,
+            "observations": probability.observations,
+            "wins": probability.wins,
+            "probability": probability.probability,
+            "forecast_explanation": forecast.explanation,
+        }
 
     def _backfill_decision_memory(self, asset_a: str, asset_b: str) -> None:
         """Seed decision memory from settled daily bars once per process start."""
@@ -617,7 +733,10 @@ class AssetRotationStrategy(Strategy):
             for symbol in self.parameters["portfolio_symbols"]
             if str(symbol).strip()
         }
-        if bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+        if (
+            bool(self.parameters.get("portfolio_autonomous_discovery", False))
+            or bool(self.parameters.get("wsb_discovery_enabled", False))
+        ):
             try:
                 symbols.update(self._autonomous_universe().managed_symbols())
             except Exception as exc:
@@ -907,7 +1026,10 @@ class AssetRotationStrategy(Strategy):
             return symbols
 
     def _remember_discovered_symbols(self, symbols: list[str]) -> None:
-        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+        if not (
+            bool(self.parameters.get("portfolio_autonomous_discovery", False))
+            or bool(self.parameters.get("wsb_discovery_enabled", False))
+        ):
             return
         try:
             self._autonomous_universe().remember(symbols)
@@ -935,6 +1057,26 @@ class AssetRotationStrategy(Strategy):
             ", ".join(f"{symbol}={quantity}" for symbol, quantity in sorted(held.items())) or "none"
         )
         symbols = self._portfolio_symbols(report, held, managed_symbols)
+        wsb_context = self._get_wsb_context(symbols)
+        if bool(self.parameters.get("wsb_discovery_enabled", False)) and wsb_context.available:
+            wsb_symbols = [
+                item.symbol
+                for item in wsb_context.mentions[: int(self.parameters["wsb_discovery_max_symbols"])]
+            ]
+            symbols = list(dict.fromkeys(symbols + wsb_symbols))
+            report["wsb_discovered_symbols"] = ", ".join(wsb_symbols) or "none"
+        report.update(
+            wsb_explanation=wsb_context.explanation,
+            wsb_highlights=wsb_context.highlights,
+        )
+        congress_context = self._get_congress_context(symbols)
+        report.update(
+            congress_symbols_matched=(
+                congress_context.matched_symbols if congress_context.available else "unavailable"
+            ),
+            congress_explanation=congress_context.explanation,
+            congress_highlights=congress_context.highlights,
+        )
 
         news_context = self._get_news_context()
         report.update(
@@ -975,6 +1117,26 @@ class AssetRotationStrategy(Strategy):
                 learning_explanation=learning_result.explanation,
             )
         veto_reason = self._market_veto_reason(news_context, llm_assessment, learning_result)
+
+        # A/B is no longer an alternate strategy mode. It is a separately
+        # labelled opportunity inside portfolio mode, trained only on the
+        # settled A-versus-B observations already kept in decision memory.
+        asset_a = str(self.parameters["asset_a"]).upper()
+        asset_b = str(self.parameters["asset_b"]).upper()
+        opportunity = self._opportunistic_opportunity(
+            asset_a, asset_b, self.get_last_price(asset_a), self.get_last_price(asset_b), news_context
+        )
+        probability = opportunity.get("probability")
+        report.update(
+            decision_memory_recorded=opportunity.get("status") != "unavailable",
+            opportunistic_opportunity_status=opportunity.get("status"),
+            opportunistic_opportunity_probability=(
+                f"{float(probability):.1%}" if probability is not None else "not ready"
+            ),
+            opportunistic_opportunity_explanation=opportunity.get(
+                "forecast_explanation", "A/B data was unavailable."
+            ),
+        )
 
         # Completing an in-flight rotation is never vetoed: the sale already
         # happened and leaving the proceeds in cash is its own risk.
@@ -1062,6 +1224,18 @@ class AssetRotationStrategy(Strategy):
             and float(signal["oos_expected_profit"]) >= oos_minimum_profit
         ]
         eligible.sort(key=lambda signal: (float(signal["expected_profit"]), float(signal["dip"])), reverse=True)
+        opportunity_probability = opportunity.get("probability")
+        opportunity_edge = opportunity.get("predicted_edge")
+        opportunity_is_eligible = (
+            asset_a in held
+            and asset_b not in held
+            and opportunity.get("status") == "ready"
+            and float(opportunity.get("dip") or 0.0) >= float(self.parameters["dip_threshold_percent"])
+            and opportunity_probability is not None
+            and float(opportunity_probability) >= float(self.parameters["portfolio_opportunistic_min_probability"])
+            and opportunity_edge is not None
+            and float(opportunity_edge) >= minimum_profit
+        )
         # Remember holdings alongside today's qualifiers so a held symbol is
         # never trimmed out of the learned universe while it is still owned.
         self._remember_discovered_symbols(
@@ -1072,14 +1246,32 @@ class AssetRotationStrategy(Strategy):
             f"OOS {float(s['oos_expected_profit']):+.2f}%/{s['oos_observations']}"
             for s in eligible
         ) or "none"
-        if not eligible:
-            report["status"] = "No portfolio trade: no symbol met the historical-profit threshold"
+        if not eligible and not opportunity_is_eligible:
+            report["status"] = "No portfolio trade: no portfolio signal or Opportunistic Opportunity met its thresholds"
             return
         if veto_reason:
             report["status"] = veto_reason
             self.log_message(
                 f"Portfolio signal present, but the trade was vetoed: {veto_reason}",
                 color="red",
+            )
+            return
+
+        if opportunity_is_eligible:
+            if self._has_active_order(asset_a, "sell"):
+                report["status"] = "Opportunistic Opportunity pending: waiting for Asset A sale"
+                return
+            source_price = self.get_last_price(asset_a)
+            if source_price is None or float(source_price) <= 0:
+                report["status"] = "No Opportunistic Opportunity: Asset A price was unavailable"
+                return
+            budget = float(source_price) * float(held[asset_a])
+            self.submit_order(self.create_order(asset_a, quantity=held[asset_a], side="sell", order_type="market"))
+            self._set_portfolio_rotation({"from": asset_a, "to": asset_b, "budget": budget})
+            report["status"] = (
+                f"Opportunistic Opportunity submitted: {asset_a} to {asset_b} "
+                f"({float(opportunity_probability):.1%} historical win probability, "
+                f"{float(opportunity_edge):+.2f}% predicted edge)"
             )
             return
 
@@ -1146,6 +1338,14 @@ class AssetRotationStrategy(Strategy):
             asset_b = str(self.parameters["asset_b"]).upper()
             threshold = float(self.parameters["dip_threshold_percent"])
             lookback = int(self.parameters["recent_high_lookback_days"])
+            congress_context = self._get_congress_context([asset_a, asset_b])
+            report.update(
+                congress_symbols_matched=(
+                    congress_context.matched_symbols if congress_context.available else "unavailable"
+                ),
+                congress_explanation=congress_context.explanation,
+                congress_highlights=congress_context.highlights,
+            )
             news_context = self._get_news_context()
             report.update(
                 news_risk_level=news_context.risk_level,

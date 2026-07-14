@@ -57,9 +57,9 @@ The agent does **not** automatically create the initial Asset A position. It
 also does not rotate from Asset B back into Asset A. After a completed A-to-B
 rotation, it will take no further rotation action unless Asset A is held again.
 
-### Optional portfolio mode
+### Portfolio mode (default)
 
-Portfolio mode is off by default. When enabled, the agent only considers the
+Portfolio mode is the default. It only considers the
 symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
 its own. For every symbol it measures the current dip and the average
 next-session return after comparable historical dips. That average is reduced
@@ -89,11 +89,19 @@ position bought by the strategy can never become invisible to it. The
 world-event keyword guard, the optional LLM assessment, and the
 mature adaptive-news forecast can each veto a *new* portfolio purchase or
 replacement exactly as they veto an A/B rotation; completing an in-flight
-replacement is never vetoed. (Decision memory is specific to the A/B rotation
-and stays inactive in portfolio mode.) This estimated historical return is not
-a real or guaranteed profit; it is a filter for paper-trading and must be
-validated before any live use. Portfolio mode bypasses the original A/B
-rotation, which remains the behavior when it is disabled.
+replacement is never vetoed. This estimated historical return is not a real or
+guaranteed profit; it is a filter for paper-trading and must be validated before
+any live use.
+
+Within portfolio mode, the former A/B rotation is evaluated separately as an
+**Opportunistic Opportunity**. When Asset B has dipped and Asset A is held, the
+agent uses settled prior A/B observations to estimate the chance that B will
+beat A next session. Its probability is Laplace-smoothed: `(wins + 1) / (prior
+observations + 2)`. It can rotate A into B only after decision memory is mature,
+the predicted B-minus-A edge meets the normal profit threshold, and the
+probability meets `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by default).
+It is reported separately from ordinary portfolio candidates, so it does not
+turn the two systems into interchangeable ranking signals.
 
 For a small account funded in roughly $50 increments, start with one position
 and fractional shares. The default portfolio settings reserve $2 for price
@@ -132,6 +140,8 @@ pi-trading-agent/
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── trade_memory.py      SQLite journal and learning from past rotation signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
+├── congress_context.py Public STOCK Act disclosure context (research-only)
+├── wsb_context.py      Public AltIndex WallStreetBets context and discovery
 ├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
 ├── strategy.py         Daily dip and rotation logic
 └── setup_service.sh    Virtual environment and systemd installer
@@ -286,7 +296,7 @@ chmod 600 config.json
 | `ASSET_B` | Asset whose dip is measured and purchased | `"QQQ"` |
 | `DIP_THRESHOLD_PERCENT` | Required fall from the recent high | `5.0` |
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
-| `PORTFOLIO_ENABLED` | Enables watchlist-based portfolio mode instead of A/B rotation | `false` |
+| `PORTFOLIO_ENABLED` | Enables the default watchlist-based portfolio mode | `true` |
 | `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
 | `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings; use `1` for a ~$50 account | `1` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
@@ -302,6 +312,11 @@ chmod 600 config.json
 | `PORTFOLIO_FRACTIONAL_SHARES` | Allows decimal-share market orders, needed for small balances | `true` |
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
+| `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity | `0.55` |
+| `WSB_CONTEXT_ENABLED` | Reports public AltIndex WallStreetBets mentions for monitored symbols | `false` |
+| `WSB_DISCOVERY_ENABLED` | Adds top public WSB symbols to the portfolio research universe | `false` |
+| `WSB_DISCOVERY_MAX_SYMBOLS` | Maximum WSB symbols evaluated per cycle | `10` |
+| `WSB_CONTEXT_TIMEOUT_SECONDS` | Maximum wait for the public tracker page | `10.0` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -321,6 +336,8 @@ chmod 600 config.json
 | `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
+| `CONGRESS_CONTEXT_ENABLED` | Adds Kadoa public disclosure context to logs/email; never affects orders | `false` |
+| `CONGRESS_CONTEXT_TIMEOUT_SECONDS` | Maximum wait for the public Kadoa dataset | `10.0` |
 | `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
 | `DECISION_MEMORY_BLOCK_ENABLED` | Allows mature decision memory to veto a rotation | `false` |
 | `DECISION_MEMORY_MIN_OBSERVATIONS` | Comparable dip signals needed before a forecast | `40` |
@@ -535,6 +552,49 @@ Restart the service after changing either setting.
 Use paper mode to compare the logged scores with actual headlines and market
 behavior before relying on the guard.
 
+## Optional WallStreetBets context and discovery
+
+AltIndex publishes a public tracker of WallStreetBets ticker mentions and
+sentiment from the preceding 24 hours. Enable `WSB_CONTEXT_ENABLED` to add
+matching mentions to the log and daily email. Enable
+`WSB_DISCOVERY_ENABLED` to add the tracker’s top symbols to that day’s
+portfolio research universe; symbols still need to pass the existing price
+history, walk-forward, risk, and order checks before they can be bought.
+The agent fetches one snapshot during initialization before trade evaluations,
+persists it in `.wsb_context_snapshot.json`, and reuses it for 24 hours. It
+does not repeatedly poll AltIndex during the day.
+
+```json
+"WSB_CONTEXT_ENABLED": true,
+"WSB_DISCOVERY_ENABLED": true,
+"WSB_DISCOVERY_MAX_SYMBOLS": 10,
+"WSB_CONTEXT_TIMEOUT_SECONDS": 10.0
+```
+
+WSB data is not a buy signal and never changes position size or bypasses the
+validated portfolio filters. If the tracker cannot be reached or its public
+markup changes, the agent fails open and evaluates its regular universe.
+
+## Optional congressional-trading context
+
+When enabled, the agent retrieves Kadoa's open-source ticker summary assembled
+from House, Senate, and executive-branch STOCK Act disclosures. For each asset
+being evaluated it reports the disclosed trade count, unique filers, purchases,
+and sales in the log and daily email.
+
+This is deliberately **research context only**. STOCK Act reports can be filed
+well after the transaction, and Kadoa's aggregate ticker file does not turn a
+disclosure into a timely recommendation. It cannot create a trade, choose a
+symbol, change order size, or veto a price-based decision. If Kadoa or GitHub
+is unavailable, the agent records the failure and continues normally.
+
+Enable it after reviewing the delayed-data limitation:
+
+```json
+"CONGRESS_CONTEXT_ENABLED": true,
+"CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0
+```
+
 ## Optional LLM news assessment
 
 In addition to the fixed keyword rules, the agent can send the same daily
@@ -723,8 +783,8 @@ before considering whether this feature is useful.
 The news learner estimates Asset B's absolute return. Decision memory adds the
 question this strategy needs to answer: after a comparable dip, would owning
 Asset B have done better than continuing to own Asset A? Because it models the
-A/B pair specifically, it runs only in A/B mode and stays inactive when
-portfolio mode is enabled.
+A/B pair specifically, portfolio mode uses it only for the separately labelled
+Opportunistic Opportunity; it is not mixed into ordinary portfolio rankings.
 
 For each evaluable day, its local SQLite database records the two prices, dip,
 available news score, signal state, and final decision. At the next market
