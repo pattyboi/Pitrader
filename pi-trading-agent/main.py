@@ -192,6 +192,30 @@ def load_config(path: Path) -> dict[str, Any]:
     config["NEWS_LEARNING_MAX_OBSERVATIONS"] = learning_maximum
     config["NEWS_PREDICTED_RETURN_BLOCK_PERCENT"] = predicted_return_block
     config["NEWS_LEARNING_MIN_CORRELATION"] = minimum_correlation
+    decision_defaults = {
+        "DECISION_MEMORY_ENABLED": True,
+        "DECISION_MEMORY_BLOCK_ENABLED": False,
+        "DECISION_MEMORY_MIN_OBSERVATIONS": 40,
+        "DECISION_MEMORY_MAX_OBSERVATIONS": 180,
+        "DECISION_MEMORY_MIN_CORRELATION": 0.25,
+        "DECISION_MEMORY_EDGE_BLOCK_PERCENT": -0.75,
+    }
+    for key, default in decision_defaults.items():
+        config.setdefault(key, default)
+    if not isinstance(config["DECISION_MEMORY_ENABLED"], bool) or not isinstance(config["DECISION_MEMORY_BLOCK_ENABLED"], bool):
+        raise TypeError("DECISION_MEMORY_ENABLED and DECISION_MEMORY_BLOCK_ENABLED must be true or false")
+    decision_minimum = int(config["DECISION_MEMORY_MIN_OBSERVATIONS"])
+    decision_maximum = int(config["DECISION_MEMORY_MAX_OBSERVATIONS"])
+    decision_correlation = float(config["DECISION_MEMORY_MIN_CORRELATION"])
+    decision_edge = float(config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"])
+    if not 20 <= decision_minimum <= 500 or not decision_minimum <= decision_maximum <= 1000:
+        raise ValueError("DECISION_MEMORY observation limits must be from 20 to 1000")
+    if not 0.0 <= decision_correlation <= 1.0 or not -25.0 <= decision_edge < 0.0:
+        raise ValueError("DECISION_MEMORY correlation must be 0..1 and edge block must be -25..<0")
+    config["DECISION_MEMORY_MIN_OBSERVATIONS"] = decision_minimum
+    config["DECISION_MEMORY_MAX_OBSERVATIONS"] = decision_maximum
+    config["DECISION_MEMORY_MIN_CORRELATION"] = decision_correlation
+    config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"] = decision_edge
     return config
 
 
@@ -260,6 +284,13 @@ def main() -> int:
                     "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
                 ],
                 "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
+                "decision_memory_enabled": config["DECISION_MEMORY_ENABLED"],
+                "decision_memory_block_enabled": config["DECISION_MEMORY_BLOCK_ENABLED"],
+                "decision_memory_min_observations": config["DECISION_MEMORY_MIN_OBSERVATIONS"],
+                "decision_memory_max_observations": config["DECISION_MEMORY_MAX_OBSERVATIONS"],
+                "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
+                "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
+                "decision_memory_database_file": str(BASE_DIR / ".trade_memory.sqlite3"),
                 "llm_news_enabled": config["LLM_NEWS_ENABLED"],
                 "llm_news_provider": config["LLM_NEWS_PROVIDER"],
                 "llm_news_model": config["LLM_NEWS_MODEL"],

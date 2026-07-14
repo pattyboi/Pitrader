@@ -65,6 +65,7 @@ pi-trading-agent/
 ├── requirements.txt    Python package requirements
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
+├── trade_memory.py      SQLite journal and learning from past rotation signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
 ├── strategy.py         Daily dip and rotation logic
@@ -75,8 +76,10 @@ The installer later creates `.venv/`, which contains an isolated Python
 environment. Do not edit that directory. When email reporting is enabled, the
 agent also creates `.last_email_report`. That small file contains only the date
 of the most recently sent report and prevents duplicates after a restart. The
-adaptive model creates `.news_learning_state.json` to preserve its observations,
-and `.rotation_state.json` remembers a rotation that is partway through (sold
+adaptive model creates `.news_learning_state.json` to preserve its observations.
+Decision memory creates `.trade_memory.sqlite3`, a local database of market
+snapshots, decisions, and fills (never credentials or balances).
+`.rotation_state.json` remembers a rotation that is partway through (sold
 Asset A, not yet bought Asset B) so restarts cannot strand the cash.
 
 ## What you need
@@ -169,6 +172,12 @@ The initial file is:
   "NEWS_LEARNING_MAX_OBSERVATIONS": 120,
   "NEWS_LEARNING_MIN_CORRELATION": 0.15,
   "NEWS_PREDICTED_RETURN_BLOCK_PERCENT": -1.0,
+  "DECISION_MEMORY_ENABLED": true,
+  "DECISION_MEMORY_BLOCK_ENABLED": false,
+  "DECISION_MEMORY_MIN_OBSERVATIONS": 40,
+  "DECISION_MEMORY_MAX_OBSERVATIONS": 180,
+  "DECISION_MEMORY_MIN_CORRELATION": 0.25,
+  "DECISION_MEMORY_EDGE_BLOCK_PERCENT": -0.75,
   "LLM_NEWS_ENABLED": false,
   "LLM_NEWS_PROVIDER": "gemini",
   "LLM_NEWS_API_KEY": "REPLACE_WITH_YOUR_LLM_API_KEY",
@@ -227,6 +236,12 @@ chmod 600 config.json
 | `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
+| `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
+| `DECISION_MEMORY_BLOCK_ENABLED` | Allows mature decision memory to veto a rotation | `false` |
+| `DECISION_MEMORY_MIN_OBSERVATIONS` | Comparable dip signals needed before a forecast | `40` |
+| `DECISION_MEMORY_MAX_OBSERVATIONS` | Rolling comparable-signal history retained | `180` |
+| `DECISION_MEMORY_MIN_CORRELATION` | Fit strength required for a decision-memory veto | `0.25` |
+| `DECISION_MEMORY_EDGE_BLOCK_PERCENT` | B-minus-A forecast at or below which rotation is blocked | `-0.75` |
 | `LLM_NEWS_ENABLED` | Sends the day's headlines to an LLM for one risk assessment | `false` |
 | `LLM_NEWS_PROVIDER` | `gemini`, `openai_compatible`, or `anthropic` | `"gemini"` |
 | `LLM_NEWS_API_KEY` | API key for the chosen provider | Your API key |
@@ -613,6 +628,26 @@ state is preserved and becomes available again if learning is re-enabled.
 
 Keep the agent in paper mode throughout warm-up and review many mature forecasts
 before considering whether this feature is useful.
+
+## Decision memory: learning from its own rotations
+
+The news learner estimates Asset B's absolute return. Decision memory adds the
+question this strategy needs to answer: after a comparable dip, would owning
+Asset B have done better than continuing to own Asset A?
+
+For each evaluable day, its local SQLite database records the two prices, dip,
+available news score, signal state, and final decision. At the next market
+evaluation it settles the earlier record using `Asset B return - Asset A
+return`. Only prior dip signals train its conservative, ridge-stabilized model;
+the inputs are dip size and news score. Broker-confirmed fills are recorded
+separately for auditability.
+
+It is advisory by default. After at least 40 comparable settled signals, you
+may enable `DECISION_MEMORY_BLOCK_ENABLED` in paper trading after reviewing its
+forecasts. A veto requires both a negative predicted edge and the configured
+minimum fit correlation. It never creates a trade, increases order size, or
+overrides the existing safeguards. Delete `.trade_memory.sqlite3` only if you
+intend to reset this learning history.
 
 ### Resetting learned history
 

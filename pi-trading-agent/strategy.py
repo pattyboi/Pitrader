@@ -16,6 +16,7 @@ from lumibot.strategies import Strategy
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
+from trade_memory import RotationForecast, TradeMemory
 
 
 class AssetRotationStrategy(Strategy):
@@ -30,6 +31,8 @@ class AssetRotationStrategy(Strategy):
         "news_context_enabled": True,
         "news_learning_enabled": True,
         "llm_news_enabled": False,
+        "decision_memory_enabled": True,
+        "decision_memory_block_enabled": False,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -157,6 +160,9 @@ class AssetRotationStrategy(Strategy):
                         f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                         f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                         f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
+                        f"Decision-memory observations: {report.get('decision_memory_observations', 'unavailable')}",
+                        f"Predicted rotation edge: {report.get('rotation_edge_forecast', 'not ready')}",
+                        f"Decision-memory explanation: {report.get('decision_memory_explanation', 'unavailable')}",
                         "Notable scored headlines:",
                         *[
                             f"- {headline}"
@@ -311,12 +317,77 @@ class AssetRotationStrategy(Strategy):
                 color="red",
             )
             return LearningResult(
-                observations=0,
-                ready=False,
-                predicted_return_percent=None,
-                slope=None,
-                correlation=None,
-                explanation=f"Learning update failed: {type(exc).__name__}: {exc}",
+                0,
+                False,
+                None,
+                None,
+                None,
+                f"Learning update failed: {type(exc).__name__}: {exc}",
+            )
+
+    def _update_decision_memory(
+        self,
+        price_a: float,
+        price_b: float,
+        dip_percent: float,
+        news_context: NewsContext,
+    ) -> RotationForecast:
+        """Learn whether comparable past rotations favored B over A."""
+        if not bool(self.parameters.get("decision_memory_enabled", True)):
+            return RotationForecast(
+                0, False, None, None, "Decision memory is disabled in config.json."
+            )
+        try:
+            memory = TradeMemory(
+                database_path=Path(
+                    str(self.parameters["decision_memory_database_file"])
+                ),
+                minimum_observations=int(
+                    self.parameters["decision_memory_min_observations"]
+                ),
+                maximum_observations=int(
+                    self.parameters["decision_memory_max_observations"]
+                ),
+            )
+            result = memory.update_and_forecast(
+                evaluation_date=self.get_datetime().date().isoformat(),
+                price_a=price_a,
+                price_b=price_b,
+                dip_percent=dip_percent,
+                news_score=news_context.score if news_context.available else None,
+                signal_present=dip_percent >= float(self.parameters["dip_threshold_percent"]),
+            )
+            self.log_message(result.explanation, color="blue")
+            return result
+        except Exception as exc:
+            self.log_message(
+                f"Decision memory failed safely: {type(exc).__name__}: {exc}",
+                color="red",
+            )
+            return RotationForecast(
+                0,
+                False,
+                None,
+                None,
+                f"Decision memory failed: {type(exc).__name__}: {exc}",
+            )
+
+    def _record_memory_decision(self, report: dict[str, Any]) -> None:
+        """Persist the final decision label after an observation was recorded."""
+        if not report.get("decision_memory_recorded"):
+            return
+        try:
+            TradeMemory(
+                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
+            ).record_decision(
+                self.get_datetime().date().isoformat(),
+                str(report.get("status", "unknown")),
+                str(report.get("decision_reason", report.get("status", ""))),
+            )
+        except Exception as exc:
+            self.log_message(
+                f"Could not label decision-memory entry: {type(exc).__name__}: {exc}",
+                color="red",
             )
 
     @staticmethod
@@ -431,7 +502,7 @@ class AssetRotationStrategy(Strategy):
                 return
             price_a = float(price_a)
             price_b = float(price_b)
-            if price_a <= 0 or price_b <= 0:
+            if not math.isfinite(price_a) or not math.isfinite(price_b) or price_a <= 0 or price_b <= 0:
                 report["status"] = "No trade: invalid non-positive price received"
                 self.log_message("Invalid non-positive market price received; no trade made.", color="red")
                 return
@@ -502,6 +573,10 @@ class AssetRotationStrategy(Strategy):
                 return
 
             recent_high = float(valid_highs.max())
+            if not math.isfinite(recent_high) or recent_high <= 0:
+                report["status"] = "No trade: historical data contained an invalid high"
+                self.log_message("Invalid recent high received; no trade made.", color="red")
+                return
             dip_percent = ((recent_high - price_b) / recent_high) * 100.0
             report.update(
                 recent_high=f"${recent_high:.2f}",
@@ -512,6 +587,20 @@ class AssetRotationStrategy(Strategy):
                 f"{asset_b}=${price_b:.2f} ({quantity_b} shares), "
                 f"{lookback}-day high=${recent_high:.2f}, dip={dip_percent:.2f}%.",
                 color="blue",
+            )
+
+            decision_memory = self._update_decision_memory(
+                price_a, price_b, dip_percent, news_context
+            )
+            report.update(
+                decision_memory_recorded=True,
+                decision_memory_observations=decision_memory.observations,
+                rotation_edge_forecast=(
+                    f"{decision_memory.predicted_edge_percent:+.2f}%"
+                    if decision_memory.ready and decision_memory.predicted_edge_percent is not None
+                    else "not ready"
+                ),
+                decision_memory_explanation=decision_memory.explanation,
             )
 
             if dip_percent < threshold:
@@ -582,6 +671,28 @@ class AssetRotationStrategy(Strategy):
                 )
                 return
 
+            should_block_for_decision_memory = (
+                bool(self.parameters.get("decision_memory_block_enabled", False))
+                and decision_memory.ready
+                and decision_memory.predicted_edge_percent is not None
+                and decision_memory.correlation is not None
+                and abs(decision_memory.correlation)
+                >= float(self.parameters["decision_memory_min_correlation"])
+                and decision_memory.predicted_edge_percent
+                <= float(self.parameters["decision_memory_edge_block_percent"])
+            )
+            if should_block_for_decision_memory:
+                forecast = decision_memory.predicted_edge_percent
+                report["status"] = (
+                    f"Trade blocked: decision-memory edge forecast {forecast:+.2f}%"
+                )
+                self.log_message(
+                    f"Dip signal met, but decision memory forecast that holding {asset_a} "
+                    f"should outperform {asset_b} by {-forecast:+.2f}% next session.",
+                    color="red",
+                )
+                return
+
             sell_order = self.create_order(
                 asset_a,
                 quantity=quantity_a,
@@ -605,6 +716,7 @@ class AssetRotationStrategy(Strategy):
                 color="red",
             )
         finally:
+            self._record_memory_decision(report)
             self._send_daily_email(report)
 
     def on_filled_order(
@@ -622,6 +734,21 @@ class AssetRotationStrategy(Strategy):
             f"Filled {side} order: {quantity} shares of {symbol} at ${price:.2f}.",
             color="green",
         )
+        try:
+            TradeMemory(
+                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
+            ).record_execution(
+                self.get_datetime().date().isoformat(),
+                str(symbol),
+                str(side),
+                float(price),
+                float(quantity),
+            )
+        except Exception as exc:
+            self.log_message(
+                f"Could not journal execution: {type(exc).__name__}: {exc}",
+                color="red",
+            )
 
         # Continue the rotation immediately after Alpaca confirms the sale.
         # The next daily iteration remains a fallback if this callback cannot
