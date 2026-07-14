@@ -247,7 +247,11 @@ class AssetRotationStrategy(Strategy):
                 ),
             )
         try:
-            analyzer = LLMNewsAnalyzer(model=str(self.parameters["llm_news_model"]))
+            analyzer = LLMNewsAnalyzer(
+                provider=str(self.parameters["llm_news_provider"]),
+                model=str(self.parameters["llm_news_model"]),
+                base_url=str(self.parameters.get("llm_news_base_url", "")),
+            )
             assessment = analyzer.assess(news_context.articles)
             self.log_message(
                 f"LLM news assessment: risk={assessment.risk_level}, "

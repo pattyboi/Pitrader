@@ -66,7 +66,7 @@ pi-trading-agent/
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
-├── llm_news.py         Optional Claude-based daily news assessment
+├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
 ├── strategy.py         Daily dip and rotation logic
 └── setup_service.sh    Virtual environment and systemd installer
 ```
@@ -168,11 +168,18 @@ The initial file is:
   "NEWS_LEARNING_MIN_OBSERVATIONS": 20,
   "NEWS_LEARNING_MAX_OBSERVATIONS": 120,
   "NEWS_LEARNING_MIN_CORRELATION": 0.15,
-  "NEWS_PREDICTED_RETURN_BLOCK_PERCENT": -1.0
+  "NEWS_PREDICTED_RETURN_BLOCK_PERCENT": -1.0,
+  "LLM_NEWS_ENABLED": false,
+  "LLM_NEWS_PROVIDER": "gemini",
+  "LLM_NEWS_API_KEY": "REPLACE_WITH_YOUR_LLM_API_KEY",
+  "LLM_NEWS_MODEL": "gemini-2.5-flash",
+  "LLM_NEWS_BASE_URL": "",
+  "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
+  "LLM_NEWS_BLOCK_SCORE": -6
 }
 ```
 
-Replace only the two credential strings. Keep the quotation marks. For example,
+Replace only the two Alpaca credential strings. Keep the quotation marks. For example,
 the key line should have the same shape as this fictitious value:
 
 ```json
@@ -220,9 +227,11 @@ chmod 600 config.json
 | `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
-| `LLM_NEWS_ENABLED` | Sends the day's headlines to Claude for one risk assessment | `false` |
-| `ANTHROPIC_API_KEY` | Claude API key from platform.claude.com | Your API key |
-| `LLM_NEWS_MODEL` | Claude model used for the assessment | `"claude-opus-4-8"` |
+| `LLM_NEWS_ENABLED` | Sends the day's headlines to an LLM for one risk assessment | `false` |
+| `LLM_NEWS_PROVIDER` | `gemini`, `openai_compatible`, or `anthropic` | `"gemini"` |
+| `LLM_NEWS_API_KEY` | API key for the chosen provider | Your API key |
+| `LLM_NEWS_MODEL` | Model used for the assessment | `"gemini-2.5-flash"` |
+| `LLM_NEWS_BASE_URL` | Endpoint for `openai_compatible` providers only | `""` |
 | `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
 
@@ -243,7 +252,9 @@ JSON is strict:
 - Minimum learned correlation must be from `0.0` through `1.0`.
 - The learned-return blocking threshold must be negative and at least `-25`.
 - The LLM block score must be an integer from `-10` through `-1`.
-- When `LLM_NEWS_ENABLED` is `true`, a real `ANTHROPIC_API_KEY` is required.
+- The LLM provider must be `gemini`, `openai_compatible`, or `anthropic`.
+- When the provider is `openai_compatible`, `LLM_NEWS_BASE_URL` is required.
+- When `LLM_NEWS_ENABLED` is `true`, a real `LLM_NEWS_API_KEY` is required.
 
 The lookback is a number of market-data bars, not necessarily calendar days.
 Weekends and exchange holidays do not produce normal stock-market daily bars.
@@ -422,27 +433,35 @@ Restart the service after changing either setting.
 Use paper mode to compare the logged scores with actual headlines and market
 behavior before relying on the guard.
 
-## Optional Claude-based news assessment
+## Optional LLM news assessment
 
 In addition to the fixed keyword rules, the agent can send the same daily
-Alpaca headlines to the Claude API for one language-model risk assessment per
-trading day. Unlike the keyword scorer, the model reads the articles with
-genuine language understanding: it can recognize that ten articles describe
-one event, that a headline is speculation rather than fact, or that a
-negative-sounding story is irrelevant to broad US equity markets.
+Alpaca headlines to a language model for one risk assessment per trading day.
+Unlike the keyword scorer, the model reads the articles with genuine language
+understanding: it can recognize that ten articles describe one event, that a
+headline is speculation rather than fact, or that a negative-sounding story
+is irrelevant to broad US equity markets.
 
 Like every other news feature, this layer can only **veto** a rotation. It
 never creates a buy signal, and if the API is unreachable the price strategy
 continues without it (the same fail-open behavior as the rest of the news
 stack).
 
-### What it needs
+### Getting a free API key (Gemini, the default)
 
-This feature requires an **Anthropic API key**, which is separate from a
-Claude Pro or Max chat subscription. A chat subscription cannot be used here.
-Create an API key at the Claude Console (`platform.claude.com`), add a small
-amount of prepaid credit, and expect costs of a few cents per month: the agent
-makes one small request per trading day.
+The default provider is Google's Gemini API, which has a genuinely free,
+rate-limited tier that comfortably covers this agent's one request per
+trading day. Chat subscriptions such as Claude Pro or ChatGPT Plus **cannot**
+be used here; those products do not include API access.
+
+1. Sign in at `aistudio.google.com` with a Google account.
+2. Create an API key (no credit card is required for the free tier).
+3. Paste it into `LLM_NEWS_API_KEY` in `config.json`.
+
+One caveat of the free tier: Google may use free-tier prompts to improve its
+products. This agent only ever sends **public news headlines and summaries**
+to the model — never your credentials, positions, balances, or account data —
+so there is nothing sensitive in those prompts.
 
 Treat the API key like every other secret in `config.json`: never commit it,
 keep the file at mode `600`, and rotate the key if exposure is suspected.
@@ -453,8 +472,10 @@ Stop the service, edit the settings, and restart:
 
 ```json
 "LLM_NEWS_ENABLED": true,
-"ANTHROPIC_API_KEY": "YOUR_ANTHROPIC_API_KEY",
-"LLM_NEWS_MODEL": "claude-opus-4-8",
+"LLM_NEWS_PROVIDER": "gemini",
+"LLM_NEWS_API_KEY": "YOUR_GEMINI_API_KEY",
+"LLM_NEWS_MODEL": "gemini-2.5-flash",
+"LLM_NEWS_BASE_URL": "",
 "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
 "LLM_NEWS_BLOCK_SCORE": -6
 ```
@@ -466,15 +487,23 @@ recommended starting mode. Review several weeks of paper-trading logs and
 compare the model's assessments with what actually happened before setting it
 to `true`.
 
-`claude-opus-4-8` is a highly capable default. `claude-haiku-4-5` is a
-cheaper, faster alternative that is usually sufficient for this kind of
-summarized scoring; either way the daily cost is small.
+### Other providers
+
+| Provider setting | What it is | Key settings |
+|---|---|---|
+| `"gemini"` | Google Gemini API (free tier available) | Model such as `"gemini-2.5-flash"`; leave `LLM_NEWS_BASE_URL` empty |
+| `"anthropic"` | Claude API (paid, a few cents per month here) | Key from `platform.claude.com`; model such as `"claude-opus-4-8"` or the cheaper `"claude-haiku-4-5"` |
+| `"openai_compatible"` | Any OpenAI-compatible endpoint (Groq, OpenRouter, a local server, ...) | Set `LLM_NEWS_BASE_URL`, e.g. `"https://api.groq.com/openai/v1"`, plus that provider's key and model name |
+
+Free tiers are rate-limited and their terms can change; if a provider starts
+failing, the agent logs the error and continues on price logic and the
+keyword guard alone.
 
 ### How it works
 
 1. The existing news layer fetches up to `NEWS_MAX_ARTICLES` recent articles
    from Alpaca (so `NEWS_CONTEXT_ENABLED` must remain `true`).
-2. The headlines and summaries are sent to the configured Claude model with
+2. The headlines and summaries are sent to the configured model with
    instructions to score aggregate near-term market risk from `-10` (severe,
    market-wide danger) to `+10` (strongly constructive), scoring
    conservatively and treating duplicate coverage as one event.

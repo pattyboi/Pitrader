@@ -55,8 +55,10 @@ def load_config(path: Path) -> dict[str, Any]:
         "NEWS_LEARNING_MIN_CORRELATION",
         "NEWS_PREDICTED_RETURN_BLOCK_PERCENT",
         "LLM_NEWS_ENABLED",
-        "ANTHROPIC_API_KEY",
+        "LLM_NEWS_PROVIDER",
+        "LLM_NEWS_API_KEY",
         "LLM_NEWS_MODEL",
+        "LLM_NEWS_BASE_URL",
         "LLM_NEWS_BLOCK_ON_HIGH_RISK",
         "LLM_NEWS_BLOCK_SCORE",
     }
@@ -149,19 +151,34 @@ def load_config(path: Path) -> dict[str, Any]:
     llm_block_score = int(config["LLM_NEWS_BLOCK_SCORE"])
     if not -10 <= llm_block_score <= -1:
         raise ValueError("LLM_NEWS_BLOCK_SCORE must be from -10 through -1")
+    llm_provider = str(config["LLM_NEWS_PROVIDER"]).strip().lower()
+    if llm_provider not in ("gemini", "openai_compatible", "anthropic"):
+        raise ValueError(
+            "LLM_NEWS_PROVIDER must be gemini, openai_compatible, or anthropic"
+        )
     llm_model = str(config["LLM_NEWS_MODEL"]).strip()
     if not llm_model:
         raise ValueError("LLM_NEWS_MODEL must be a non-empty model id")
+    llm_base_url = str(config["LLM_NEWS_BASE_URL"]).strip()
+    if llm_base_url and not llm_base_url.startswith(("http://", "https://")):
+        raise ValueError("LLM_NEWS_BASE_URL must be an http(s) URL or empty")
+    if llm_provider == "openai_compatible" and not llm_base_url:
+        raise ValueError(
+            "LLM_NEWS_BASE_URL is required when LLM_NEWS_PROVIDER is "
+            "openai_compatible"
+        )
     if config["LLM_NEWS_ENABLED"]:
-        anthropic_key = str(config["ANTHROPIC_API_KEY"]).strip()
-        if not anthropic_key or anthropic_key.startswith("REPLACE_WITH_"):
+        llm_key = str(config["LLM_NEWS_API_KEY"]).strip()
+        if not llm_key or llm_key.startswith("REPLACE_WITH_"):
             raise ValueError(
-                "LLM news assessment is enabled, but ANTHROPIC_API_KEY is "
-                "not set. Create an API key at platform.claude.com or set "
-                "LLM_NEWS_ENABLED to false."
+                "LLM news assessment is enabled, but LLM_NEWS_API_KEY is "
+                "not set. For the free Gemini tier, create a key at "
+                "aistudio.google.com, or set LLM_NEWS_ENABLED to false."
             )
     config["LLM_NEWS_BLOCK_SCORE"] = llm_block_score
+    config["LLM_NEWS_PROVIDER"] = llm_provider
     config["LLM_NEWS_MODEL"] = llm_model
+    config["LLM_NEWS_BASE_URL"] = llm_base_url
 
     config["ASSET_A"] = asset_a
     config["ASSET_B"] = asset_b
@@ -194,9 +211,9 @@ def main() -> int:
         os.environ["ALPACA_API_SECRET"] = str(config["ALPACA_SECRET_KEY"])
         os.environ["ALPACA_IS_PAPER"] = str(config["IS_PAPER_TRADING"]).lower()
         os.environ["EMAIL_SMTP_PASSWORD"] = str(config["EMAIL_SMTP_PASSWORD"])
-        anthropic_key = str(config["ANTHROPIC_API_KEY"]).strip()
-        if anthropic_key and not anthropic_key.startswith("REPLACE_WITH_"):
-            os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+        llm_key = str(config["LLM_NEWS_API_KEY"]).strip()
+        if llm_key and not llm_key.startswith("REPLACE_WITH_"):
+            os.environ["LLM_NEWS_API_KEY"] = llm_key
 
         broker = Alpaca(
             {
@@ -244,7 +261,9 @@ def main() -> int:
                 ],
                 "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
                 "llm_news_enabled": config["LLM_NEWS_ENABLED"],
+                "llm_news_provider": config["LLM_NEWS_PROVIDER"],
                 "llm_news_model": config["LLM_NEWS_MODEL"],
+                "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
                 "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
                 "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
             },
