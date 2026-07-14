@@ -54,11 +54,14 @@ class AdaptiveNewsModel:
                     state["observations"] = observations[-self.maximum_observations :]
 
         if news_score is not None:
-            state["pending"] = {
-                "date": evaluation_date,
-                "price": current_price,
-                "news_score": news_score,
-            }
+            # Keep the original same-day observation across restarts so the
+            # next return is measured from the first evaluation, not a later one.
+            if not (pending and pending.get("date") == evaluation_date):
+                state["pending"] = {
+                    "date": evaluation_date,
+                    "price": current_price,
+                    "news_score": news_score,
+                }
         elif pending and pending.get("date") != evaluation_date:
             state["pending"] = None
 
@@ -141,10 +144,29 @@ class AdaptiveNewsModel:
             observations = state.get("observations", [])
             if not isinstance(observations, list):
                 raise ValueError("observations must be a list")
+            # Drop malformed entries so one bad record cannot permanently
+            # break every future fit (valid JSON never reaches the corrupt-file
+            # quarantine below).
+            numeric = (int, float)
+            observations = [
+                item
+                for item in observations
+                if isinstance(item, dict)
+                and isinstance(item.get("news_score"), numeric)
+                and isinstance(item.get("return_percent"), numeric)
+            ]
+            pending = state.get("pending")
+            if not (
+                isinstance(pending, dict)
+                and isinstance(pending.get("date"), str)
+                and isinstance(pending.get("price"), numeric)
+                and isinstance(pending.get("news_score"), numeric)
+            ):
+                pending = None
             return {
                 "version": 1,
                 "observations": observations[-self.maximum_observations :],
-                "pending": state.get("pending"),
+                "pending": pending,
             }
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             # Preserve a corrupt file for diagnosis instead of trusting its data.

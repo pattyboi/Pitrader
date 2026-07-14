@@ -45,17 +45,18 @@ Four modules, one strategy class:
 
 1. Fetch news context and prices; bail out (no trade) if prices are missing or non-positive.
 2. Update the adaptive model with today's score/price.
-3. If `vars.pending_rotation` is set, this iteration only finishes the previous rotation (wait for the A sale to leave the position, then buy B) — it never evaluates a new signal.
+3. If `vars.pending_rotation` is set, reconcile against live positions and open orders: still holding A with an active sell → wait; holding A with no active sell (order died / lost across restart) → clear the flag and fall through to a fresh evaluation; A gone → buy B (or finish the rotation if cash can't cover one share).
 4. Compute dip from the max daily high over the lookback; require `dip >= threshold` and a long Asset A position.
 5. Two independent vetoes, either blocks the trade: the fixed news score (`score <= NEWS_HIGH_RISK_SCORE` when `NEWS_BLOCK_ON_HIGH_RISK`) and the mature learned forecast (`predicted return <= NEWS_PREDICTED_RETURN_BLOCK_PERCENT` when correlation qualifies).
-6. Submit the A market sale and set `vars.pending_rotation = True`. The B buy happens in `on_filled_order` when the sale fills, with the next daily iteration (step 3) as fallback.
+6. Submit the A market sale and set the pending flag via `_set_pending_rotation(True)`, which persists to `.rotation_state.json` so restarts can't strand mid-rotation cash. The B buy happens in `on_filled_order` when the sale fills (next daily iteration as fallback); the flag clears only when the B **buy fills** (or cash drops below one share), never on submission. `on_canceled_order` resets a dead sell to idle and leaves a dead buy pending for retry. `_buy_asset_b_with_available_cash` holds back `CASH_BUFFER_FRACTION` (1%) of cash so the market order can't be rejected on a price uptick, checks for an already-working buy order before submitting, and is serialized by `_rotation_lock` against the broker-callback thread.
 
 ### Fail-safe conventions — preserve these
 
 - News/data outages **fail open**: the price strategy continues without the news veto rather than halting (`NewsContext.available = False`).
 - Any exception in the iteration is caught, logged as "failed safely", and retried next cycle; the process must not die mid-market-day.
 - The daily email report (`_send_daily_email`, gated by `.last_email_report` date file so it never duplicates a day) is sent from a `finally` block — every exit path fills `report["status"]` first, so new early returns must set it too.
-- A corrupt `.news_learning_state.json` is renamed to `.corrupt` and learning restarts clean.
-- The two-phase rotation (`pending_rotation` + whole-share cash buy) is deliberately idempotent across restarts and network drops; don't introduce paths that could submit duplicate orders.
+- A corrupt `.news_learning_state.json` is renamed to `.corrupt` and learning restarts clean; malformed entries inside valid JSON are filtered out on load.
+- The two-phase rotation (persisted `pending_rotation` + whole-share cash buy) is deliberately idempotent across restarts, rejections, and network drops; don't introduce paths that could submit duplicate orders or clear the flag before the buy actually fills.
+- Secrets never travel through Lumibot's `parameters` dict (it can be logged): `main.py` exports `ALPACA_API_KEY`/`ALPACA_API_SECRET` (read by `news_context.py` — alpaca-py has no env fallback of its own) and `EMAIL_SMTP_PASSWORD` (read by `_send_daily_email`). SMTP uses `ssl.create_default_context()` for STARTTLS — the stdlib default is unverified; don't regress it.
 
 The README is user-facing documentation for a novice operator and describes behavior in detail — keep it in sync with any behavior or config change.

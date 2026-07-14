@@ -39,9 +39,17 @@ this sequence:
 1. Submit a market order to sell the entire long SPY position.
 2. Wait for Alpaca to confirm that the sale filled.
 3. Read the available cash and current QQQ price.
-4. Submit a market order for the maximum whole number of QQQ shares that the
-   available cash can purchase.
-5. Leave any cash that is insufficient to purchase another whole share unused.
+4. Submit a market order for the maximum whole number of QQQ shares that
+   roughly 99% of the available cash can purchase. About 1% is held back so a
+   small upward price move between the quote and the fill cannot cause the
+   order to be rejected or overspend the account.
+5. Leave the safety buffer and any cash insufficient for another whole share
+   unused.
+
+The rotation is tracked in a small state file, so a reboot, crash, or rejected
+order between the sale and the purchase does not strand the cash: the agent
+reconciles its state against actual positions and open orders on the next
+evaluation and finishes the rotation.
 
 The agent does **not** automatically create the initial Asset A position. It
 also does not rotate from Asset B back into Asset A. After a completed A-to-B
@@ -52,6 +60,7 @@ rotation, it will take no further rotation action unless Asset A is held again.
 ```text
 pi-trading-agent/
 ├── README.md           This guide
+├── config.example.json Placeholder template copied to config.json
 ├── config.json         Credentials, symbols, and strategy settings
 ├── requirements.txt    Python package requirements
 ├── main.py             Configuration validation and application startup
@@ -65,7 +74,9 @@ The installer later creates `.venv/`, which contains an isolated Python
 environment. Do not edit that directory. When email reporting is enabled, the
 agent also creates `.last_email_report`. That small file contains only the date
 of the most recently sent report and prevents duplicates after a restart. The
-adaptive model creates `.news_learning_state.json` to preserve its observations.
+adaptive model creates `.news_learning_state.json` to preserve its observations,
+and `.rotation_state.json` remembers a rotation that is partway through (sold
+Asset A, not yet bought Asset B) so restarts cannot strand the cash.
 
 ## What you need
 
@@ -112,6 +123,13 @@ Move into the project directory:
 
 ```bash
 cd /mnt/dietpi_userdata/staging/pi-trading/pi-trading-agent
+```
+
+If `config.json` does not exist yet (for example after cloning the repository),
+create it from the template first:
+
+```bash
+cp config.example.json config.json
 ```
 
 Open the configuration file with a terminal editor:
@@ -748,8 +766,10 @@ The agent does not buy Asset A for you.
 Review the logs and Alpaca order activity first. A connection failure or missing
 price immediately after the sale can delay the purchase until the next strategy
 cycle. Insufficient cash for one whole Asset B share also prevents a purchase.
-Do not manually create a duplicate order until you have checked Alpaca's open,
-filled, rejected, and canceled orders.
+The pending rotation is stored in `.rotation_state.json` and retried
+automatically on the next evaluation, including after a rejected order or a
+reboot. Do not manually create a duplicate order until you have checked
+Alpaca's open, filled, rejected, and canceled orders.
 
 ### Dependency installation fails
 

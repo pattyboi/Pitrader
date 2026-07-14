@@ -13,6 +13,15 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
+if [[ ! -f "${PROJECT_DIR}/config.json" && -f "${PROJECT_DIR}/config.example.json" ]]; then
+    cp "${PROJECT_DIR}/config.example.json" "${PROJECT_DIR}/config.json"
+    chown "${RUN_USER}:${RUN_GROUP}" "${PROJECT_DIR}/config.json"
+    chmod 600 "${PROJECT_DIR}/config.json"
+    echo "Created config.json from config.example.json."
+    echo "Edit ${PROJECT_DIR}/config.json with your Alpaca credentials, then rerun this installer."
+    exit 1
+fi
+
 if [[ ! -f "${PROJECT_DIR}/main.py" || ! -f "${PROJECT_DIR}/strategy.py" || \
       ! -f "${PROJECT_DIR}/adaptive_news_model.py" || \
       ! -f "${PROJECT_DIR}/news_context.py" || ! -f "${PROJECT_DIR}/config.json" ]]; then

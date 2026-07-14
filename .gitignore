@@ -8,6 +8,8 @@ pi-trading-agent/config.json
 .last_email_report
 .news_learning_state.json
 .news_learning_state.json.*
+.rotation_state.json
+.rotation_state.json.*
 
 # Python bytecode
 __pycache__/

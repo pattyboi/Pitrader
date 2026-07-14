@@ -1,5 +1,6 @@
 """Lightweight headline analysis for daily market context."""
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,8 @@ from typing import Any
 SEVERE_RISK_TERMS = (
     "bank failure",
     "cyberattack",
-    "default",
+    "debt default",
+    "sovereign default",
     "invasion",
     "market crash",
     "missile attack",
@@ -95,13 +97,23 @@ class WorldEventAnalyzer:
         from alpaca.data.historical.news import NewsClient
         from alpaca.data.requests import NewsRequest
 
+        # alpaca-py does not read credentials from the environment on its own;
+        # main.py exports these before the strategy starts.
+        api_key = os.environ.get("ALPACA_API_KEY", "")
+        secret_key = os.environ.get("ALPACA_API_SECRET", "")
+        if not api_key or not secret_key:
+            raise RuntimeError(
+                "Alpaca credentials were not found in the environment; "
+                "news retrieval requires them."
+            )
+
         now = datetime.now(timezone.utc)
         request = NewsRequest(
             start=now - timedelta(hours=self.lookback_hours),
             end=now,
             limit=self.max_articles,
         )
-        response = NewsClient().get_news(request)
+        response = NewsClient(api_key=api_key, secret_key=secret_key).get_news(request)
         dataframe = getattr(response, "df", None)
         if dataframe is None or dataframe.empty:
             return NewsContext(
@@ -112,11 +124,13 @@ class WorldEventAnalyzer:
 
         scored_headlines: list[tuple[int, str]] = []
         total_score = 0
+        article_count = 0
         for _, row in dataframe.iterrows():
             headline = str(self._row_value(row, "headline") or "").strip()
             summary = str(self._row_value(row, "summary") or "").strip()
             if not headline:
                 continue
+            article_count += 1
             article_score, matched = self.score_text(f"{headline} {summary}")
             total_score += article_score
             if article_score != 0:
@@ -136,7 +150,6 @@ class WorldEventAnalyzer:
 
         scored_headlines.sort(key=lambda item: abs(item[0]), reverse=True)
         top_headlines = [text for _, text in scored_headlines[:5]]
-        article_count = len(dataframe.index)
         return NewsContext(
             available=True,
             score=total_score,

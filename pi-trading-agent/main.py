@@ -161,9 +161,13 @@ def main() -> int:
         config = load_config(CONFIG_PATH)
 
         # Keep credentials out of command-line arguments and process listings.
+        # The news layer (news_context.py) and email reporting read these
+        # environment variables so secrets never travel through the Lumibot
+        # parameters dict, which can end up in logs.
         os.environ["ALPACA_API_KEY"] = str(config["ALPACA_API_KEY"])
         os.environ["ALPACA_API_SECRET"] = str(config["ALPACA_SECRET_KEY"])
         os.environ["ALPACA_IS_PAPER"] = str(config["IS_PAPER_TRADING"]).lower()
+        os.environ["EMAIL_SMTP_PASSWORD"] = str(config["EMAIL_SMTP_PASSWORD"])
 
         broker = Alpaca(
             {
@@ -183,11 +187,11 @@ def main() -> int:
                 "email_smtp_host": config["EMAIL_SMTP_HOST"],
                 "email_smtp_port": config["EMAIL_SMTP_PORT"],
                 "email_smtp_username": config["EMAIL_SMTP_USERNAME"],
-                "email_smtp_password": config["EMAIL_SMTP_PASSWORD"],
                 "email_from_address": config["EMAIL_FROM_ADDRESS"],
                 "email_to_address": config["EMAIL_TO_ADDRESS"],
                 "email_use_tls": config["EMAIL_USE_TLS"],
                 "email_state_file": str(BASE_DIR / ".last_email_report"),
+                "rotation_state_file": str(BASE_DIR / ".rotation_state.json"),
                 "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
                 "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
                 "news_max_articles": config["NEWS_MAX_ARTICLES"],

@@ -1,7 +1,11 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
+import json
 import math
+import os
 import smtplib
+import ssl
+import threading
 from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from pathlib import Path
@@ -26,10 +30,87 @@ class AssetRotationStrategy(Strategy):
         "news_learning_enabled": True,
     }
 
+    # Fraction of cash withheld from the Asset B buy so the market order is not
+    # rejected (or filled into a deficit) if the price moves before execution.
+    CASH_BUFFER_FRACTION = 0.01
+
+    # Order statuses that mean an order can no longer fill. Anything else is
+    # treated as still working so the agent never submits a duplicate.
+    _TERMINAL_ORDER_STATUSES = {
+        "fill",
+        "filled",
+        "cancel",
+        "canceled",
+        "cancelled",
+        "cash_settled",
+        "error",
+        "expired",
+        "rejected",
+    }
+
     def initialize(self) -> None:
         """Configure one evaluation per trading day."""
         self.sleeptime = "1D"
-        self.vars.pending_rotation = False
+        self._rotation_lock = threading.Lock()
+        self.vars.pending_rotation = self._load_pending_rotation()
+        if self.vars.pending_rotation:
+            self.log_message(
+                "Restored an in-progress rotation from disk; it will be "
+                "reconciled on the next trading iteration.",
+                color="yellow",
+            )
+
+    def _rotation_state_path(self) -> Path | None:
+        raw = self.parameters.get("rotation_state_file")
+        return Path(str(raw)) if raw else None
+
+    def _load_pending_rotation(self) -> bool:
+        """Restore the in-progress rotation flag after a restart."""
+        path = self._rotation_state_path()
+        if path is None or not path.exists():
+            return False
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            return bool(state.get("pending_rotation", False))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+    def _set_pending_rotation(self, value: bool) -> None:
+        """Update the rotation flag in memory and persist it atomically."""
+        self.vars.pending_rotation = bool(value)
+        path = self._rotation_state_path()
+        if path is None:
+            return
+        try:
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(
+                json.dumps({"pending_rotation": bool(value)}) + "\n",
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except OSError as exc:
+            self.log_message(f"Could not persist rotation state: {exc}", color="red")
+
+    def _has_active_order(self, symbol: str, side: str) -> bool:
+        """Best-effort check for a working order; unknown states count as active."""
+        try:
+            orders = self.get_orders() or []
+        except Exception as exc:
+            self.log_message(
+                f"Could not read orders ({type(exc).__name__}: {exc}); "
+                "assuming one may still be working.",
+                color="yellow",
+            )
+            return True
+        for order in orders:
+            order_symbol = getattr(getattr(order, "asset", None), "symbol", None)
+            order_side = str(getattr(order, "side", "")).lower()
+            if order_symbol != symbol or order_side != side.lower():
+                continue
+            status = str(getattr(order, "status", "")).lower()
+            if status not in self._TERMINAL_ORDER_STATUSES:
+                return True
+        return False
 
     def _send_daily_email(self, report: dict[str, Any]) -> None:
         """Send at most one successful summary email per calendar day."""
@@ -86,15 +167,18 @@ class AssetRotationStrategy(Strategy):
 
             host = str(self.parameters["email_smtp_host"])
             port = int(self.parameters["email_smtp_port"])
+            # The password comes from the environment so it never travels
+            # through Lumibot's parameters dict, which may be logged.
+            password = os.environ.get("EMAIL_SMTP_PASSWORD") or str(
+                self.parameters.get("email_smtp_password", "")
+            )
             with smtplib.SMTP(host, port, timeout=30) as smtp:
                 smtp.ehlo()
                 if bool(self.parameters["email_use_tls"]):
-                    smtp.starttls()
+                    # Verify the server certificate; the stdlib default does not.
+                    smtp.starttls(context=ssl.create_default_context())
                     smtp.ehlo()
-                smtp.login(
-                    str(self.parameters["email_smtp_username"]),
-                    str(self.parameters["email_smtp_password"]),
-                )
+                smtp.login(str(self.parameters["email_smtp_username"]), password)
                 smtp.send_message(message)
 
             state_file.write_text(report_date + "\n", encoding="utf-8")
@@ -197,31 +281,48 @@ class AssetRotationStrategy(Strategy):
         except (AttributeError, InvalidOperation, TypeError, ValueError):
             return Decimal("0")
 
-    def _buy_asset_b_with_available_cash(self, asset_b: str, price_b: float) -> bool:
-        """Invest all available whole-share buying capacity in Asset B."""
-        cash = float(self.get_cash())
-        quantity = math.floor(cash / price_b)
-        if quantity < 1:
-            self.log_message(
-                f"No purchase submitted: available cash ${cash:.2f} cannot buy one "
-                f"share of {asset_b} at ${price_b:.2f}.",
-                color="yellow",
-            )
-            return False
+    def _buy_asset_b_with_available_cash(self, asset_b: str, price_b: float) -> str:
+        """Submit the largest whole-share Asset B buy the cash safely supports.
 
-        buy_order = self.create_order(
-            asset_b,
-            quantity=quantity,
-            side="buy",
-            order_type="market",
-        )
-        self.submit_order(buy_order)
-        self.log_message(
-            f"Submitted market buy for {quantity} shares of {asset_b}, using "
-            f"the maximum whole-share quantity supported by ${cash:.2f} cash.",
-            color="green",
-        )
-        return True
+        Returns "submitted" when a new order was placed, "working" when a buy
+        order is already in flight, or "insufficient" when the spendable cash
+        cannot purchase one whole share.
+        """
+        with self._rotation_lock:
+            if self._has_active_order(asset_b, "buy"):
+                self.log_message(
+                    f"A buy order for {asset_b} is already working; "
+                    "not submitting another.",
+                    color="yellow",
+                )
+                return "working"
+
+            cash = float(self.get_cash())
+            spendable = cash * (1.0 - self.CASH_BUFFER_FRACTION)
+            quantity = math.floor(spendable / price_b)
+            if quantity < 1:
+                self.log_message(
+                    f"No purchase submitted: spendable cash ${spendable:.2f} "
+                    f"(${cash:.2f} minus the safety buffer) cannot buy one "
+                    f"share of {asset_b} at ${price_b:.2f}.",
+                    color="yellow",
+                )
+                return "insufficient"
+
+            buy_order = self.create_order(
+                asset_b,
+                quantity=quantity,
+                side="buy",
+                order_type="market",
+            )
+            self.submit_order(buy_order)
+            self.log_message(
+                f"Submitted market buy for {quantity} shares of {asset_b}, the "
+                f"largest whole-share quantity supported by ${cash:.2f} cash "
+                f"after a {self.CASH_BUFFER_FRACTION:.0%} safety buffer.",
+                color="green",
+            )
+            return "submitted"
 
     def on_trading_iteration(self) -> None:
         """Evaluate the dip and safely advance any required portfolio rotation."""
@@ -286,22 +387,43 @@ class AssetRotationStrategy(Strategy):
                 learning_explanation=learning_result.explanation,
             )
 
-            # A previous iteration may have submitted the sale. Wait until the
-            # position is actually gone before spending the resulting cash.
+            # A previous iteration may have submitted the sale. Reconcile the
+            # persisted rotation flag against live positions and open orders.
             if self.vars.pending_rotation:
                 if quantity_a > 0:
-                    report["status"] = f"Pending: waiting for the {asset_a} sale to fill"
+                    if self._has_active_order(asset_a, "sell"):
+                        report["status"] = f"Pending: waiting for the {asset_a} sale to fill"
+                        self.log_message(
+                            f"Waiting for the {asset_a} sale to fill before buying {asset_b}.",
+                            color="yellow",
+                        )
+                        return
+                    # The sale died without a callback (canceled, rejected, or
+                    # lost across a restart). Re-evaluate the signal fresh.
+                    self._set_pending_rotation(False)
                     self.log_message(
-                        f"Waiting for the {asset_a} sale to fill before buying {asset_b}.",
+                        f"The pending {asset_a} sale is no longer working; "
+                        "re-evaluating the dip signal from scratch.",
                         color="yellow",
                     )
-                    return
-                if self._buy_asset_b_with_available_cash(asset_b, price_b):
-                    self.vars.pending_rotation = False
-                    report["status"] = f"Submitted purchase of {asset_b} after completed sale"
                 else:
-                    report["status"] = f"No purchase: insufficient cash for one {asset_b} share"
-                return
+                    outcome = self._buy_asset_b_with_available_cash(asset_b, price_b)
+                    if outcome == "submitted":
+                        report["status"] = (
+                            f"Submitted purchase of {asset_b} after completed sale"
+                        )
+                    elif outcome == "working":
+                        report["status"] = (
+                            f"Pending: waiting for the open {asset_b} purchase to fill"
+                        )
+                    else:
+                        # Below one whole share: the rotation is complete by design.
+                        self._set_pending_rotation(False)
+                        report["status"] = (
+                            f"Rotation finished: remaining cash cannot buy one "
+                            f"{asset_b} share"
+                        )
+                    return
 
             bars = self.get_historical_prices(asset_b, lookback, "day")
             if bars is None or bars.df is None or bars.df.empty or "high" not in bars.df:
@@ -388,7 +510,7 @@ class AssetRotationStrategy(Strategy):
                 order_type="market",
             )
             self.submit_order(sell_order)
-            self.vars.pending_rotation = True
+            self._set_pending_rotation(True)
             report["status"] = f"Submitted market sale of {asset_a} to rotate into {asset_b}"
             self.log_message(
                 f"Dip signal triggered. Submitted market sale of {quantity_a} "
@@ -427,7 +549,17 @@ class AssetRotationStrategy(Strategy):
         # obtain fresh account or price data during a temporary outage.
         asset_a = str(self.parameters["asset_a"]).upper()
         asset_b = str(self.parameters["asset_b"]).upper()
-        if not self.vars.pending_rotation or symbol != asset_a or str(side).lower() != "sell":
+        side_text = str(side).lower()
+
+        # The Asset B purchase filled: the rotation is complete.
+        if self.vars.pending_rotation and symbol == asset_b and side_text == "buy":
+            self._set_pending_rotation(False)
+            self.log_message(
+                f"Rotation complete: the {asset_b} purchase filled.", color="green"
+            )
+            return
+
+        if not self.vars.pending_rotation or symbol != asset_a or side_text != "sell":
             return
 
         try:
@@ -439,11 +571,43 @@ class AssetRotationStrategy(Strategy):
                     color="yellow",
                 )
                 return
-            if self._buy_asset_b_with_available_cash(asset_b, float(price_b)):
-                self.vars.pending_rotation = False
+            outcome = self._buy_asset_b_with_available_cash(asset_b, float(price_b))
+            if outcome == "insufficient":
+                # Cash may not have settled yet; keep the rotation pending so
+                # the next iteration retries with confirmed balances and only
+                # then declares the rotation finished.
+                self.log_message(
+                    f"The {asset_b} purchase will be retried next cycle in case "
+                    "the sale proceeds have not settled yet.",
+                    color="yellow",
+                )
         except Exception as exc:
             self.log_message(
                 f"Post-sale purchase failed safely and will be retried: "
                 f"{type(exc).__name__}: {exc}",
                 color="red",
             )
+
+    def on_canceled_order(self, order: Any) -> None:
+        """Keep the rotation state truthful when the broker kills an order."""
+        symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
+        side = str(getattr(order, "side", "unknown")).lower()
+        self.log_message(
+            f"Order canceled or rejected by the broker: {side} {symbol}.",
+            color="red",
+        )
+        if not self.vars.pending_rotation:
+            return
+
+        asset_a = str(self.parameters["asset_a"]).upper()
+        if symbol == asset_a and side == "sell":
+            # Nothing was sold, so the rotation never started. Clear the flag
+            # and let the next iteration evaluate the dip signal fresh.
+            self._set_pending_rotation(False)
+            self.log_message(
+                f"The {asset_a} sale was canceled; the rotation is reset and "
+                "the signal will be re-evaluated next cycle.",
+                color="yellow",
+            )
+        # A canceled Asset B buy keeps pending_rotation set, so the next
+        # iteration retries the purchase with the cash still on hand.
