@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import date as date_type, timedelta
 from pathlib import Path
 
+import duckdb
+
 # An unsettled observation older than this is never settled: after a longer
 # service outage, "price today" would record a multi-day return as if it were
 # a single session and poison the learned relationship. Four calendar days
@@ -60,8 +62,9 @@ class TradeMemory:
         diluting the decision-specific evidence.
         """
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as conn:
+        with self._connect() as conn:
             self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
             self._settle_prior_observations(conn, evaluation_date, price_a, price_b)
             conn.execute(
                 """
@@ -100,8 +103,10 @@ class TradeMemory:
             return 0
         inserted = 0
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as conn:
+        with self._connect() as conn:
             self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
+            before = self._observation_count(conn)
             for (date, price_a, price_b, dip, signal), (_, next_a, next_b, _, _) in zip(
                 rows, rows[1:]
             ):
@@ -110,7 +115,7 @@ class TradeMemory:
                 edge = ((next_b - price_b) / price_b - (next_a - price_a) / price_a) * 100.0
                 if not math.isfinite(edge):
                     continue
-                result = conn.execute(
+                conn.execute(
                     """
                     INSERT INTO observations
                         (evaluation_date, price_a, price_b, dip_percent, news_score,
@@ -127,14 +132,15 @@ class TradeMemory:
                         max(-25.0, min(25.0, edge)),
                     ),
                 )
-                inserted += max(result.rowcount, 0)
+            inserted = self._observation_count(conn) - before
             conn.commit()
         return inserted
 
     def record_decision(self, evaluation_date: str, decision: str, reason: str) -> None:
         """Attach the final decision to today's already-recorded snapshot."""
-        with sqlite3.connect(self.database_path) as conn:
+        with self._connect() as conn:
             self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
             conn.execute(
                 "UPDATE observations SET decision = ?, decision_reason = ? WHERE evaluation_date = ?",
                 (decision[:40], reason[:500], evaluation_date),
@@ -143,10 +149,14 @@ class TradeMemory:
 
     def record_execution(self, evaluation_date: str, symbol: str, side: str, price: float, quantity: float) -> None:
         """Keep an immutable local record of broker-confirmed fills."""
-        with sqlite3.connect(self.database_path) as conn:
+        with self._connect() as conn:
             self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
             conn.execute(
-                "INSERT INTO executions (evaluation_date, symbol, side, price, quantity) VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT INTO executions (id, evaluation_date, symbol, side, price, quantity)
+                VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM executions), ?, ?, ?, ?, ?)
+                """,
                 (evaluation_date, symbol[:32], side[:12], price, quantity),
             )
             conn.commit()
@@ -183,7 +193,7 @@ class TradeMemory:
         )
 
     @staticmethod
-    def _create_schema(conn: sqlite3.Connection) -> None:
+    def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS observations (
@@ -202,7 +212,7 @@ class TradeMemory:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS executions (
-                id INTEGER PRIMARY KEY,
+                id BIGINT PRIMARY KEY,
                 evaluation_date TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -211,9 +221,16 @@ class TradeMemory:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_state (
+                name TEXT PRIMARY KEY
+            )
+            """
+        )
 
     @staticmethod
-    def _settle_prior_observations(conn: sqlite3.Connection, date: str, price_a: float, price_b: float) -> None:
+    def _settle_prior_observations(conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float) -> None:
         try:
             cutoff = (date_type.fromisoformat(date) - timedelta(days=MAX_SETTLEMENT_GAP_DAYS)).isoformat()
         except ValueError:
@@ -239,6 +256,61 @@ class TradeMemory:
                     "UPDATE observations SET relative_return_percent = ? WHERE evaluation_date = ?",
                     (max(-25.0, min(25.0, edge)), prior_date),
                 )
+
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        """Open the host-native analytical store used for decision memory."""
+        return duckdb.connect(str(self.database_path))
+
+    @staticmethod
+    def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
+        return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
+
+    def _migrate_legacy_sqlite(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Copy the old journal once when upgrading an existing installation.
+
+        This uses Python's built-in SQLite reader rather than DuckDB extensions,
+        so it works on the Pi without fetching or installing an extension.
+        """
+        legacy_path = self.database_path.with_suffix(".sqlite3")
+        migrated = conn.execute(
+            "SELECT 1 FROM migration_state WHERE name = 'sqlite_to_duckdb'"
+        ).fetchone()
+        if migrated or not legacy_path.is_file():
+            return
+        try:
+            with sqlite3.connect(legacy_path) as legacy:
+                observations = legacy.execute(
+                    """
+                    SELECT evaluation_date, price_a, price_b, dip_percent, news_score,
+                           signal_present, decision, decision_reason, relative_return_percent
+                    FROM observations
+                    """
+                ).fetchall()
+                executions = legacy.execute(
+                    "SELECT id, evaluation_date, symbol, side, price, quantity FROM executions"
+                ).fetchall()
+        except sqlite3.Error:
+            # A malformed or incompatible old file must not stop trading. The
+            # new database remains usable and can be reviewed independently.
+            return
+        if observations:
+            conn.executemany(
+                """
+                INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(evaluation_date) DO NOTHING
+                """,
+                observations,
+            )
+        if executions:
+            conn.executemany(
+                """
+                INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                executions,
+            )
+        conn.execute("INSERT INTO migration_state VALUES ('sqlite_to_duckdb')")
+        conn.commit()
 
     def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:
         count = len(rows)

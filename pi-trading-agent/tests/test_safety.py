@@ -139,3 +139,39 @@ def test_walk_forward_validation_accounts_for_costs_before_selection() -> None:
 def test_holding_horizon_is_due_on_the_next_trading_day_interval() -> None:
     assert AssetRotationStrategy._holding_is_due("2026-01-02", date(2026, 1, 5), 1)
     assert not AssetRotationStrategy._holding_is_due("2026-01-05", date(2026, 1, 5), 1)
+
+
+def test_decision_memory_uses_duckdb_and_imports_legacy_sqlite(tmp_path: Path) -> None:
+    legacy_path = tmp_path / ".trade_memory.sqlite3"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE observations (
+                evaluation_date TEXT PRIMARY KEY, price_a REAL, price_b REAL,
+                dip_percent REAL, news_score INTEGER, signal_present INTEGER,
+                decision TEXT, decision_reason TEXT, relative_return_percent REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE executions (
+                id INTEGER PRIMARY KEY, evaluation_date TEXT, symbol TEXT,
+                side TEXT, price REAL, quantity REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO observations VALUES
+            ('2026-01-02', 100, 100, -2, NULL, 1, 'hold', 'legacy', 1.5)
+            """
+        )
+        conn.commit()
+
+    memory = TradeMemory(tmp_path / ".trade_memory.duckdb", 1, 10)
+    result = memory.update_and_forecast("2026-01-05", 101.0, 102.0, -2.0, None, True)
+
+    assert (tmp_path / ".trade_memory.duckdb").is_file()
+    assert result.observations == 1
+    memory.record_execution("2026-01-05", "SPY", "buy", 102.0, 1.0)

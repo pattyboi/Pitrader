@@ -138,7 +138,7 @@ pi-trading-agent/
 ├── requirements.txt    Python package requirements
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
-├── trade_memory.py      SQLite journal and learning from past rotation signals
+├── trade_memory.py      DuckDB journal and learning from past rotation signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── congress_context.py Public STOCK Act disclosure context (research-only)
 ├── wsb_context.py      Public AltIndex WallStreetBets context and discovery
@@ -152,8 +152,10 @@ environment. Do not edit that directory. When email reporting is enabled, the
 agent also creates `.last_email_report`. That small file contains only the date
 of the most recently sent report and prevents duplicates after a restart. The
 adaptive model creates `.news_learning_state.json` to preserve its observations.
-Decision memory creates `.trade_memory.sqlite3`, a local database of market
+Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances).
+On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
+requiring a DuckDB extension download.
 `.rotation_state.json` remembers a rotation that is partway through (sold
 Asset A, not yet bought Asset B) so restarts cannot strand the cash. Portfolio
 mode keeps its own equivalents: `.portfolio_rotation_state.json` for a staged
@@ -786,7 +788,7 @@ Asset B have done better than continuing to own Asset A? Because it models the
 A/B pair specifically, portfolio mode uses it only for the separately labelled
 Opportunistic Opportunity; it is not mixed into ordinary portfolio rankings.
 
-For each evaluable day, its local SQLite database records the two prices, dip,
+For each evaluable day, its local DuckDB database records the two prices, dip,
 available news score, signal state, and final decision. At the next market
 evaluation it settles the earlier record using `Asset B return - Asset A
 return`. A record is only settled when the next evaluation happens within a
@@ -800,7 +802,7 @@ It is advisory by default. After at least 40 comparable settled signals, you
 may enable `DECISION_MEMORY_BLOCK_ENABLED` in paper trading after reviewing its
 forecasts. A veto requires both a negative predicted edge and the configured
 minimum fit correlation. It never creates a trade, increases order size, or
-overrides the existing safeguards. Delete `.trade_memory.sqlite3` only if you
+overrides the existing safeguards. Delete `.trade_memory.duckdb` only if you
 intend to reset this learning history.
 
 ### Startup catch-up

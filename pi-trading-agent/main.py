@@ -517,7 +517,7 @@ def main() -> int:
                 "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
                 "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
                 "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
-                "decision_memory_database_file": str(BASE_DIR / ".trade_memory.sqlite3"),
+                "decision_memory_database_file": str(BASE_DIR / ".trade_memory.duckdb"),
                 "llm_news_enabled": config["LLM_NEWS_ENABLED"],
                 "llm_news_provider": config["LLM_NEWS_PROVIDER"],
                 "llm_news_model": config["LLM_NEWS_MODEL"],
