@@ -54,6 +54,11 @@ def load_config(path: Path) -> dict[str, Any]:
         "NEWS_LEARNING_MAX_OBSERVATIONS",
         "NEWS_LEARNING_MIN_CORRELATION",
         "NEWS_PREDICTED_RETURN_BLOCK_PERCENT",
+        "LLM_NEWS_ENABLED",
+        "ANTHROPIC_API_KEY",
+        "LLM_NEWS_MODEL",
+        "LLM_NEWS_BLOCK_ON_HIGH_RISK",
+        "LLM_NEWS_BLOCK_SCORE",
     }
     missing = sorted(required.difference(config))
     if missing:
@@ -137,6 +142,27 @@ def load_config(path: Path) -> dict[str, Any]:
     if not 0.0 <= minimum_correlation <= 1.0:
         raise ValueError("NEWS_LEARNING_MIN_CORRELATION must be between 0 and 1")
 
+    if not isinstance(config["LLM_NEWS_ENABLED"], bool):
+        raise TypeError("LLM_NEWS_ENABLED must be true or false")
+    if not isinstance(config["LLM_NEWS_BLOCK_ON_HIGH_RISK"], bool):
+        raise TypeError("LLM_NEWS_BLOCK_ON_HIGH_RISK must be true or false")
+    llm_block_score = int(config["LLM_NEWS_BLOCK_SCORE"])
+    if not -10 <= llm_block_score <= -1:
+        raise ValueError("LLM_NEWS_BLOCK_SCORE must be from -10 through -1")
+    llm_model = str(config["LLM_NEWS_MODEL"]).strip()
+    if not llm_model:
+        raise ValueError("LLM_NEWS_MODEL must be a non-empty model id")
+    if config["LLM_NEWS_ENABLED"]:
+        anthropic_key = str(config["ANTHROPIC_API_KEY"]).strip()
+        if not anthropic_key or anthropic_key.startswith("REPLACE_WITH_"):
+            raise ValueError(
+                "LLM news assessment is enabled, but ANTHROPIC_API_KEY is "
+                "not set. Create an API key at platform.claude.com or set "
+                "LLM_NEWS_ENABLED to false."
+            )
+    config["LLM_NEWS_BLOCK_SCORE"] = llm_block_score
+    config["LLM_NEWS_MODEL"] = llm_model
+
     config["ASSET_A"] = asset_a
     config["ASSET_B"] = asset_b
     config["DIP_THRESHOLD_PERCENT"] = dip_threshold
@@ -168,6 +194,9 @@ def main() -> int:
         os.environ["ALPACA_API_SECRET"] = str(config["ALPACA_SECRET_KEY"])
         os.environ["ALPACA_IS_PAPER"] = str(config["IS_PAPER_TRADING"]).lower()
         os.environ["EMAIL_SMTP_PASSWORD"] = str(config["EMAIL_SMTP_PASSWORD"])
+        anthropic_key = str(config["ANTHROPIC_API_KEY"]).strip()
+        if anthropic_key and not anthropic_key.startswith("REPLACE_WITH_"):
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_key
 
         broker = Alpaca(
             {
@@ -214,6 +243,10 @@ def main() -> int:
                     "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
                 ],
                 "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
+                "llm_news_enabled": config["LLM_NEWS_ENABLED"],
+                "llm_news_model": config["LLM_NEWS_MODEL"],
+                "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
+                "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
             },
         )
 

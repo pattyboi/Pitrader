@@ -56,6 +56,8 @@ class NewsContext:
     article_count: int = 0
     risk_level: str = "unknown"
     headlines: list[str] = field(default_factory=list)
+    # Raw articles for optional downstream analysis (e.g. the LLM layer).
+    articles: list[dict] = field(default_factory=list)
     explanation: str = "News context was not evaluated."
 
 
@@ -123,6 +125,7 @@ class WorldEventAnalyzer:
             )
 
         scored_headlines: list[tuple[int, str]] = []
+        articles: list[dict] = []
         total_score = 0
         article_count = 0
         for _, row in dataframe.iterrows():
@@ -131,6 +134,7 @@ class WorldEventAnalyzer:
             if not headline:
                 continue
             article_count += 1
+            articles.append({"headline": headline, "summary": summary})
             article_score, matched = self.score_text(f"{headline} {summary}")
             total_score += article_score
             if article_score != 0:
@@ -156,6 +160,7 @@ class WorldEventAnalyzer:
             article_count=article_count,
             risk_level=risk_level,
             headlines=top_headlines,
+            articles=articles,
             explanation=(
                 f"Scored {article_count} recent articles using explicit keyword rules; "
                 f"aggregate score {total_score}."

@@ -66,6 +66,7 @@ pi-trading-agent/
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
+├── llm_news.py         Optional Claude-based daily news assessment
 ├── strategy.py         Daily dip and rotation logic
 └── setup_service.sh    Virtual environment and systemd installer
 ```
@@ -219,6 +220,11 @@ chmod 600 config.json
 | `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
+| `LLM_NEWS_ENABLED` | Sends the day's headlines to Claude for one risk assessment | `false` |
+| `ANTHROPIC_API_KEY` | Claude API key from platform.claude.com | Your API key |
+| `LLM_NEWS_MODEL` | Claude model used for the assessment | `"claude-opus-4-8"` |
+| `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
+| `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
 
 JSON is strict:
 
@@ -236,6 +242,8 @@ JSON is strict:
 - Learning maximum must be at least the minimum and no more than 1,000.
 - Minimum learned correlation must be from `0.0` through `1.0`.
 - The learned-return blocking threshold must be negative and at least `-25`.
+- The LLM block score must be an integer from `-10` through `-1`.
+- When `LLM_NEWS_ENABLED` is `true`, a real `ANTHROPIC_API_KEY` is required.
 
 The lookback is a number of market-data bars, not necessarily calendar days.
 Weekends and exchange holidays do not produce normal stock-market daily bars.
@@ -413,6 +421,85 @@ Restart the service after changing either setting.
 
 Use paper mode to compare the logged scores with actual headlines and market
 behavior before relying on the guard.
+
+## Optional Claude-based news assessment
+
+In addition to the fixed keyword rules, the agent can send the same daily
+Alpaca headlines to the Claude API for one language-model risk assessment per
+trading day. Unlike the keyword scorer, the model reads the articles with
+genuine language understanding: it can recognize that ten articles describe
+one event, that a headline is speculation rather than fact, or that a
+negative-sounding story is irrelevant to broad US equity markets.
+
+Like every other news feature, this layer can only **veto** a rotation. It
+never creates a buy signal, and if the API is unreachable the price strategy
+continues without it (the same fail-open behavior as the rest of the news
+stack).
+
+### What it needs
+
+This feature requires an **Anthropic API key**, which is separate from a
+Claude Pro or Max chat subscription. A chat subscription cannot be used here.
+Create an API key at the Claude Console (`platform.claude.com`), add a small
+amount of prepaid credit, and expect costs of a few cents per month: the agent
+makes one small request per trading day.
+
+Treat the API key like every other secret in `config.json`: never commit it,
+keep the file at mode `600`, and rotate the key if exposure is suspected.
+
+### Enabling it
+
+Stop the service, edit the settings, and restart:
+
+```json
+"LLM_NEWS_ENABLED": true,
+"ANTHROPIC_API_KEY": "YOUR_ANTHROPIC_API_KEY",
+"LLM_NEWS_MODEL": "claude-opus-4-8",
+"LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
+"LLM_NEWS_BLOCK_SCORE": -6
+```
+
+With `LLM_NEWS_BLOCK_ON_HIGH_RISK` set to `false` (the default), the
+assessment is **advisory only**: the score, risk level, and reasoning appear
+in the logs and the daily email, but cannot block a trade. This is the
+recommended starting mode. Review several weeks of paper-trading logs and
+compare the model's assessments with what actually happened before setting it
+to `true`.
+
+`claude-opus-4-8` is a highly capable default. `claude-haiku-4-5` is a
+cheaper, faster alternative that is usually sufficient for this kind of
+summarized scoring; either way the daily cost is small.
+
+### How it works
+
+1. The existing news layer fetches up to `NEWS_MAX_ARTICLES` recent articles
+   from Alpaca (so `NEWS_CONTEXT_ENABLED` must remain `true`).
+2. The headlines and summaries are sent to the configured Claude model with
+   instructions to score aggregate near-term market risk from `-10` (severe,
+   market-wide danger) to `+10` (strongly constructive), scoring
+   conservatively and treating duplicate coverage as one event.
+3. The model must reply in a fixed JSON format containing the score, a risk
+   level, and two or three sentences of reasoning that cite the headlines.
+4. The score, level, and reasoning are logged and included in the email
+   report. When blocking is enabled and all normal trading conditions pass, a
+   score at or below `LLM_NEWS_BLOCK_SCORE` vetoes that day's rotation.
+
+The log line looks like:
+
+```text
+LLM news assessment: risk=elevated, score=-3. Several articles describe ...
+```
+
+### Limitations
+
+- The model sees only headlines and short summaries, not full articles.
+- A language model can misjudge significance in either direction; its
+  reasoning is plausible-sounding even when wrong.
+- The assessment depends on an external API: an outage means no LLM
+  protection that day (trading continues on price logic and the keyword
+  guard).
+- Scores are not comparable to the keyword score; the two guards use separate
+  thresholds and either can veto independently once enabled.
 
 ## Adaptive news learning
 

@@ -14,6 +14,7 @@ from typing import Any
 from lumibot.strategies import Strategy
 
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
+from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
 
 
@@ -28,6 +29,7 @@ class AssetRotationStrategy(Strategy):
         "email_report_enabled": False,
         "news_context_enabled": True,
         "news_learning_enabled": True,
+        "llm_news_enabled": False,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -149,6 +151,9 @@ class AssetRotationStrategy(Strategy):
                         f"News score: {report.get('news_score', 'unavailable')}",
                         f"News articles checked: {report.get('news_article_count', 'unavailable')}",
                         f"News explanation: {report.get('news_explanation', 'unavailable')}",
+                        f"LLM risk level: {report.get('llm_risk_level', 'unavailable')}",
+                        f"LLM score: {report.get('llm_score', 'unavailable')}",
+                        f"LLM reasoning: {report.get('llm_reasoning', 'unavailable')}",
                         f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                         f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                         f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
@@ -223,6 +228,45 @@ class AssetRotationStrategy(Strategy):
                 available=False,
                 risk_level="unavailable",
                 explanation=f"News retrieval failed: {type(exc).__name__}: {exc}",
+            )
+
+    def _get_llm_news_assessment(self, news_context: NewsContext) -> LLMNewsAssessment:
+        """Ask Claude to assess today's headlines, failing open on problems."""
+        if not bool(self.parameters.get("llm_news_enabled", False)):
+            return LLMNewsAssessment(
+                available=False,
+                risk_level="disabled",
+                explanation="LLM news assessment is disabled in config.json.",
+            )
+        if not news_context.available or not news_context.articles:
+            return LLMNewsAssessment(
+                available=False,
+                risk_level="unavailable",
+                explanation=(
+                    "No news articles were available for the LLM assessment."
+                ),
+            )
+        try:
+            analyzer = LLMNewsAnalyzer(model=str(self.parameters["llm_news_model"]))
+            assessment = analyzer.assess(news_context.articles)
+            self.log_message(
+                f"LLM news assessment: risk={assessment.risk_level}, "
+                f"score={assessment.score:+d}. {assessment.reasoning}",
+                color="yellow" if assessment.score < 0 else "blue",
+            )
+            return assessment
+        except Exception as exc:
+            self.log_message(
+                f"LLM news assessment unavailable; price strategy will "
+                f"continue: {type(exc).__name__}: {exc}",
+                color="red",
+            )
+            return LLMNewsAssessment(
+                available=False,
+                risk_level="unavailable",
+                explanation=(
+                    f"LLM assessment failed: {type(exc).__name__}: {exc}"
+                ),
             )
 
     def _update_adaptive_learning(
@@ -346,6 +390,19 @@ class AssetRotationStrategy(Strategy):
                 ),
                 news_explanation=news_context.explanation,
                 news_headlines=news_context.headlines,
+            )
+
+            llm_assessment = self._get_llm_news_assessment(news_context)
+            report.update(
+                llm_risk_level=llm_assessment.risk_level,
+                llm_score=(
+                    llm_assessment.score if llm_assessment.available else "unavailable"
+                ),
+                llm_reasoning=(
+                    llm_assessment.reasoning
+                    if llm_assessment.available
+                    else llm_assessment.explanation
+                ),
             )
 
             price_a = self.get_last_price(asset_a)
@@ -477,6 +534,24 @@ class AssetRotationStrategy(Strategy):
                 self.log_message(
                     f"Dip signal met, but rotation was blocked by the configured "
                     f"world-event risk guard (score {news_context.score}).",
+                    color="red",
+                )
+                return
+
+            should_block_for_llm = (
+                llm_assessment.available
+                and bool(self.parameters["llm_news_block_on_high_risk"])
+                and llm_assessment.score <= int(self.parameters["llm_news_block_score"])
+            )
+            if should_block_for_llm:
+                report["status"] = (
+                    f"Trade blocked: LLM news assessment score "
+                    f"{llm_assessment.score:+d}"
+                )
+                self.log_message(
+                    f"Dip signal met, but rotation was blocked by the LLM news "
+                    f"assessment (score {llm_assessment.score:+d}): "
+                    f"{llm_assessment.reasoning}",
                     color="red",
                 )
                 return
