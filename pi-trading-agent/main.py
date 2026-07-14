@@ -85,6 +85,72 @@ def load_config(path: Path) -> dict[str, Any]:
     if lookback_days < 2:
         raise ValueError("RECENT_HIGH_LOOKBACK_DAYS must be at least 2")
 
+    # Portfolio mode is deliberately opt-in. Autonomous discovery, when also
+    # enabled, expands the configured seed watchlist through a bounded scan.
+    portfolio_defaults = {
+        "PORTFOLIO_ENABLED": False,
+        "PORTFOLIO_SYMBOLS": [asset_a, asset_b],
+        "PORTFOLIO_MAX_POSITIONS": 1,
+        "PORTFOLIO_ANALYSIS_DAYS": 252,
+        "PORTFOLIO_MIN_SIGNAL_OBSERVATIONS": 20,
+        "PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT": 1.0,
+        "PORTFOLIO_AUTONOMOUS_DISCOVERY": False,
+        "PORTFOLIO_DISCOVERY_BATCH_SIZE": 12,
+        "PORTFOLIO_DISCOVERY_REFRESH_DAYS": 7,
+        "PORTFOLIO_FRACTIONAL_SHARES": True,
+        "PORTFOLIO_CASH_RESERVE_DOLLARS": 2.0,
+        "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
+    }
+    for key, default in portfolio_defaults.items():
+        config.setdefault(key, default)
+    if not isinstance(config["PORTFOLIO_ENABLED"], bool):
+        raise TypeError("PORTFOLIO_ENABLED must be true or false")
+    raw_symbols = config["PORTFOLIO_SYMBOLS"]
+    if not isinstance(raw_symbols, list):
+        raise TypeError("PORTFOLIO_SYMBOLS must be a JSON array of symbols")
+    portfolio_symbols = list(dict.fromkeys(str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()))
+    if not portfolio_symbols:
+        raise ValueError("PORTFOLIO_SYMBOLS must contain at least one symbol")
+    if len(portfolio_symbols) > 30:
+        raise ValueError("PORTFOLIO_SYMBOLS may contain at most 30 symbols")
+    portfolio_max_positions = int(config["PORTFOLIO_MAX_POSITIONS"])
+    portfolio_analysis_days = int(config["PORTFOLIO_ANALYSIS_DAYS"])
+    portfolio_min_observations = int(config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"])
+    portfolio_min_profit = float(config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"])
+    if not isinstance(config["PORTFOLIO_AUTONOMOUS_DISCOVERY"], bool):
+        raise TypeError("PORTFOLIO_AUTONOMOUS_DISCOVERY must be true or false")
+    discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
+    discovery_refresh_days = int(config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"])
+    if not isinstance(config["PORTFOLIO_FRACTIONAL_SHARES"], bool):
+        raise TypeError("PORTFOLIO_FRACTIONAL_SHARES must be true or false")
+    portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
+    portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
+    if not 1 <= portfolio_max_positions <= len(portfolio_symbols):
+        raise ValueError("PORTFOLIO_MAX_POSITIONS must be between 1 and the number of portfolio symbols")
+    if not 30 <= portfolio_analysis_days <= 2000:
+        raise ValueError("PORTFOLIO_ANALYSIS_DAYS must be between 30 and 2000")
+    if not 5 <= portfolio_min_observations <= 500:
+        raise ValueError("PORTFOLIO_MIN_SIGNAL_OBSERVATIONS must be between 5 and 500")
+    if not 0.0 <= portfolio_min_profit <= 100.0:
+        raise ValueError("PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT must be between 0 and 100")
+    if not 1 <= discovery_batch_size <= 30:
+        raise ValueError("PORTFOLIO_DISCOVERY_BATCH_SIZE must be between 1 and 30")
+    if not 1 <= discovery_refresh_days <= 90:
+        raise ValueError("PORTFOLIO_DISCOVERY_REFRESH_DAYS must be between 1 and 90")
+    if not 0.0 <= portfolio_cash_reserve <= 1000.0:
+        raise ValueError("PORTFOLIO_CASH_RESERVE_DOLLARS must be between 0 and 1000")
+    if not 1.0 <= portfolio_min_order <= 1000.0:
+        raise ValueError("PORTFOLIO_MIN_ORDER_DOLLARS must be between 1 and 1000")
+    config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
+    config["PORTFOLIO_MAX_POSITIONS"] = portfolio_max_positions
+    config["PORTFOLIO_ANALYSIS_DAYS"] = portfolio_analysis_days
+    config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"] = portfolio_min_observations
+    config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"] = portfolio_min_profit
+    config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] = discovery_batch_size
+    config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"] = discovery_refresh_days
+    config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
+    config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
+
     if not isinstance(config["EMAIL_REPORT_ENABLED"], bool):
         raise TypeError("EMAIL_REPORT_ENABLED must be true or false")
     if not isinstance(config["EMAIL_USE_TLS"], bool):
@@ -267,6 +333,20 @@ def main() -> int:
                 "email_use_tls": config["EMAIL_USE_TLS"],
                 "email_state_file": str(BASE_DIR / ".last_email_report"),
                 "rotation_state_file": str(BASE_DIR / ".rotation_state.json"),
+                "portfolio_enabled": config["PORTFOLIO_ENABLED"],
+                "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
+                "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
+                "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
+                "portfolio_min_signal_observations": config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"],
+                "portfolio_min_expected_profit_percent": config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"],
+                "portfolio_rotation_state_file": str(BASE_DIR / ".portfolio_rotation_state.json"),
+                "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
+                "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
+                "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
+                "portfolio_universe_state_file": str(BASE_DIR / ".autonomous_universe.json"),
+                "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
+                "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
+                "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
                 "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
                 "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
                 "news_max_articles": config["NEWS_MAX_ARTICLES"],
@@ -309,10 +389,11 @@ def main() -> int:
         trader = Trader()
         trader.add_strategy(strategy)
         logger.info(
-            "Starting %s trading for %s/%s",
+            "Starting %s trading for %s/%s%s",
             "paper" if config["IS_PAPER_TRADING"] else "LIVE",
             config["ASSET_A"],
             config["ASSET_B"],
+            " (portfolio mode enabled)" if config["PORTFOLIO_ENABLED"] else "",
         )
         trader.run_all()
         return 0

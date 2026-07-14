@@ -6,7 +6,7 @@ import os
 import smtplib
 import ssl
 import threading
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -14,13 +14,14 @@ from typing import Any
 from lumibot.strategies import Strategy
 
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
+from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
 from trade_memory import RotationForecast, TradeMemory
 
 
 class AssetRotationStrategy(Strategy):
-    """Rotate Asset A into Asset B when Asset B falls from its recent high."""
+    """Run either the original A/B rotation or an opt-in dip-signal portfolio."""
 
     parameters = {
         "asset_a": "SPY",
@@ -33,6 +34,7 @@ class AssetRotationStrategy(Strategy):
         "llm_news_enabled": False,
         "decision_memory_enabled": True,
         "decision_memory_block_enabled": False,
+        "portfolio_enabled": False,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -61,10 +63,17 @@ class AssetRotationStrategy(Strategy):
         # Historical bars are fetched during the first evaluation, after the
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
+        self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
         if self.vars.pending_rotation:
             self.log_message(
                 "Restored an in-progress rotation from disk; it will be "
                 "reconciled on the next trading iteration.",
+                color="yellow",
+            )
+        if self.vars.portfolio_pending_rotation:
+            pending = self.vars.portfolio_pending_rotation
+            self.log_message(
+                f"Restored portfolio rotation {pending['from']} to {pending['to']}; it will be reconciled next cycle.",
                 color="yellow",
             )
 
@@ -98,6 +107,40 @@ class AssetRotationStrategy(Strategy):
             temporary_path.replace(path)
         except OSError as exc:
             self.log_message(f"Could not persist rotation state: {exc}", color="red")
+
+    def _portfolio_rotation_state_path(self) -> Path | None:
+        raw = self.parameters.get("portfolio_rotation_state_file")
+        return Path(str(raw)) if raw else None
+
+    def _load_portfolio_rotation(self) -> dict[str, Any] | None:
+        """Restore a single staged portfolio replacement after a restart."""
+        path = self._portfolio_rotation_state_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if all(isinstance(state.get(key), str) and state[key] for key in ("from", "to")):
+                budget = float(state.get("budget", 0))
+                if math.isfinite(budget) and budget > 0:
+                    return {"from": state["from"].upper(), "to": state["to"].upper(), "budget": budget}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return None
+
+    def _set_portfolio_rotation(self, state: dict[str, Any] | None) -> None:
+        self.vars.portfolio_pending_rotation = state
+        path = self._portfolio_rotation_state_path()
+        if path is None:
+            return
+        try:
+            if state is None:
+                path.unlink(missing_ok=True)
+                return
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+            temporary_path.replace(path)
+        except OSError as exc:
+            self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
 
     def _has_active_order(self, symbol: str, side: str) -> bool:
         """Best-effort check for a working order; unknown states count as active."""
@@ -483,15 +526,23 @@ class AssetRotationStrategy(Strategy):
                 return "working"
 
             cash = float(self.get_cash())
-            spendable = cash * (1.0 - self.CASH_BUFFER_FRACTION)
-            quantity = math.floor(spendable / price_b)
-            if quantity < 1:
+            spendable = cash * (1.0 - self.CASH_BUFFER_FRACTION) - float(
+                self.parameters.get("portfolio_cash_reserve_dollars", 0.0)
+            )
+            if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
                 self.log_message(
                     f"No purchase submitted: spendable cash ${spendable:.2f} "
-                    f"(${cash:.2f} minus the safety buffer) cannot buy one "
-                    f"share of {asset_b} at ${price_b:.2f}.",
+                    "is below the configured minimum order amount.",
                     color="yellow",
                 )
+                return "insufficient"
+            if bool(self.parameters.get("fractional_shares", False)):
+                quantity: Decimal | int = (Decimal(str(spendable)) / Decimal(str(price_b))).quantize(
+                    Decimal("1.000000000"), rounding=ROUND_DOWN
+                )
+            else:
+                quantity = math.floor(spendable / price_b)
+            if quantity <= 0:
                 return "insufficient"
 
             buy_order = self.create_order(
@@ -503,11 +554,201 @@ class AssetRotationStrategy(Strategy):
             self.submit_order(buy_order)
             self.log_message(
                 f"Submitted market buy for {quantity} shares of {asset_b}, the "
-                f"largest whole-share quantity supported by ${cash:.2f} cash "
+                f"largest supported quantity from ${cash:.2f} cash "
                 f"after a {self.CASH_BUFFER_FRACTION:.0%} safety buffer.",
                 color="green",
             )
             return "submitted"
+
+    def _buy_portfolio_symbol(self, symbol: str, price: float, budget: float) -> str:
+        """Buy a whole or fractional quantity within a stated portfolio budget."""
+        with self._rotation_lock:
+            if self._has_active_order(symbol, "buy"):
+                return "working"
+            spendable = min(float(self.get_cash()), budget) * (1.0 - self.CASH_BUFFER_FRACTION)
+            spendable -= float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0))
+            if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
+                return "insufficient"
+            if bool(self.parameters.get("fractional_shares", False)):
+                quantity: Decimal | int = (Decimal(str(spendable)) / Decimal(str(price))).quantize(
+                    Decimal("1.000000000"), rounding=ROUND_DOWN
+                )
+            else:
+                quantity = math.floor(spendable / price)
+            if quantity <= 0:
+                return "insufficient"
+            self.submit_order(self.create_order(symbol, quantity=quantity, side="buy", order_type="market"))
+            self.log_message(
+                f"Portfolio submitted buy of {quantity} {symbol} shares using up to ${budget:.2f}.",
+                color="green",
+            )
+            return "submitted"
+
+    def _portfolio_signal(self, symbol: str) -> dict[str, float | int | str] | None:
+        """Estimate next-session return from this symbol's prior comparable dips.
+
+        This is a historical average, not a prediction or a promised profit.
+        Requiring prior observations prevents a freshly listed symbol from being
+        selected purely because it happened to dip today.
+        """
+        bars = self.get_historical_prices(
+            symbol, int(self.parameters["portfolio_analysis_days"]), "day"
+        )
+        if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
+            return None
+        rows = [
+            (float(row["high"]), float(row["close"]))
+            for _, row in bars.df[["high", "close"]].dropna().iterrows()
+            if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
+            and float(row["high"]) > 0 and float(row["close"]) > 0
+        ]
+        lookback = int(self.parameters["recent_high_lookback_days"])
+        if len(rows) <= lookback:
+            return None
+        price = self.get_last_price(symbol)
+        if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+            return None
+        threshold = float(self.parameters["dip_threshold_percent"])
+        returns: list[float] = []
+        for index in range(lookback - 1, len(rows) - 1):
+            recent_high = max(high for high, _ in rows[index - lookback + 1 : index + 1])
+            dip = ((recent_high - rows[index][1]) / recent_high) * 100.0
+            if dip >= threshold:
+                returns.append(((rows[index + 1][1] - rows[index][1]) / rows[index][1]) * 100.0)
+        recent_high = max(high for high, _ in rows[-lookback:])
+        current_dip = ((recent_high - float(price)) / recent_high) * 100.0
+        if current_dip < threshold or not returns:
+            return None
+        return {
+            "symbol": symbol,
+            "price": float(price),
+            "dip": current_dip,
+            "expected_profit": sum(returns) / len(returns),
+            "observations": len(returns),
+        }
+
+    def _portfolio_symbols(self, report: dict[str, Any]) -> list[str]:
+        """Combine the static watchlist with one bounded discovery batch."""
+        symbols = [str(symbol).upper() for symbol in self.parameters["portfolio_symbols"]]
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            return symbols
+        try:
+            discovered = AutonomousUniverse(
+                Path(str(self.parameters["portfolio_universe_state_file"])),
+                int(self.parameters["portfolio_discovery_refresh_days"]),
+                int(self.parameters["portfolio_discovery_batch_size"]),
+            ).next_batch(
+                os.environ.get("ALPACA_API_KEY", ""),
+                os.environ.get("ALPACA_API_SECRET", ""),
+            )
+            report["discovered_symbols"] = ", ".join(discovered) or "none"
+            return list(dict.fromkeys(symbols + discovered))
+        except Exception as exc:
+            # Discovery cannot turn a provider outage into a trade decision.
+            report["discovery_status"] = f"unavailable: {type(exc).__name__}"
+            self.log_message(
+                f"Autonomous discovery failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return symbols
+
+    def _remember_discovered_symbols(self, symbols: list[str]) -> None:
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            return
+        try:
+            AutonomousUniverse(
+                Path(str(self.parameters["portfolio_universe_state_file"])),
+                int(self.parameters["portfolio_discovery_refresh_days"]),
+                int(self.parameters["portfolio_discovery_batch_size"]),
+            ).remember(symbols)
+        except Exception as exc:
+            self.log_message(f"Could not persist learned symbols: {type(exc).__name__}: {exc}", color="yellow")
+
+    def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
+        """Build or rotate a bounded portfolio from the explicit symbol list."""
+        symbols = self._portfolio_symbols(report)
+        minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
+        minimum_profit = float(self.parameters["portfolio_min_expected_profit_percent"])
+        max_positions = int(self.parameters["portfolio_max_positions"])
+        news_context = self._get_news_context()
+        report.update(news_risk_level=news_context.risk_level, news_score=news_context.score if news_context.available else "unavailable")
+        if news_context.available and bool(self.parameters["news_block_on_high_risk"]) and news_context.score <= int(self.parameters["news_high_risk_score"]):
+            report["status"] = f"Portfolio trade blocked: high world-event risk score {news_context.score}"
+            return
+
+        pending = self.vars.portfolio_pending_rotation
+        if pending:
+            source, target, budget = pending["from"], pending["to"], float(pending["budget"])
+            source_quantity = self._quantity(self.get_position(source))
+            if source_quantity > 0:
+                if self._has_active_order(source, "sell"):
+                    report["status"] = f"Portfolio pending: waiting for {source} sale"
+                    return
+                self._set_portfolio_rotation(None)
+                report["status"] = f"Portfolio rotation reset: {source} sale did not fill"
+                return
+            price = self.get_last_price(target)
+            if price is None or float(price) <= 0:
+                report["status"] = f"Portfolio pending: no valid {target} price"
+                return
+            outcome = self._buy_portfolio_symbol(target, float(price), budget)
+            if outcome != "working":
+                self._set_portfolio_rotation(None)
+            report["status"] = f"Portfolio {target} purchase {outcome} after {source} sale"
+            return
+
+        signals = [self._portfolio_signal(symbol) for symbol in symbols]
+        signals = [signal for signal in signals if signal is not None]
+        eligible = [signal for signal in signals if int(signal["observations"]) >= minimum_observations and float(signal["expected_profit"]) >= minimum_profit]
+        eligible.sort(key=lambda signal: (float(signal["expected_profit"]), float(signal["dip"])), reverse=True)
+        self._remember_discovered_symbols([str(signal["symbol"]) for signal in eligible])
+        report["portfolio_candidates"] = ", ".join(f"{s['symbol']} {s['expected_profit']:+.2f}%/{s['observations']}" for s in eligible) or "none"
+        if not eligible:
+            report["status"] = "No portfolio trade: no symbol met the historical-profit threshold"
+            return
+
+        held = {symbol: self._quantity(self.get_position(symbol)) for symbol in symbols}
+        held = {symbol: quantity for symbol, quantity in held.items() if quantity > 0}
+        desired = eligible[:max_positions]
+        desired_symbols = {str(signal["symbol"]) for signal in desired}
+        target = next((signal for signal in desired if signal["symbol"] not in held), None)
+        if target is None:
+            # A recurring small deposit should grow the highest-ranked current
+            # holding instead of remaining idle once the portfolio is full.
+            cash = float(self.get_cash())
+            minimum_cash = float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0)) + float(
+                self.parameters.get("portfolio_min_order_dollars", 1.0)
+            )
+            if cash >= minimum_cash:
+                target = desired[0]
+                outcome = self._buy_portfolio_symbol(
+                    str(target["symbol"]), float(target["price"]), cash
+                )
+                report["status"] = f"Portfolio top-up: {target['symbol']} purchase {outcome}"
+                return
+            report["status"] = "No portfolio trade: current holdings match top signals and cash is below the minimum order"
+            return
+        if len(held) < max_positions:
+            slots_remaining = min(max_positions - len(held), len(desired_symbols.difference(held)))
+            outcome = self._buy_portfolio_symbol(str(target["symbol"]), float(target["price"]), float(self.get_cash()) / slots_remaining)
+            report["status"] = f"Portfolio build: {target['symbol']} purchase {outcome}"
+            return
+
+        held_signals = {str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held}
+        source = min(held, key=lambda symbol: float(held_signals.get(symbol, {"expected_profit": -100.0})["expected_profit"]))
+        source_score = float(held_signals.get(source, {"expected_profit": -100.0})["expected_profit"])
+        advantage = float(target["expected_profit"]) - source_score
+        if advantage < minimum_profit:
+            report["status"] = f"No portfolio rotation: {target['symbol']} advantage {advantage:+.2f}% is below threshold"
+            return
+        source_price = self.get_last_price(source)
+        if source_price is None or float(source_price) <= 0 or self._has_active_order(source, "sell"):
+            report["status"] = f"No portfolio rotation: {source} is unavailable or has a working order"
+            return
+        budget = float(source_price) * float(held[source])
+        self.submit_order(self.create_order(source, quantity=held[source], side="sell", order_type="market"))
+        self._set_portfolio_rotation({"from": source, "to": str(target["symbol"]), "budget": budget})
+        report["status"] = f"Portfolio rotation submitted: {source} to {target['symbol']} (expected advantage {advantage:+.2f}%)"
 
     def on_trading_iteration(self) -> None:
         """Evaluate the dip and safely advance any required portfolio rotation."""
@@ -518,6 +759,10 @@ class AssetRotationStrategy(Strategy):
             "status": "Evaluation started",
         }
         try:
+            if bool(self.parameters.get("portfolio_enabled", False)):
+                report["portfolio_mode"] = "enabled"
+                self._run_portfolio_iteration(report)
+                return
             asset_a = str(self.parameters["asset_a"]).upper()
             asset_b = str(self.parameters["asset_b"]).upper()
             threshold = float(self.parameters["dip_threshold_percent"])

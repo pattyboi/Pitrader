@@ -55,6 +55,46 @@ The agent does **not** automatically create the initial Asset A position. It
 also does not rotate from Asset B back into Asset A. After a completed A-to-B
 rotation, it will take no further rotation action unless Asset A is held again.
 
+### Optional portfolio mode
+
+Portfolio mode is off by default. When enabled, the agent only considers the
+symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
+its own. For every symbol it measures the current dip and the average
+next-session return after comparable historical dips. It opens up to
+`PORTFOLIO_MAX_POSITIONS` positions only when that historical average meets
+`PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and has at least
+`PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` examples. Cash is split among open slots.
+
+Once full, it replaces one holding only when a new candidate's historical
+expected return exceeds the weakest holding's by at least that same configured
+percentage. Replacements are staged: the old position sells first, then only
+its sale budget is used for the new purchase. This estimated historical return
+is not a real or guaranteed profit; it is a filter for paper-trading and must
+be validated before any live use. Portfolio mode bypasses the original A/B
+rotation, which remains the behavior when it is disabled.
+
+For a small account funded in roughly $50 increments, start with one position
+and fractional shares. The default portfolio settings reserve $2 for price
+movement and only submit an order of at least $5. When a later deposit arrives
+and the current top signal still qualifies, the agent adds fractional shares to
+that holding rather than leaving the deposit idle. Alpaca must support
+fractional trading for the account and symbol.
+
+`PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
+uses the Alpaca asset directory to rotate through a small batch of active,
+tradable US-equity symbols each day. A symbol becomes part of the persisted
+learned watchlist only after it passes the same historical-dip criteria; it is
+not traded merely because Alpaca lists it. The market-wide news guard remains
+in force. Discovery failure is fail-safe: the agent falls back to the static
+watchlist and places no discovery-driven order.
+
+Enable both settings only after observing the behavior in paper trading:
+
+```json
+"PORTFOLIO_ENABLED": true,
+"PORTFOLIO_AUTONOMOUS_DISCOVERY": true
+```
+
 ## Project files
 
 ```text
@@ -218,6 +258,18 @@ chmod 600 config.json
 | `ASSET_B` | Asset whose dip is measured and purchased | `"QQQ"` |
 | `DIP_THRESHOLD_PERCENT` | Required fall from the recent high | `5.0` |
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
+| `PORTFOLIO_ENABLED` | Enables watchlist-based portfolio mode instead of A/B rotation | `false` |
+| `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
+| `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings; use `1` for a ~$50 account | `1` |
+| `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
+| `PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` | Comparable historical dips needed for a symbol to qualify | `20` |
+| `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum historical average next-session return; also the minimum replacement advantage | `1.0` |
+| `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
+| `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
+| `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
+| `PORTFOLIO_FRACTIONAL_SHARES` | Allows decimal-share market orders, needed for small balances | `true` |
+| `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
+| `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
