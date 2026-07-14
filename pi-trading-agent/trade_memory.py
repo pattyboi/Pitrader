@@ -7,7 +7,14 @@ never stores API credentials, account balances, or order identifiers.
 import math
 import sqlite3
 from dataclasses import dataclass
+from datetime import date as date_type, timedelta
 from pathlib import Path
+
+# An unsettled observation older than this is never settled: after a longer
+# service outage, "price today" would record a multi-day return as if it were
+# a single session and poison the learned relationship. Four calendar days
+# covers weekends and single-holiday gaps.
+MAX_SETTLEMENT_GAP_DAYS = 4
 
 
 @dataclass
@@ -167,23 +174,30 @@ class TradeMemory:
 
     @staticmethod
     def _settle_prior_observations(conn: sqlite3.Connection, date: str, price_a: float, price_b: float) -> None:
+        try:
+            cutoff = (date_type.fromisoformat(date) - timedelta(days=MAX_SETTLEMENT_GAP_DAYS)).isoformat()
+        except ValueError:
+            return
         rows = conn.execute(
             """
             SELECT evaluation_date, price_a, price_b FROM observations
-            WHERE evaluation_date < ? AND relative_return_percent IS NULL
+            WHERE evaluation_date < ? AND evaluation_date >= ?
+              AND relative_return_percent IS NULL
             """,
-            (date,),
+            (date, cutoff),
         ).fetchall()
         for prior_date, prior_a, prior_b in rows:
             if prior_a <= 0 or prior_b <= 0:
                 continue
             return_a = ((price_a - prior_a) / prior_a) * 100.0
             return_b = ((price_b - prior_b) / prior_b) * 100.0
-            edge = max(-25.0, min(25.0, return_b - return_a))
+            edge = return_b - return_a
+            # Check finiteness before clamping: min/max silently turn NaN
+            # into the clamp bound, which would record a fabricated edge.
             if math.isfinite(edge):
                 conn.execute(
                     "UPDATE observations SET relative_return_percent = ? WHERE evaluation_date = ?",
-                    (edge, prior_date),
+                    (max(-25.0, min(25.0, edge)), prior_date),
                 )
 
     def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:
@@ -213,9 +227,10 @@ class TradeMemory:
         predicted = mean_y + beta_dip * (dip - mean_x[0]) + beta_news * ((score or 0) - mean_x[1])
         predicted = max(-10.0, min(10.0, predicted))
         fitted = [mean_y + beta_dip * row[0] + beta_news * row[1] for row in centered]
+        mean_fit = sum(fitted) / count
         variance_y = sum((value - mean_y) ** 2 for value in ys)
-        variance_fit = sum((value - sum(fitted) / count) ** 2 for value in fitted)
-        covariance = sum((y - mean_y) * (fit - sum(fitted) / count) for y, fit in zip(ys, fitted))
+        variance_fit = sum((value - mean_fit) ** 2 for value in fitted)
+        covariance = sum((y - mean_y) * (fit - mean_fit) for y, fit in zip(ys, fitted))
         correlation = covariance / math.sqrt(variance_y * variance_fit) if variance_y > 0 and variance_fit > 0 else 0.0
         return RotationForecast(
             count, True, predicted, correlation,

@@ -94,6 +94,9 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_ANALYSIS_DAYS": 252,
         "PORTFOLIO_MIN_SIGNAL_OBSERVATIONS": 20,
         "PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT": 1.0,
+        "PORTFOLIO_OOS_MIN_OBSERVATIONS": 10,
+        "PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT": 0.0,
+        "PORTFOLIO_ROUND_TRIP_COST_PERCENT": 0.20,
         "PORTFOLIO_AUTONOMOUS_DISCOVERY": False,
         "PORTFOLIO_DISCOVERY_BATCH_SIZE": 12,
         "PORTFOLIO_DISCOVERY_REFRESH_DAYS": 7,
@@ -117,6 +120,9 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_analysis_days = int(config["PORTFOLIO_ANALYSIS_DAYS"])
     portfolio_min_observations = int(config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"])
     portfolio_min_profit = float(config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"])
+    portfolio_oos_min_observations = int(config["PORTFOLIO_OOS_MIN_OBSERVATIONS"])
+    portfolio_oos_min_profit = float(config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"])
+    portfolio_round_trip_cost = float(config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"])
     if not isinstance(config["PORTFOLIO_AUTONOMOUS_DISCOVERY"], bool):
         raise TypeError("PORTFOLIO_AUTONOMOUS_DISCOVERY must be true or false")
     discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
@@ -133,6 +139,12 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("PORTFOLIO_MIN_SIGNAL_OBSERVATIONS must be between 5 and 500")
     if not 0.0 <= portfolio_min_profit <= 100.0:
         raise ValueError("PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT must be between 0 and 100")
+    if not 5 <= portfolio_oos_min_observations <= 500:
+        raise ValueError("PORTFOLIO_OOS_MIN_OBSERVATIONS must be between 5 and 500")
+    if not 0.0 <= portfolio_oos_min_profit <= 100.0:
+        raise ValueError("PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT must be between 0 and 100")
+    if not 0.0 <= portfolio_round_trip_cost <= 10.0:
+        raise ValueError("PORTFOLIO_ROUND_TRIP_COST_PERCENT must be between 0 and 10")
     if not 1 <= discovery_batch_size <= 30:
         raise ValueError("PORTFOLIO_DISCOVERY_BATCH_SIZE must be between 1 and 30")
     if not 1 <= discovery_refresh_days <= 90:
@@ -146,6 +158,9 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_ANALYSIS_DAYS"] = portfolio_analysis_days
     config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"] = portfolio_min_observations
     config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"] = portfolio_min_profit
+    config["PORTFOLIO_OOS_MIN_OBSERVATIONS"] = portfolio_oos_min_observations
+    config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"] = portfolio_oos_min_profit
+    config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"] = portfolio_round_trip_cost
     config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] = discovery_batch_size
     config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"] = discovery_refresh_days
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
@@ -290,9 +305,43 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
+class _DropTelemetry(logging.Filter):
+    """Drop Lumibot's five-minute telemetry lines; they bloat the SD-card journal."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "LUMIBOT_TELEMETRY" not in record.getMessage()
+        except Exception:
+            return True
+
+
+class _DropLumibotDuplicates(logging.Filter):
+    """Keep Lumibot records off the root handler; Lumibot's own handler prints them.
+
+    Lumibot attaches a console handler to its "lumibot" logger and re-forces
+    propagation on during its own setup, so without this filter every Lumibot
+    line lands in the journal twice (Lumibot's format plus the root handler
+    installed by basicConfig).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith("lumibot")
+
+
+def _tidy_logging() -> None:
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_DropLumibotDuplicates())
+        handler.addFilter(_DropTelemetry())
+    # Logger-level filters run before any handler (Lumibot's included) and
+    # survive Lumibot recreating its handlers, so telemetry is silenced at
+    # the source.
+    logging.getLogger("lumibot.brokers.broker").addFilter(_DropTelemetry())
+
+
 def main() -> int:
     """Configure Lumibot and run until the process receives a stop signal."""
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    _tidy_logging()
     logger = logging.getLogger("trading-agent")
 
     try:
@@ -339,6 +388,9 @@ def main() -> int:
                 "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
                 "portfolio_min_signal_observations": config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"],
                 "portfolio_min_expected_profit_percent": config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"],
+                "portfolio_oos_min_observations": config["PORTFOLIO_OOS_MIN_OBSERVATIONS"],
+                "portfolio_oos_min_net_profit_percent": config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"],
+                "portfolio_round_trip_cost_percent": config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"],
                 "portfolio_rotation_state_file": str(BASE_DIR / ".portfolio_rotation_state.json"),
                 "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
                 "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],

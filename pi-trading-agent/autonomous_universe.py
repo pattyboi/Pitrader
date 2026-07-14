@@ -11,13 +11,17 @@ import requests
 class AutonomousUniverse:
     """Rotate through a small batch of active assets without an unbounded scan."""
 
-    ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets"
+    # The assets endpoint lives on a different host per trading mode; paper
+    # keys are rejected by the live host and vice versa.
+    ASSETS_URL_PAPER = "https://paper-api.alpaca.markets/v2/assets"
+    ASSETS_URL_LIVE = "https://api.alpaca.markets/v2/assets"
     _SYMBOL = re.compile(r"^[A-Z]{1,5}$")
 
-    def __init__(self, state_path: Path, refresh_days: int, batch_size: int):
+    def __init__(self, state_path: Path, refresh_days: int, batch_size: int, paper: bool = True):
         self.state_path = state_path
         self.refresh_days = refresh_days
         self.batch_size = batch_size
+        self.assets_url = self.ASSETS_URL_PAPER if paper else self.ASSETS_URL_LIVE
 
     def next_batch(self, api_key: str, secret_key: str) -> list[str]:
         state = self._load()
@@ -29,7 +33,7 @@ class AutonomousUniverse:
         symbols = state.get("symbols", [])
         if not isinstance(symbols, list) or today - refreshed >= timedelta(days=self.refresh_days):
             response = requests.get(
-                self.ASSETS_URL,
+                self.assets_url,
                 params={"status": "active", "asset_class": "us_equity"},
                 headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key},
                 timeout=20,
@@ -61,9 +65,31 @@ class AutonomousUniverse:
         """Keep historically qualifying symbols in future daily evaluations."""
         state = self._load()
         learned = [str(symbol).upper() for symbol in state.get("learned", [])]
-        learned = [symbol for symbol in learned + symbols if self._SYMBOL.fullmatch(symbol)]
-        state["learned"] = list(dict.fromkeys(learned))[-limit:]
+        combined = [
+            symbol
+            for symbol in learned + [str(symbol).upper() for symbol in symbols]
+            if self._SYMBOL.fullmatch(symbol)
+        ]
+        # Deduplicate keeping each symbol's most recent mention, so symbols
+        # re-confirmed today (e.g. current holdings) sort newest and are not
+        # trimmed as stale when the list exceeds the limit.
+        state["learned"] = list(reversed(list(dict.fromkeys(reversed(combined)))))[-limit:]
         self._save(state)
+
+    def managed_symbols(self) -> list[str]:
+        """Return the persisted discovery symbols the strategy is allowed to own.
+
+        This is deliberately separate from the full Alpaca asset directory.
+        The directory is only a source of candidates; a holding becomes managed
+        only after it is in the configured watchlist or this persisted list.
+        """
+        return list(
+            dict.fromkeys(
+                str(symbol).upper()
+                for symbol in self._load().get("learned", [])
+                if self._SYMBOL.fullmatch(str(symbol).upper())
+            )
+        )
 
     def _load(self) -> dict:
         try:

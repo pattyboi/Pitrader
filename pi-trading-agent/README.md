@@ -3,8 +3,9 @@
 This project runs a small Lumibot strategy against an Alpaca account. It checks
 once per trading day whether **Asset B** has fallen by a configured percentage
 from its recent high. If that dip occurs and the account owns **Asset A**, the
-agent sells Asset A and uses the available cash to buy as many whole shares of
-Asset B as possible.
+agent sells Asset A and uses the available cash to buy as much Asset B as
+possible (fractional shares by default; whole shares when
+`PORTFOLIO_FRACTIONAL_SHARES` is `false`).
 
 Start with Alpaca paper trading. Paper trading uses simulated money and is the
 appropriate place to learn how the agent behaves. Do not enable live trading
@@ -39,12 +40,13 @@ this sequence:
 1. Submit a market order to sell the entire long SPY position.
 2. Wait for Alpaca to confirm that the sale filled.
 3. Read the available cash and current QQQ price.
-4. Submit a market order for the maximum whole number of QQQ shares that
-   roughly 99% of the available cash can purchase. About 1% is held back so a
-   small upward price move between the quote and the fill cannot cause the
-   order to be rejected or overspend the account.
-5. Leave the safety buffer and any cash insufficient for another whole share
-   unused.
+4. Submit a market order for the maximum QQQ quantity (fractional by default)
+   that roughly 99% of the available cash can purchase. About 1% is held back,
+   plus the configured cash reserve, so a small upward price move between the
+   quote and the fill cannot cause the order to be rejected or overspend the
+   account.
+5. Leave the safety buffer, the cash reserve, and anything below the minimum
+   order amount unused.
 
 The rotation is tracked in a small state file, so a reboot, crash, or rejected
 order between the sale and the purchase does not strand the cash: the agent
@@ -60,17 +62,34 @@ rotation, it will take no further rotation action unless Asset A is held again.
 Portfolio mode is off by default. When enabled, the agent only considers the
 symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
 its own. For every symbol it measures the current dip and the average
-next-session return after comparable historical dips. It opens up to
-`PORTFOLIO_MAX_POSITIONS` positions only when that historical average meets
-`PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and has at least
-`PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` examples. Cash is split among open slots.
+next-session return after comparable historical dips. That average is reduced
+by `PORTFOLIO_ROUND_TRIP_COST_PERCENT` to account for estimated entry and exit
+costs. It also runs a chronological walk-forward check: each validation trade
+is selected only from earlier observations, never its own realised return. It
+opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
+historical estimate and the out-of-sample result meet their configured minimums
+with enough observations. Cash is split among open slots.
 
 Once full, it replaces one holding only when a new candidate's historical
 expected return exceeds the weakest holding's by at least that same configured
-percentage. Replacements are staged: the old position sells first, then only
-its sale budget is used for the new purchase. This estimated historical return
-is not a real or guaranteed profit; it is a filter for paper-trading and must
-be validated before any live use. Portfolio mode bypasses the original A/B
+percentage. A holding that is not currently dipping is scored as a neutral
+`0%` expected edge (it is never force-rotated just because something else
+dipped). Replacements are staged like the A/B rotation: the old position sells
+first, the replacement is bought as soon as the sale fills (only its sale
+budget is spent), and the staged state clears only when the replacement
+purchase itself fills, so restarts, rejections, and network drops cannot
+strand the cash. The strategy manages only symbols explicitly listed in
+`PORTFOLIO_SYMBOLS` plus discovery symbols it previously persisted after they
+qualified; it never adopts or sells unrelated stocks in the same Alpaca
+account. Managed holdings always stay in the daily evaluation universe, so a
+position bought by the strategy can never become invisible to it. The
+world-event keyword guard, the optional LLM assessment, and the
+mature adaptive-news forecast can each veto a *new* portfolio purchase or
+replacement exactly as they veto an A/B rotation; completing an in-flight
+replacement is never vetoed. (Decision memory is specific to the A/B rotation
+and stays inactive in portfolio mode.) This estimated historical return is not
+a real or guaranteed profit; it is a filter for paper-trading and must be
+validated before any live use. Portfolio mode bypasses the original A/B
 rotation, which remains the behavior when it is disabled.
 
 For a small account funded in roughly $50 increments, start with one position
@@ -81,12 +100,15 @@ that holding rather than leaving the deposit idle. Alpaca must support
 fractional trading for the account and symbol.
 
 `PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
-uses the Alpaca asset directory to rotate through a small batch of active,
-tradable US-equity symbols each day. A symbol becomes part of the persisted
-learned watchlist only after it passes the same historical-dip criteria; it is
-not traded merely because Alpaca lists it. The market-wide news guard remains
-in force. Discovery failure is fail-safe: the agent falls back to the static
-watchlist and places no discovery-driven order.
+uses the Alpaca asset directory (the paper or live host matching the
+configured trading mode) to rotate through a small batch of active, tradable
+US-equity symbols each day. A symbol becomes part of the persisted learned
+watchlist only after it passes the same historical-dip criteria; it is not
+traded merely because Alpaca lists it. Currently held symbols are re-confirmed
+in that learned list every day, so a holding is never trimmed out of the
+universe while it is still owned. The market-wide news guard remains in force.
+Discovery failure is fail-safe: the agent falls back to the static watchlist
+and places no discovery-driven order.
 
 Enable both settings only after observing the behavior in paper trading:
 
@@ -120,7 +142,10 @@ adaptive model creates `.news_learning_state.json` to preserve its observations.
 Decision memory creates `.trade_memory.sqlite3`, a local database of market
 snapshots, decisions, and fills (never credentials or balances).
 `.rotation_state.json` remembers a rotation that is partway through (sold
-Asset A, not yet bought Asset B) so restarts cannot strand the cash.
+Asset A, not yet bought Asset B) so restarts cannot strand the cash. Portfolio
+mode keeps its own equivalents: `.portfolio_rotation_state.json` for a staged
+replacement and `.autonomous_universe.json` for the discovery cursor and
+learned watchlist.
 
 ## What you need
 
@@ -263,7 +288,10 @@ chmod 600 config.json
 | `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings; use `1` for a ~$50 account | `1` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
 | `PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` | Comparable historical dips needed for a symbol to qualify | `20` |
-| `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum historical average next-session return; also the minimum replacement advantage | `1.0` |
+| `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum cost-adjusted historical average next-session return; also the minimum replacement advantage | `1.0` |
+| `PORTFOLIO_OOS_MIN_OBSERVATIONS` | Minimum walk-forward, prior-only validation trades | `10` |
+| `PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT` | Minimum net average return in walk-forward validation | `0.0` |
+| `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return | `0.20` |
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
 | `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
@@ -335,10 +363,11 @@ trading. When enabled, the agent attempts to send one summary after its daily
 market evaluation. The report includes:
 
 - Evaluation date and time.
-- Asset A and Asset B symbols.
-- Current prices and quantities, when available.
-- Asset B's recent high and calculated dip, when available.
+- Asset A and Asset B symbols, prices, quantities, recent high, and calculated
+  dip when available (A/B mode), or current holdings, signal candidates, and
+  discovered symbols (portfolio mode).
 - The configured dip threshold.
+- News, LLM, and adaptive-learning summaries.
 - The action taken or the reason no action was taken.
 - Any caught evaluation error.
 
@@ -648,8 +677,10 @@ the default requires at least `0.15`. If news scores do not vary enough, the
 model remains non-authoritative even after collecting the minimum sample count.
 
 This veto is separate from the fixed high-risk keyword veto. Either can block a
-trade. To collect learning data without allowing learned forecasts to affect
-orders, temporarily use:
+trade, in both A/B and portfolio mode (in portfolio mode the model keeps
+learning from Asset B as a market proxy and its veto applies to new portfolio
+purchases and replacements). To collect learning data without allowing learned
+forecasts to affect orders, temporarily use:
 
 ```json
 "NEWS_LEARNING_ENABLED": true,
@@ -687,14 +718,19 @@ before considering whether this feature is useful.
 
 The news learner estimates Asset B's absolute return. Decision memory adds the
 question this strategy needs to answer: after a comparable dip, would owning
-Asset B have done better than continuing to own Asset A?
+Asset B have done better than continuing to own Asset A? Because it models the
+A/B pair specifically, it runs only in A/B mode and stays inactive when
+portfolio mode is enabled.
 
 For each evaluable day, its local SQLite database records the two prices, dip,
 available news score, signal state, and final decision. At the next market
 evaluation it settles the earlier record using `Asset B return - Asset A
-return`. Only prior dip signals train its conservative, ridge-stabilized model;
-the inputs are dip size and news score. Broker-confirmed fills are recorded
-separately for auditability.
+return`. A record is only settled when the next evaluation happens within a
+few calendar days; after a longer outage the stale record is left unsettled
+rather than recording a multi-day return as if it were one session. Only prior
+dip signals train its conservative, ridge-stabilized model; the inputs are dip
+size and news score. Broker-confirmed fills are recorded separately for
+auditability.
 
 It is advisory by default. After at least 40 comparable settled signals, you
 may enable `DECISION_MEMORY_BLOCK_ENABLED` in paper trading after reviewing its

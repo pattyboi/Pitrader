@@ -27,7 +27,10 @@ MIN_SCORE = -10
 MAX_SCORE = 10
 RISK_LEVELS = ("high", "elevated", "normal", "constructive")
 REQUEST_TIMEOUT_SECONDS = 60
-MAX_RESPONSE_TOKENS = 2048  # the response is one short JSON object
+# The reply is one short JSON object, but reasoning models (e.g. Gemini 2.5)
+# spend hidden "thinking" tokens from this same cap; too small a cap yields an
+# empty reply, which this layer treats as a failed (skipped) assessment.
+MAX_RESPONSE_TOKENS = 4096
 
 
 @dataclass

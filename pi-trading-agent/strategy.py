@@ -35,6 +35,9 @@ class AssetRotationStrategy(Strategy):
         "decision_memory_enabled": True,
         "decision_memory_block_enabled": False,
         "portfolio_enabled": False,
+        "portfolio_oos_min_observations": 10,
+        "portfolio_oos_min_net_profit_percent": 0.0,
+        "portfolio_round_trip_cost_percent": 0.20,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -64,6 +67,15 @@ class AssetRotationStrategy(Strategy):
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
+        if self.vars.pending_rotation and bool(self.parameters.get("portfolio_enabled", False)):
+            # The A/B rotation flag is meaningless in portfolio mode and the
+            # portfolio branch never reconciles it; clear it so a later switch
+            # back to A/B mode starts from a truthful state.
+            self._set_pending_rotation(False)
+            self.log_message(
+                "Cleared a stale A/B rotation flag; portfolio mode is active.",
+                color="yellow",
+            )
         if self.vars.pending_rotation:
             self.log_message(
                 "Restored an in-progress rotation from disk; it will be "
@@ -180,47 +192,62 @@ class AssetRotationStrategy(Strategy):
             )
             message["From"] = str(self.parameters["email_from_address"])
             message["To"] = str(self.parameters["email_to_address"])
-            message.set_content(
-                "\n".join(
-                    [
-                        "Raspberry Pi Trading Agent Daily Summary",
-                        "",
-                        f"Date: {report_date}",
-                        f"Evaluation time: {self.get_datetime().isoformat()}",
-                        f"Asset A: {report['asset_a']}",
-                        f"Asset B: {report['asset_b']}",
-                        f"Asset A price: {report.get('price_a', 'unavailable')}",
-                        f"Asset B price: {report.get('price_b', 'unavailable')}",
-                        f"Asset A quantity: {report.get('quantity_a', 'unavailable')}",
-                        f"Asset B quantity: {report.get('quantity_b', 'unavailable')}",
-                        f"Recent high: {report.get('recent_high', 'unavailable')}",
-                        f"Calculated dip: {report.get('dip_percent', 'unavailable')}",
-                        f"Dip threshold: {report['threshold']:.2f}%",
-                        f"News risk level: {report.get('news_risk_level', 'unavailable')}",
-                        f"News score: {report.get('news_score', 'unavailable')}",
-                        f"News articles checked: {report.get('news_article_count', 'unavailable')}",
-                        f"News explanation: {report.get('news_explanation', 'unavailable')}",
-                        f"LLM risk level: {report.get('llm_risk_level', 'unavailable')}",
-                        f"LLM score: {report.get('llm_score', 'unavailable')}",
-                        f"LLM reasoning: {report.get('llm_reasoning', 'unavailable')}",
-                        f"Learning observations: {report.get('learning_observations', 'unavailable')}",
-                        f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
-                        f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
-                        f"Decision-memory observations: {report.get('decision_memory_observations', 'unavailable')}",
-                        f"Predicted rotation edge: {report.get('rotation_edge_forecast', 'not ready')}",
-                        f"Decision-memory explanation: {report.get('decision_memory_explanation', 'unavailable')}",
-                        "Notable scored headlines:",
-                        *[
-                            f"- {headline}"
-                            for headline in report.get("news_headlines", [])
-                        ],
-                        f"Result: {report['status']}",
-                        "",
-                        "Review all orders and positions in the Alpaca dashboard.",
-                        "This automated message is not financial advice.",
-                    ]
-                )
-            )
+            portfolio_mode = report.get("portfolio_mode") == "enabled"
+            lines = [
+                "Raspberry Pi Trading Agent Daily Summary",
+                "",
+                f"Date: {report_date}",
+                f"Evaluation time: {self.get_datetime().isoformat()}",
+            ]
+            if portfolio_mode:
+                lines += [
+                    "Mode: portfolio",
+                    f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
+                    f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
+                    f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
+                    f"Discovery status: {report.get('discovery_status', 'ok')}",
+                    f"Dip threshold: {report['threshold']:.2f}%",
+                ]
+            else:
+                lines += [
+                    f"Asset A: {report['asset_a']}",
+                    f"Asset B: {report['asset_b']}",
+                    f"Asset A price: {report.get('price_a', 'unavailable')}",
+                    f"Asset B price: {report.get('price_b', 'unavailable')}",
+                    f"Asset A quantity: {report.get('quantity_a', 'unavailable')}",
+                    f"Asset B quantity: {report.get('quantity_b', 'unavailable')}",
+                    f"Recent high: {report.get('recent_high', 'unavailable')}",
+                    f"Calculated dip: {report.get('dip_percent', 'unavailable')}",
+                    f"Dip threshold: {report['threshold']:.2f}%",
+                ]
+            lines += [
+                f"News risk level: {report.get('news_risk_level', 'unavailable')}",
+                f"News score: {report.get('news_score', 'unavailable')}",
+                f"News articles checked: {report.get('news_article_count', 'unavailable')}",
+                f"News explanation: {report.get('news_explanation', 'unavailable')}",
+                f"LLM risk level: {report.get('llm_risk_level', 'unavailable')}",
+                f"LLM score: {report.get('llm_score', 'unavailable')}",
+                f"LLM reasoning: {report.get('llm_reasoning', 'unavailable')}",
+                f"Learning observations: {report.get('learning_observations', 'unavailable')}",
+                f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
+                f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
+            ]
+            if not portfolio_mode:
+                # Decision memory models the A/B rotation edge specifically.
+                lines += [
+                    f"Decision-memory observations: {report.get('decision_memory_observations', 'unavailable')}",
+                    f"Predicted rotation edge: {report.get('rotation_edge_forecast', 'not ready')}",
+                    f"Decision-memory explanation: {report.get('decision_memory_explanation', 'unavailable')}",
+                ]
+            lines += [
+                "Notable scored headlines:",
+                *[f"- {headline}" for headline in report.get("news_headlines", [])],
+                f"Result: {report['status']}",
+                "",
+                "Review all orders and positions in the Alpaca dashboard.",
+                "This automated message is not financial advice.",
+            ]
+            message.set_content("\n".join(lines))
 
             host = str(self.parameters["email_smtp_host"])
             port = int(self.parameters["email_smtp_port"])
@@ -459,10 +486,14 @@ class AssetRotationStrategy(Strategy):
             threshold = float(self.parameters["dip_threshold_percent"])
             history = []
             for position, (date, close_b, high_b) in enumerate(b_rows):
+                # Full windows only, excluding the event day's own high, so
+                # backfilled dips match how the live path measures them.
+                if position < lookback:
+                    continue
                 close_a = a_closes.get(date)
                 if close_a is None:
                     continue
-                recent_high = max(row[2] for row in b_rows[max(0, position - lookback + 1) : position + 1])
+                recent_high = max(row[2] for row in b_rows[position - lookback : position])
                 dip = ((recent_high - close_b) / recent_high) * 100.0
                 history.append((date, close_a, close_b, dip, dip >= threshold))
             inserted = TradeMemory(
@@ -509,12 +540,110 @@ class AssetRotationStrategy(Strategy):
         except (AttributeError, InvalidOperation, TypeError, ValueError):
             return Decimal("0")
 
-    def _buy_asset_b_with_available_cash(self, asset_b: str, price_b: float) -> str:
-        """Submit the largest whole-share Asset B buy the cash safely supports.
+    def _managed_portfolio_symbols(self) -> set[str]:
+        """Return symbols this strategy is permitted to count or sell.
 
-        Returns "submitted" when a new order was placed, "working" when a buy
-        order is already in flight, or "insufficient" when the spendable cash
-        cannot purchase one whole share.
+        A shared Alpaca account may contain manual investments.  Portfolio
+        mode must never adopt or liquidate them merely because they are stocks.
+        Static symbols are explicitly opted in; discovered symbols become
+        managed only after they have been persisted in the learned universe.
+        """
+        symbols = {
+            str(symbol).strip().upper()
+            for symbol in self.parameters["portfolio_symbols"]
+            if str(symbol).strip()
+        }
+        if bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            try:
+                symbols.update(self._autonomous_universe().managed_symbols())
+            except Exception as exc:
+                self.log_message(
+                    f"Could not read managed discovery symbols: {type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+        pending = self.vars.portfolio_pending_rotation
+        if pending:
+            symbols.update((str(pending["from"]).upper(), str(pending["to"]).upper()))
+        return symbols
+
+    def _portfolio_held_positions(
+        self, managed_symbols: set[str]
+    ) -> dict[str, Decimal] | None:
+        """Return managed long stock positions, or None on broker-read failure."""
+        try:
+            positions = self.get_positions() or []
+        except Exception as exc:
+            self.log_message(
+                f"Could not read account positions ({type(exc).__name__}: {exc}); "
+                "skipping this portfolio evaluation.",
+                color="red",
+            )
+            return None
+        held: dict[str, Decimal] = {}
+        for position in positions:
+            asset = getattr(position, "asset", None)
+            symbol = getattr(asset, "symbol", None)
+            asset_type = str(getattr(asset, "asset_type", "stock") or "stock").lower()
+            normalized_symbol = str(symbol).upper() if symbol else ""
+            if (
+                not normalized_symbol
+                or normalized_symbol not in managed_symbols
+                or asset_type not in ("stock", "us_equity")
+            ):
+                continue
+            quantity = self._quantity(position)
+            if quantity > 0:
+                held[normalized_symbol] = quantity
+        return held
+
+    def _market_veto_reason(
+        self,
+        news_context: NewsContext,
+        llm_assessment: LLMNewsAssessment,
+        learning_result: LearningResult | None,
+    ) -> str | None:
+        """Return the first market-level veto that blocks opening a trade.
+
+        Used by the portfolio path so it honors the same configured guards as
+        the A/B path. Completing an in-flight rotation is never vetoed.
+        """
+        if (
+            news_context.available
+            and bool(self.parameters["news_block_on_high_risk"])
+            and news_context.score <= int(self.parameters["news_high_risk_score"])
+        ):
+            return f"Trade blocked: high world-event risk score {news_context.score}"
+        if (
+            llm_assessment.available
+            and bool(self.parameters["llm_news_block_on_high_risk"])
+            and llm_assessment.score <= int(self.parameters["llm_news_block_score"])
+        ):
+            return f"Trade blocked: LLM news assessment score {llm_assessment.score:+d}"
+        if (
+            learning_result is not None
+            and bool(self.parameters["news_learning_block_enabled"])
+            and learning_result.ready
+            and learning_result.predicted_return_percent is not None
+            and learning_result.correlation is not None
+            and abs(learning_result.correlation)
+            >= float(self.parameters["news_learning_min_correlation"])
+            and learning_result.predicted_return_percent
+            <= float(self.parameters["news_predicted_return_block_percent"])
+        ):
+            return (
+                "Trade blocked: adaptive model forecast "
+                f"{learning_result.predicted_return_percent:+.2f}%"
+            )
+        return None
+
+    def _buy_asset_b_with_available_cash(self, asset_b: str, price_b: float) -> str:
+        """Submit the largest Asset B buy the cash safely supports.
+
+        Buys fractional shares when PORTFOLIO_FRACTIONAL_SHARES is enabled
+        (the default), otherwise whole shares. Returns "submitted" when a new
+        order was placed, "working" when a buy order is already in flight, or
+        "insufficient" when the spendable cash is below the minimum order (or
+        below one whole share in whole-share mode).
         """
         with self._rotation_lock:
             if self._has_active_order(asset_b, "buy"):
@@ -584,7 +713,32 @@ class AssetRotationStrategy(Strategy):
             )
             return "submitted"
 
-    def _portfolio_signal(self, symbol: str) -> dict[str, float | int | str] | None:
+    @staticmethod
+    def _walk_forward_net_returns(
+        returns: list[float],
+        round_trip_cost_percent: float,
+        minimum_observations: int,
+        entry_threshold_percent: float,
+    ) -> list[float]:
+        """Evaluate only trades selected from information available beforehand.
+
+        Each validation result uses a historical mean formed strictly before
+        that event.  This prevents a candidate's realised return from helping
+        select itself, unlike an in-sample average.
+        """
+        outcomes: list[float] = []
+        for index in range(minimum_observations, len(returns)):
+            prior_net_mean = (
+                sum(value - round_trip_cost_percent for value in returns[:index])
+                / index
+            )
+            if prior_net_mean >= entry_threshold_percent:
+                outcomes.append(returns[index] - round_trip_cost_percent)
+        return outcomes
+
+    def _portfolio_signal(
+        self, symbol: str
+    ) -> dict[str, float | int | str | None] | None:
         """Estimate next-session return from this symbol's prior comparable dips.
 
         This is a historical average, not a prediction or a promised profit.
@@ -610,8 +764,11 @@ class AssetRotationStrategy(Strategy):
             return None
         threshold = float(self.parameters["dip_threshold_percent"])
         returns: list[float] = []
-        for index in range(lookback - 1, len(rows) - 1):
-            recent_high = max(high for high, _ in rows[index - lookback + 1 : index + 1])
+        # Historical dips are measured against the *previous* lookback bars,
+        # excluding the event day's own high, to match the live check below
+        # (which compares today's price against already-completed bars).
+        for index in range(lookback, len(rows) - 1):
+            recent_high = max(high for high, _ in rows[index - lookback : index])
             dip = ((recent_high - rows[index][1]) / recent_high) * 100.0
             if dip >= threshold:
                 returns.append(((rows[index + 1][1] - rows[index][1]) / rows[index][1]) * 100.0)
@@ -619,25 +776,58 @@ class AssetRotationStrategy(Strategy):
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         if current_dip < threshold or not returns:
             return None
+        round_trip_cost = float(
+            self.parameters.get("portfolio_round_trip_cost_percent", 0.20)
+        )
+        net_returns = [value - round_trip_cost for value in returns]
+        walk_forward_returns = self._walk_forward_net_returns(
+            returns,
+            round_trip_cost,
+            int(self.parameters.get("portfolio_oos_min_observations", 10)),
+            float(self.parameters["portfolio_min_expected_profit_percent"]),
+        )
         return {
             "symbol": symbol,
             "price": float(price),
             "dip": current_dip,
-            "expected_profit": sum(returns) / len(returns),
+            # This net historical mean is a coarse current estimate. It is
+            # never enough by itself: _run_portfolio_iteration also requires
+            # the chronological walk-forward result below.
+            "expected_profit": sum(net_returns) / len(net_returns),
             "observations": len(returns),
+            "oos_expected_profit": (
+                sum(walk_forward_returns) / len(walk_forward_returns)
+                if walk_forward_returns
+                else None
+            ),
+            "oos_observations": len(walk_forward_returns),
         }
 
-    def _portfolio_symbols(self, report: dict[str, Any]) -> list[str]:
-        """Combine the static watchlist with one bounded discovery batch."""
-        symbols = [str(symbol).upper() for symbol in self.parameters["portfolio_symbols"]]
+    def _autonomous_universe(self) -> AutonomousUniverse:
+        return AutonomousUniverse(
+            Path(str(self.parameters["portfolio_universe_state_file"])),
+            int(self.parameters["portfolio_discovery_refresh_days"]),
+            int(self.parameters["portfolio_discovery_batch_size"]),
+            paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
+        )
+
+    def _portfolio_symbols(
+        self,
+        report: dict[str, Any],
+        held: dict[str, Decimal],
+        managed_symbols: set[str],
+    ) -> list[str]:
+        """Combine the watchlist, current holdings, and one discovery batch.
+
+        Held symbols are always part of the universe so an existing position
+        keeps getting a signal (and stays eligible for rotation) even after
+        the discovery batch that surfaced it has moved on.
+        """
+        symbols = list(dict.fromkeys(sorted(managed_symbols) + sorted(held)))
         if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
             return symbols
         try:
-            discovered = AutonomousUniverse(
-                Path(str(self.parameters["portfolio_universe_state_file"])),
-                int(self.parameters["portfolio_discovery_refresh_days"]),
-                int(self.parameters["portfolio_discovery_batch_size"]),
-            ).next_batch(
+            discovered = self._autonomous_universe().next_batch(
                 os.environ.get("ALPACA_API_KEY", ""),
                 os.environ.get("ALPACA_API_SECRET", ""),
             )
@@ -656,59 +846,141 @@ class AssetRotationStrategy(Strategy):
         if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
             return
         try:
-            AutonomousUniverse(
-                Path(str(self.parameters["portfolio_universe_state_file"])),
-                int(self.parameters["portfolio_discovery_refresh_days"]),
-                int(self.parameters["portfolio_discovery_batch_size"]),
-            ).remember(symbols)
+            self._autonomous_universe().remember(symbols)
         except Exception as exc:
             self.log_message(f"Could not persist learned symbols: {type(exc).__name__}: {exc}", color="yellow")
 
     def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
         """Build or rotate a bounded portfolio from the explicit symbol list."""
-        symbols = self._portfolio_symbols(report)
         minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
         minimum_profit = float(self.parameters["portfolio_min_expected_profit_percent"])
+        oos_minimum_observations = int(
+            self.parameters.get("portfolio_oos_min_observations", 10)
+        )
+        oos_minimum_profit = float(
+            self.parameters.get("portfolio_oos_min_net_profit_percent", 0.0)
+        )
         max_positions = int(self.parameters["portfolio_max_positions"])
-        news_context = self._get_news_context()
-        report.update(news_risk_level=news_context.risk_level, news_score=news_context.score if news_context.available else "unavailable")
-        if news_context.available and bool(self.parameters["news_block_on_high_risk"]) and news_context.score <= int(self.parameters["news_high_risk_score"]):
-            report["status"] = f"Portfolio trade blocked: high world-event risk score {news_context.score}"
-            return
 
+        managed_symbols = self._managed_portfolio_symbols()
+        held = self._portfolio_held_positions(managed_symbols)
+        if held is None:
+            report["status"] = "No portfolio trade: account positions were unavailable"
+            return
+        report["portfolio_holdings"] = (
+            ", ".join(f"{symbol}={quantity}" for symbol, quantity in sorted(held.items())) or "none"
+        )
+        symbols = self._portfolio_symbols(report, held, managed_symbols)
+
+        news_context = self._get_news_context()
+        report.update(
+            news_risk_level=news_context.risk_level,
+            news_score=news_context.score if news_context.available else "unavailable",
+            news_article_count=(
+                news_context.article_count if news_context.available else "unavailable"
+            ),
+            news_explanation=news_context.explanation,
+            news_headlines=news_context.headlines,
+        )
+        llm_assessment = self._get_llm_news_assessment(news_context)
+        report.update(
+            llm_risk_level=llm_assessment.risk_level,
+            llm_score=llm_assessment.score if llm_assessment.available else "unavailable",
+            llm_reasoning=(
+                llm_assessment.reasoning
+                if llm_assessment.available
+                else llm_assessment.explanation
+            ),
+        )
+
+        # The adaptive model keeps learning from the configured market proxy
+        # (Asset B) so its forecast can veto portfolio trades exactly as it
+        # vetoes A/B rotations. A missing proxy price fails open.
+        learning_result: LearningResult | None = None
+        proxy_price = self.get_last_price(str(self.parameters["asset_b"]).upper())
+        if proxy_price is not None and math.isfinite(float(proxy_price)) and float(proxy_price) > 0:
+            learning_result = self._update_adaptive_learning(float(proxy_price), news_context)
+            report.update(
+                learning_observations=learning_result.observations,
+                learned_forecast=(
+                    f"{learning_result.predicted_return_percent:+.2f}%"
+                    if learning_result.ready
+                    and learning_result.predicted_return_percent is not None
+                    else "not ready"
+                ),
+                learning_explanation=learning_result.explanation,
+            )
+        veto_reason = self._market_veto_reason(news_context, llm_assessment, learning_result)
+
+        # Completing an in-flight rotation is never vetoed: the sale already
+        # happened and leaving the proceeds in cash is its own risk.
         pending = self.vars.portfolio_pending_rotation
         if pending:
             source, target, budget = pending["from"], pending["to"], float(pending["budget"])
-            source_quantity = self._quantity(self.get_position(source))
-            if source_quantity > 0:
+            if held.get(source, Decimal("0")) > 0:
                 if self._has_active_order(source, "sell"):
                     report["status"] = f"Portfolio pending: waiting for {source} sale"
                     return
                 self._set_portfolio_rotation(None)
                 report["status"] = f"Portfolio rotation reset: {source} sale did not fill"
                 return
+            if held.get(target, Decimal("0")) > 0 and not self._has_active_order(target, "buy"):
+                # The buy filled but the fill callback was lost (restart).
+                self._set_portfolio_rotation(None)
+                report["status"] = f"Portfolio rotation complete: the {target} purchase filled"
+                return
             price = self.get_last_price(target)
-            if price is None or float(price) <= 0:
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
                 report["status"] = f"Portfolio pending: no valid {target} price"
                 return
             outcome = self._buy_portfolio_symbol(target, float(price), budget)
-            if outcome != "working":
+            if outcome == "insufficient":
+                # Balances are confirmed by now; the rotation ends here.
                 self._set_portfolio_rotation(None)
-            report["status"] = f"Portfolio {target} purchase {outcome} after {source} sale"
+                report["status"] = (
+                    f"Portfolio rotation finished: cash is below the minimum {target} order"
+                )
+            elif outcome == "working":
+                report["status"] = f"Portfolio pending: waiting for the {target} purchase to fill"
+            else:
+                # The flag clears when the buy fills (on_filled_order), never
+                # on submission, so a rejected order is retried next cycle.
+                report["status"] = f"Portfolio {target} purchase submitted after {source} sale"
             return
 
         signals = [self._portfolio_signal(symbol) for symbol in symbols]
         signals = [signal for signal in signals if signal is not None]
-        eligible = [signal for signal in signals if int(signal["observations"]) >= minimum_observations and float(signal["expected_profit"]) >= minimum_profit]
+        eligible = [
+            signal
+            for signal in signals
+            if int(signal["observations"]) >= minimum_observations
+            and float(signal["expected_profit"]) >= minimum_profit
+            and int(signal["oos_observations"]) >= oos_minimum_observations
+            and signal["oos_expected_profit"] is not None
+            and float(signal["oos_expected_profit"]) >= oos_minimum_profit
+        ]
         eligible.sort(key=lambda signal: (float(signal["expected_profit"]), float(signal["dip"])), reverse=True)
-        self._remember_discovered_symbols([str(signal["symbol"]) for signal in eligible])
-        report["portfolio_candidates"] = ", ".join(f"{s['symbol']} {s['expected_profit']:+.2f}%/{s['observations']}" for s in eligible) or "none"
+        # Remember holdings alongside today's qualifiers so a held symbol is
+        # never trimmed out of the learned universe while it is still owned.
+        self._remember_discovered_symbols(
+            list(dict.fromkeys([str(signal["symbol"]) for signal in eligible] + sorted(held)))
+        )
+        report["portfolio_candidates"] = ", ".join(
+            f"{s['symbol']} net {s['expected_profit']:+.2f}%/{s['observations']}; "
+            f"OOS {float(s['oos_expected_profit']):+.2f}%/{s['oos_observations']}"
+            for s in eligible
+        ) or "none"
         if not eligible:
             report["status"] = "No portfolio trade: no symbol met the historical-profit threshold"
             return
+        if veto_reason:
+            report["status"] = veto_reason
+            self.log_message(
+                f"Portfolio signal present, but the trade was vetoed: {veto_reason}",
+                color="red",
+            )
+            return
 
-        held = {symbol: self._quantity(self.get_position(symbol)) for symbol in symbols}
-        held = {symbol: quantity for symbol, quantity in held.items() if quantity > 0}
         desired = eligible[:max_positions]
         desired_symbols = {str(signal["symbol"]) for signal in desired}
         target = next((signal for signal in desired if signal["symbol"] not in held), None)
@@ -735,8 +1007,13 @@ class AssetRotationStrategy(Strategy):
             return
 
         held_signals = {str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held}
-        source = min(held, key=lambda symbol: float(held_signals.get(symbol, {"expected_profit": -100.0})["expected_profit"]))
-        source_score = float(held_signals.get(source, {"expected_profit": -100.0})["expected_profit"])
+        # A holding with no current dip signal is scored neutral (0% expected
+        # edge), not punished: rotation happens only when the target's
+        # historical edge beats holding by the configured margin. The old
+        # -100% default force-rotated any recovered holding every time some
+        # other symbol dipped, churning the portfolio.
+        source = min(held, key=lambda symbol: float(held_signals.get(symbol, {"expected_profit": 0.0})["expected_profit"]))
+        source_score = float(held_signals.get(source, {"expected_profit": 0.0})["expected_profit"])
         advantage = float(target["expected_profit"]) - source_score
         if advantage < minimum_profit:
             report["status"] = f"No portfolio rotation: {target['symbol']} advantage {advantage:+.2f}% is below threshold"
@@ -862,11 +1139,12 @@ class AssetRotationStrategy(Strategy):
                             f"Pending: waiting for the open {asset_b} purchase to fill"
                         )
                     else:
-                        # Below one whole share: the rotation is complete by design.
+                        # Below the minimum purchasable amount: the rotation
+                        # is complete by design.
                         self._set_pending_rotation(False)
                         report["status"] = (
-                            f"Rotation finished: remaining cash cannot buy one "
-                            f"{asset_b} share"
+                            f"Rotation finished: remaining cash is below the "
+                            f"minimum {asset_b} purchase"
                         )
                     return
 
@@ -1070,6 +1348,53 @@ class AssetRotationStrategy(Strategy):
         asset_b = str(self.parameters["asset_b"]).upper()
         side_text = str(side).lower()
 
+        # Portfolio rotations follow the same two-phase pattern as A/B: buy
+        # the replacement as soon as the source sale fills (instead of waiting
+        # a full day for the next iteration), and clear the pending flag only
+        # when the replacement purchase itself fills.
+        portfolio_pending = self.vars.portfolio_pending_rotation
+        if portfolio_pending:
+            if symbol == portfolio_pending["to"] and side_text == "buy":
+                self._set_portfolio_rotation(None)
+                self.log_message(
+                    f"Portfolio rotation complete: the {symbol} purchase filled.",
+                    color="green",
+                )
+                return
+            if symbol == portfolio_pending["from"] and side_text == "sell":
+                target = str(portfolio_pending["to"])
+                try:
+                    target_price = self.get_last_price(target)
+                    if (
+                        target_price is None
+                        or not math.isfinite(float(target_price))
+                        or float(target_price) <= 0
+                    ):
+                        self.log_message(
+                            f"The {symbol} sale filled, but {target} has no valid "
+                            "price; the purchase will be retried next cycle.",
+                            color="yellow",
+                        )
+                        return
+                    outcome = self._buy_portfolio_symbol(
+                        target, float(target_price), float(portfolio_pending["budget"])
+                    )
+                    if outcome == "insufficient":
+                        # Proceeds may not have settled yet; the next daily
+                        # iteration retries with confirmed balances.
+                        self.log_message(
+                            f"The {target} purchase will be retried next cycle in "
+                            "case the sale proceeds have not settled yet.",
+                            color="yellow",
+                        )
+                except Exception as exc:
+                    self.log_message(
+                        f"Portfolio post-sale purchase failed safely and will be "
+                        f"retried: {type(exc).__name__}: {exc}",
+                        color="red",
+                    )
+                return
+
         # The Asset B purchase filled: the rotation is complete.
         if self.vars.pending_rotation and symbol == asset_b and side_text == "buy":
             self._set_pending_rotation(False)
@@ -1115,6 +1440,19 @@ class AssetRotationStrategy(Strategy):
             f"Order canceled or rejected by the broker: {side} {symbol}.",
             color="red",
         )
+
+        portfolio_pending = self.vars.portfolio_pending_rotation
+        if portfolio_pending and symbol == portfolio_pending["from"] and side == "sell":
+            # Nothing was sold, so the portfolio rotation never started.
+            self._set_portfolio_rotation(None)
+            self.log_message(
+                f"The {symbol} sale was canceled; the portfolio rotation is "
+                "reset and will be re-evaluated next cycle.",
+                color="yellow",
+            )
+        # A canceled portfolio buy keeps the pending state so the next
+        # iteration retries the purchase with the cash still on hand.
+
         if not self.vars.pending_rotation:
             return
 
