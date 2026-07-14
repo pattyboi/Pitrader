@@ -1,0 +1,17 @@
+# Credentials — never commit; use config.example.json as the template
+pi-trading-agent/config.json
+
+# Virtual environment created by setup_service.sh
+.venv/
+
+# Runtime state files created by the agent
+.last_email_report
+.news_learning_state.json
+.news_learning_state.json.*
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Lumibot output
+logs/
