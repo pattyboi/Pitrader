@@ -10,6 +10,17 @@ pi-trading-agent/config.json
 .news_learning_state.json.*
 .rotation_state.json
 .rotation_state.json.*
+.portfolio_rotation_state.json
+.portfolio_rotation_state.json.*
+.portfolio_holding_state.json
+.portfolio_holding_state.json.*
+.autonomous_universe.json
+.autonomous_universe.json.*
+.wsb_context_snapshot.json
+.wsb_context_snapshot.json.*
+.trade_memory.sqlite3
+.trade_memory.duckdb
+.trade_memory.duckdb.*
 
 # Python bytecode
 __pycache__/
