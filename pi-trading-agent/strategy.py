@@ -20,7 +20,7 @@ from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
 from congress_context import CongressContext, CongressTradeAnalyzer
 from wsb_context import WSBContext, WallStreetBetsAnalyzer, WallStreetBetsSnapshot
-from trade_memory import RotationForecast, TradeMemory
+from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 
 
 class AssetRotationStrategy(Strategy):
@@ -612,9 +612,16 @@ class AssetRotationStrategy(Strategy):
         dip = ((recent_high - float(price_b)) / recent_high) * 100.0
         self._backfill_decision_memory(asset_a, asset_b)
         forecast = self._update_decision_memory(float(price_a), float(price_b), dip, news_context)
-        probability = TradeMemory(
-            Path(str(self.parameters["decision_memory_database_file"])), 1, 1
-        ).opportunity_probability()
+        try:
+            probability = TradeMemory(
+                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
+            ).opportunity_probability()
+        except Exception as exc:
+            self.log_message(
+                f"Opportunity probability lookup failed safely: {type(exc).__name__}: {exc}",
+                color="red",
+            )
+            probability = OpportunityProbability(observations=0, wins=0, probability=None)
         return {
             "status": "ready" if forecast.ready else "warming up",
             "dip": dip,
@@ -862,6 +869,7 @@ class AssetRotationStrategy(Strategy):
                 quantity=quantity,
                 side="buy",
                 order_type="market",
+                time_in_force="day",
             )
             self.submit_order(buy_order)
             self.log_message(
@@ -889,7 +897,9 @@ class AssetRotationStrategy(Strategy):
                 quantity = math.floor(spendable / price)
             if quantity <= 0:
                 return "insufficient"
-            self.submit_order(self.create_order(symbol, quantity=quantity, side="buy", order_type="market"))
+            self.submit_order(
+                self.create_order(symbol, quantity=quantity, side="buy", order_type="market", time_in_force="day")
+            )
             self.log_message(
                 f"Portfolio submitted buy of {quantity} {symbol} shares using up to ${budget:.2f}.",
                 color="green",
@@ -1204,7 +1214,9 @@ class AssetRotationStrategy(Strategy):
                 report["status"] = f"Portfolio exit pending: waiting for {source} sale"
                 return
             self.submit_order(
-                self.create_order(source, quantity=held[source], side="sell", order_type="market")
+                self.create_order(
+                    source, quantity=held[source], side="sell", order_type="market", time_in_force="day"
+                )
             )
             report["status"] = (
                 f"Portfolio exit submitted: {source} reached its "
@@ -1266,7 +1278,11 @@ class AssetRotationStrategy(Strategy):
                 report["status"] = "No Opportunistic Opportunity: Asset A price was unavailable"
                 return
             budget = float(source_price) * float(held[asset_a])
-            self.submit_order(self.create_order(asset_a, quantity=held[asset_a], side="sell", order_type="market"))
+            self.submit_order(
+                self.create_order(
+                    asset_a, quantity=held[asset_a], side="sell", order_type="market", time_in_force="day"
+                )
+            )
             self._set_portfolio_rotation({"from": asset_a, "to": asset_b, "budget": budget})
             report["status"] = (
                 f"Opportunistic Opportunity submitted: {asset_a} to {asset_b} "
@@ -1317,7 +1333,9 @@ class AssetRotationStrategy(Strategy):
             report["status"] = f"No portfolio rotation: {source} is unavailable or has a working order"
             return
         budget = float(source_price) * float(held[source])
-        self.submit_order(self.create_order(source, quantity=held[source], side="sell", order_type="market"))
+        self.submit_order(
+            self.create_order(source, quantity=held[source], side="sell", order_type="market", time_in_force="day")
+        )
         self._set_portfolio_rotation({"from": source, "to": str(target["symbol"]), "budget": budget})
         report["status"] = f"Portfolio rotation submitted: {source} to {target['symbol']} (expected advantage {advantage:+.2f}%)"
 
@@ -1591,6 +1609,7 @@ class AssetRotationStrategy(Strategy):
                 quantity=quantity_a,
                 side="sell",
                 order_type="market",
+                time_in_force="day",
             )
             self.submit_order(sell_order)
             self._set_pending_rotation(True)
