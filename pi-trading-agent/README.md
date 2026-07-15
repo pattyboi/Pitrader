@@ -1299,8 +1299,15 @@ after an unexpected interruption.
 - Keep Raspberry Pi OS and Python security updates current.
 - Restrict SSH access, use SSH keys, and disable password login when practical.
 - Do not expose the Pi directly to the public internet.
-- Do not run the Python process itself as root. The installer configures the
-  service to use the non-root user who invoked `sudo`.
+- Prefer running the Python process as a non-root user. `setup_service.sh`
+  configures the service to run as `${SUDO_USER:-$(id -un)}` — the account
+  that invoked `sudo`. On a DietPi installation where `root` is the only
+  account (DietPi's own default), that resolves to `root`, and the service
+  runs as root; create a dedicated non-root system user first if you want the
+  process unprivileged. Either way, the unit already limits what a compromised
+  process can do: `NoNewPrivileges=true`, `PrivateTmp=true`,
+  `ProtectSystem=full`, `ProtectHome=read-only`, and `ReadWritePaths` scoped to
+  the project directory alone.
 
 Check the credential file permissions with:
 
