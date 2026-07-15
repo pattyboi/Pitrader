@@ -476,6 +476,9 @@ class AssetRotationStrategy(Strategy):
                     f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
                     f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
                     f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
+                    f"Effective max positions today: "
+                    f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
+                    f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
                     f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
                     f"WSB discovery symbols: {report.get('wsb_discovered_symbols', 'none')}",
                     f"Discovery status: {report.get('discovery_status', 'ok')}",
@@ -645,6 +648,11 @@ class AssetRotationStrategy(Strategy):
                 ("Risk posture", report.get("portfolio_risk_posture", "unavailable")),
                 ("Holdings", report.get("portfolio_holdings", "unavailable")),
                 ("Signal candidates", report.get("portfolio_candidates", "unavailable")),
+                (
+                    "Effective max positions today",
+                    f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
+                    f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
+                ),
                 ("Discovered symbols", report.get("discovered_symbols", "none")),
                 ("WSB discovery symbols", report.get("wsb_discovered_symbols", "none")),
                 ("Discovery status", report.get("discovery_status", "ok")),
@@ -1587,6 +1595,48 @@ This automated message is not financial advice.
         adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
         return expected_profit + adjustment
 
+    @staticmethod
+    def _optimal_position_count(
+        total_capital: float,
+        min_order_dollars: float,
+        candidate_edges: list[tuple[float, float]],
+        configured_max_positions: int,
+    ) -> int:
+        """How many of today's ranked candidates are worth splitting capital across.
+
+        `candidate_edges` is `(expected_profit_percent, return_stdev_percent)`
+        per eligible candidate, already ranked best-edge-first. Scores each
+        feasible position count n by the Sharpe-like ratio of an equal-weighted,
+        n-position basket -- mean edge divided by portfolio risk, where risk
+        assumes zero correlation between candidates (equal-weighted variance of
+        n independent bets falls off as 1/n). That independence assumption is
+        an optimistic upper bound: symbols sharing a market factor (broad index
+        ETFs moving together in a dip, for instance) diversify less than this
+        in practice, so the result is a ceiling suggestion, not a promise.
+        n never exceeds configured_max_positions -- this narrows that
+        configured ceiling to what today's capital and candidate quality
+        actually support; it never widens it.
+        """
+        if configured_max_positions < 1:
+            return 1
+        if not candidate_edges or total_capital <= 0 or min_order_dollars <= 0:
+            return 1
+        feasible_cap = max(1, int(total_capital // min_order_dollars))
+        ceiling = max(1, min(configured_max_positions, feasible_cap, len(candidate_edges)))
+
+        best_n = 1
+        best_score = float("-inf")
+        for n in range(1, ceiling + 1):
+            top = candidate_edges[:n]
+            mean_edge = sum(edge for edge, _ in top) / n
+            mean_variance = sum(stdev * stdev for _, stdev in top) / n
+            portfolio_stdev = math.sqrt(mean_variance / n)
+            score = mean_edge / portfolio_stdev if portfolio_stdev > 0 else mean_edge * 1e6
+            if score > best_score:
+                best_score = score
+                best_n = n
+        return best_n
+
     def _autonomous_universe(self) -> AutonomousUniverse:
         return AutonomousUniverse(
             Path(str(self.parameters["portfolio_universe_state_file"])),
@@ -2041,16 +2091,33 @@ This automated message is not financial advice.
             remaining_candidates = [
                 signal for signal in eligible if str(signal["symbol"]) not in claimed_symbols
             ]
-            desired = remaining_candidates[:max_positions]
+            # Narrow the configured ceiling to what today's total capital
+            # (existing holdings plus spendable cash) and candidate quality
+            # actually support -- see _optimal_position_count. Falls back to
+            # cash alone if a fresh broker equity read fails, which can only
+            # push the result more conservative, never past the configured cap.
+            total_capital = self.get_portfolio_value()
+            if total_capital is None or float(total_capital) <= 0:
+                total_capital = float(self.get_cash())
+            min_order_dollars = float(self.parameters.get("portfolio_min_order_dollars", 1.0))
+            candidate_edges = [
+                (float(signal["expected_profit"]), float(signal.get("return_stdev") or 0.0))
+                for signal in remaining_candidates
+            ]
+            effective_max_positions = self._optimal_position_count(
+                float(total_capital), min_order_dollars, candidate_edges, max_positions
+            )
+            report["portfolio_effective_max_positions"] = effective_max_positions
+            desired = remaining_candidates[:effective_max_positions]
 
             builds_submitted = 0
             for candidate in desired:
                 symbol = str(candidate["symbol"])
                 if symbol in held_working or symbol in claimed_symbols:
                     continue
-                if len(held_working) + builds_submitted >= max_positions:
+                if len(held_working) + builds_submitted >= effective_max_positions:
                     break
-                slots_remaining = max(1, max_positions - (len(held_working) + builds_submitted))
+                slots_remaining = max(1, effective_max_positions - (len(held_working) + builds_submitted))
                 budget = float(self.get_cash()) / slots_remaining
                 outcome = self._buy_portfolio_symbol(symbol, float(candidate["price"]), budget)
                 if outcome == "insufficient":
@@ -2065,7 +2132,7 @@ This automated message is not financial advice.
                 actions.append(f"Portfolio build: {symbol} purchase {outcome}")
 
             replacements_submitted = 0
-            if len(held_working) + builds_submitted >= max_positions:
+            if len(held_working) + builds_submitted >= effective_max_positions:
                 # A holding with no current dip signal is scored neutral (0%
                 # expected edge), not punished: rotation happens only when the
                 # target's posture-adjusted edge beats holding by the

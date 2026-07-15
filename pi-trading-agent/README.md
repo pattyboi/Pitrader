@@ -71,6 +71,17 @@ historical estimate and the out-of-sample result meet their configured minimums
 with enough observations. Cash is split evenly among the open slots a given
 iteration fills.
 
+`PORTFOLIO_MAX_POSITIONS` is a ceiling, not a target: each iteration also
+computes how many of today's qualifying candidates are actually worth
+spreading capital across, given total account capital, `PORTFOLIO_MIN_ORDER_DOLLARS`,
+and each candidate's net edge and historical return variance — an equal-weighted,
+Sharpe-like score that assumes zero correlation between candidates (an
+optimistic upper bound, since symbols sharing a market factor diversify less
+than this in practice). That computed count can only narrow the configured
+ceiling, never widen it, so a `PORTFOLIO_MAX_POSITIONS` of `1` always
+means one position regardless of this math — it only has room to act once
+the ceiling is raised.
+
 Every holding is checked against its own unrealized return each iteration,
 starting the day it's bought (using the broker's own cost basis, not a fixed
 schedule) and priced against the live bid — what a market sell would actually
@@ -388,7 +399,7 @@ chmod 600 config.json
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
 | `PORTFOLIO_ENABLED` | Enables the default watchlist-based portfolio mode | `true` |
 | `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
-| `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings, and the ceiling on how many trades one iteration can act on; use `1` for a ~$50 account. Validated against the length of `PORTFOLIO_SYMBOLS` unless `PORTFOLIO_AUTONOMOUS_DISCOVERY` is `true`, in which case discovery can supply the rest of the candidate pool | `1` |
+| `PORTFOLIO_MAX_POSITIONS` | Ceiling on simultaneous portfolio holdings and on how many trades one iteration can act on; use `1` for a ~$50 account. The actual number used each iteration is this value or the capital/edge-optimal count, whichever is smaller — see "How the strategy trades" above. Validated against the length of `PORTFOLIO_SYMBOLS` unless `PORTFOLIO_AUTONOMOUS_DISCOVERY` is `true`, in which case discovery can supply the rest of the candidate pool | `1` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
 | `PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` | Comparable historical dips needed for a symbol to qualify | `20` |
 | `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum cost-adjusted historical average next-session return; also the minimum replacement advantage | `1.0` |

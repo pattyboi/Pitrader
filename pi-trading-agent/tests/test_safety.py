@@ -282,6 +282,44 @@ def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
     assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
 
 
+def test_optimal_position_count_never_exceeds_the_configured_ceiling() -> None:
+    identical_candidates = [(2.0, 1.0)] * 5
+
+    assert AssetRotationStrategy._optimal_position_count(1000.0, 5.0, identical_candidates, 1) == 1
+
+
+def test_optimal_position_count_is_capped_by_the_minimum_order_floor() -> None:
+    # $12 of capital and a $5 minimum order can fund at most 2 positions,
+    # regardless of how generous the configured ceiling or candidate pool is.
+    identical_candidates = [(2.0, 1.0)] * 5
+
+    assert AssetRotationStrategy._optimal_position_count(12.0, 5.0, identical_candidates, 5) <= 2
+
+
+def test_optimal_position_count_diversifies_across_equally_good_candidates() -> None:
+    # Three independent candidates with identical edge/risk: the Sharpe-like
+    # score strictly improves with n under the zero-correlation assumption,
+    # so spreading across all three should beat concentrating in one.
+    identical_candidates = [(2.0, 1.0), (2.0, 1.0), (2.0, 1.0)]
+
+    assert AssetRotationStrategy._optimal_position_count(300.0, 5.0, identical_candidates, 3) == 3
+
+
+def test_optimal_position_count_excludes_a_much_weaker_third_candidate() -> None:
+    # The first two candidates are strong and identical; the third has a
+    # far worse edge-to-risk ratio and should drag the basket score down
+    # enough that including it is not worth it.
+    candidates = [(3.0, 1.0), (3.0, 1.0), (0.1, 5.0)]
+
+    assert AssetRotationStrategy._optimal_position_count(300.0, 5.0, candidates, 3) == 2
+
+
+def test_optimal_position_count_fails_open_to_one_on_bad_inputs() -> None:
+    assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [], 3) == 1
+    assert AssetRotationStrategy._optimal_position_count(0.0, 5.0, [(2.0, 1.0)], 3) == 1
+    assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [(2.0, 1.0)], 0) == 1
+
+
 def test_score_articles_attributes_score_to_only_the_tagged_symbol() -> None:
     articles = [
         {"headline": "Company reports layoffs", "summary": "", "symbols": ["TSLA"]},
