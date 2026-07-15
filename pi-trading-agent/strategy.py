@@ -1,5 +1,6 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
+import html
 import json
 import math
 import os
@@ -346,6 +347,10 @@ class AssetRotationStrategy(Strategy):
                 "This automated message is not financial advice.",
             ]
             message.set_content("\n".join(lines))
+            message.add_alternative(
+                self._render_email_html(report, report_date, portfolio_mode),
+                subtype="html",
+            )
 
             host = str(self.parameters["email_smtp_host"])
             port = int(self.parameters["email_smtp_port"])
@@ -370,6 +375,194 @@ class AssetRotationStrategy(Strategy):
                 f"Daily email report failed safely: {type(exc).__name__}: {exc}",
                 color="red",
             )
+
+    @staticmethod
+    def _email_status_theme(status: str) -> tuple[str, str]:
+        """Map a free-text status line to a (background, text) banner color."""
+        lowered = status.lower()
+        if "block" in lowered or "error" in lowered or "failed" in lowered:
+            return "#fdecea", "#b3261e"
+        if "pending" in lowered or "waiting" in lowered:
+            return "#fff4e5", "#8a5300"
+        if any(term in lowered for term in ("submitted", "complete", "filled", "finished", "top-up", "build")):
+            return "#e6f4ea", "#1e7e34"
+        return "#eceff1", "#455a64"
+
+    @staticmethod
+    def _email_value(value: Any, *, money: bool = False) -> str:
+        if value is None:
+            return "unavailable"
+        if money and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f"${float(value):,.2f}"
+        return str(value)
+
+    @classmethod
+    def _email_kv_section(cls, title: str, rows: list[tuple[str, Any]]) -> str:
+        """Render a titled two-column table of label/value rows."""
+        body_rows = []
+        for index, (label, value) in enumerate(rows):
+            shade = "#ffffff" if index % 2 == 0 else "#f8f9fb"
+            body_rows.append(
+                '<tr style="background-color:{shade};">'
+                '<td style="padding:8px 12px;font-size:13px;color:#5f6368;width:44%;'
+                'border-bottom:1px solid #eceff1;vertical-align:top;">{label}</td>'
+                '<td style="padding:8px 12px;font-size:13px;color:#1a1a2e;font-weight:500;'
+                'border-bottom:1px solid #eceff1;vertical-align:top;">{value}</td>'
+                "</tr>".format(
+                    shade=shade,
+                    label=html.escape(label),
+                    value=html.escape(cls._email_value(value)),
+                )
+            )
+        return (
+            '<div style="font-size:12px;font-weight:700;color:#8a8f98;'
+            'text-transform:uppercase;letter-spacing:0.05em;margin:20px 0 6px;">'
+            f"{html.escape(title)}</div>"
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            'style="border-collapse:collapse;">' + "".join(body_rows) + "</table>"
+        )
+
+    @classmethod
+    def _email_bullet_section(cls, title: str, items: list[str]) -> str:
+        """Render a titled bullet list, or a muted placeholder when empty."""
+        heading = (
+            '<div style="font-size:12px;font-weight:700;color:#8a8f98;'
+            'text-transform:uppercase;letter-spacing:0.05em;margin:20px 0 6px;">'
+            f"{html.escape(title)}</div>"
+        )
+        if not items:
+            return heading + (
+                '<div style="font-size:13px;color:#8a8f98;font-style:italic;">'
+                "None reported</div>"
+            )
+        list_items = "".join(
+            f'<li style="margin-bottom:4px;">{html.escape(str(item))}</li>' for item in items
+        )
+        return heading + (
+            '<ul style="margin:0;padding-left:18px;color:#333333;font-size:13px;line-height:1.6;">'
+            + list_items
+            + "</ul>"
+        )
+
+    def _render_email_html(
+        self, report: dict[str, Any], report_date: str, portfolio_mode: bool
+    ) -> str:
+        """Build a styled HTML alternative body mirroring the plain-text report."""
+        status = str(report["status"])
+        badge_bg, badge_fg = self._email_status_theme(status)
+        mode_label = "Portfolio mode" if portfolio_mode else "Asset rotation mode"
+
+        if portfolio_mode:
+            snapshot_rows = [
+                ("Risk posture", report.get("portfolio_risk_posture", "unavailable")),
+                ("Holdings", report.get("portfolio_holdings", "unavailable")),
+                ("Signal candidates", report.get("portfolio_candidates", "unavailable")),
+                ("Discovered symbols", report.get("discovered_symbols", "none")),
+                ("WSB discovery symbols", report.get("wsb_discovered_symbols", "none")),
+                ("Discovery status", report.get("discovery_status", "ok")),
+                ("Dip threshold", f"{report['threshold']:.2f}%"),
+            ]
+        else:
+            snapshot_rows = [
+                ("Asset A", report.get("asset_a", "unavailable")),
+                ("Asset B", report.get("asset_b", "unavailable")),
+                ("Asset A price", self._email_value(report.get("price_a"), money=True)),
+                ("Asset B price", self._email_value(report.get("price_b"), money=True)),
+                ("Asset A quantity", report.get("quantity_a", "unavailable")),
+                ("Asset B quantity", report.get("quantity_b", "unavailable")),
+                ("Recent high", report.get("recent_high", "unavailable")),
+                ("Calculated dip", report.get("dip_percent", "unavailable")),
+                ("Dip threshold", f"{report['threshold']:.2f}%"),
+            ]
+
+        signal_rows = [
+            ("News risk level", report.get("news_risk_level", "unavailable")),
+            ("News score", report.get("news_score", "unavailable")),
+            ("News articles checked", report.get("news_article_count", "unavailable")),
+            ("News explanation", report.get("news_explanation", "unavailable")),
+            ("LLM risk level", report.get("llm_risk_level", "unavailable")),
+            ("LLM score", report.get("llm_score", "unavailable")),
+            ("LLM reasoning", report.get("llm_reasoning", "unavailable")),
+        ]
+
+        forecast_rows = [
+            ("Learning observations", report.get("learning_observations", "unavailable")),
+            ("Learned return forecast", report.get("learned_forecast", "not ready")),
+            ("Learning explanation", report.get("learning_explanation", "unavailable")),
+            ("Congressional-trading context", report.get("congress_explanation", "unavailable")),
+            ("WallStreetBets context", report.get("wsb_explanation", "unavailable")),
+            (
+                "Opportunistic Opportunity",
+                report.get("opportunistic_opportunity_status", "unavailable"),
+            ),
+            (
+                "Opportunistic Opportunity probability",
+                report.get("opportunistic_opportunity_probability", "unavailable"),
+            ),
+            (
+                "Opportunistic Opportunity evidence",
+                report.get("opportunistic_opportunity_explanation", "unavailable"),
+            ),
+        ]
+        if not portfolio_mode:
+            forecast_rows[3:3] = [
+                (
+                    "Decision-memory observations",
+                    report.get("decision_memory_observations", "unavailable"),
+                ),
+                ("Predicted rotation edge", report.get("rotation_edge_forecast", "not ready")),
+                (
+                    "Decision-memory explanation",
+                    report.get("decision_memory_explanation", "unavailable"),
+                ),
+            ]
+
+        sections = "".join(
+            [
+                self._email_kv_section("Snapshot", snapshot_rows),
+                self._email_kv_section("News & Risk Signals", signal_rows),
+                self._email_kv_section("Learning & Forecasts", forecast_rows),
+                self._email_bullet_section(
+                    "Notable scored headlines", report.get("news_headlines", [])
+                ),
+                self._email_bullet_section(
+                    "Congressional-trading highlights", report.get("congress_highlights", [])
+                ),
+                self._email_bullet_section(
+                    "WallStreetBets highlights", report.get("wsb_highlights", [])
+                ),
+            ]
+        )
+
+        return f"""\
+<!doctype html>
+<html>
+<body style="margin:0;padding:0;background-color:#f2f4f6;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f2f4f6;">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+<tr><td style="background-color:#1a1a2e;padding:20px 24px;">
+<div style="color:#ffffff;font-size:18px;font-weight:600;">Raspberry Pi Trading Agent</div>
+<div style="color:#b8bcc8;font-size:13px;margin-top:4px;">Daily Summary &middot; {html.escape(report_date)} &middot; {html.escape(mode_label)}</div>
+</td></tr>
+<tr><td style="padding:20px 24px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{badge_bg};border-radius:6px;">
+<tr><td style="padding:14px 16px;color:{badge_fg};font-size:14px;font-weight:600;">{html.escape(status)}</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:0 24px 8px;">
+{sections}
+</td></tr>
+<tr><td style="padding:16px 24px 20px;color:#8a8f98;font-size:12px;line-height:1.5;border-top:1px solid #eceff1;">
+Review all orders and positions in the Alpaca dashboard.<br>
+This automated message is not financial advice.
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
+"""
 
     def _get_news_context(self) -> NewsContext:
         """Return recent headline context, failing open on data problems."""
