@@ -64,6 +64,50 @@ class MarketOpenLoggingAlpaca(Alpaca):
             stop_event.wait(slice_seconds)
             remaining -= slice_seconds
 
+    def _await_market_to_close(self, timedelta=None, strategy=None):
+        """Wait for market close the same interruptible way as market-open.
+
+        Lumibot's own _await_market_to_close() (alpaca.py) ends in a single
+        uninterruptible time.sleep(), which can block this thread for hours.
+        Fixing the process_pending_orders AttributeError above (see that
+        method's docstring) means this method is now actually reached and
+        slept in, re-exposing the same clean-stop problem
+        _await_market_to_open already had to solve: without this override,
+        systemd's TimeoutStopUSec expires and the process gets SIGKILLed
+        instead of exiting via the executor's stop_event.
+        """
+        self.process_pending_orders(strategy=strategy)
+
+        time_to_close = self.get_time_to_close()
+        if timedelta is not None:
+            time_to_close -= 60 * timedelta
+        if time_to_close <= 0:
+            return
+
+        self.logger.info(f"Sleeping {time_to_close:.0f} seconds until market close")
+        stop_event = getattr(getattr(strategy, "_executor", None), "stop_event", None)
+        remaining = max(0, time_to_close)
+        if stop_event is None:
+            self.sleep(remaining)
+            return
+        while remaining > 0 and not stop_event.is_set():
+            slice_seconds = min(1.0, remaining)
+            stop_event.wait(slice_seconds)
+            remaining -= slice_seconds
+
+    def process_pending_orders(self, strategy=None) -> None:
+        """No-op: this is a backtesting-only concern Lumibot calls unconditionally.
+
+        Lumibot's live Alpaca._await_market_to_close() calls
+        self.process_pending_orders(strategy=strategy) every day near market
+        close, but that method only exists on BacktestingBroker (it simulates
+        fills bar-by-bar there). Live fills already arrive through the
+        trade-event stream wired to on_filled_order, so there is nothing to
+        do here; without this stub every trading day logs an AttributeError
+        crash traceback (caught and harmless, but noisy). Upstream bug:
+        https://github.com/Lumiwealth/lumibot/issues/1113
+        """
+
 
 def load_config(path: Path) -> dict[str, Any]:
     """Load and validate configuration before connecting to the broker."""
