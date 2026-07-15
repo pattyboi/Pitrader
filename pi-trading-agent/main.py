@@ -194,8 +194,19 @@ def load_config(path: Path) -> dict[str, Any]:
         raise TypeError("WSB_DISCOVERY_ENABLED must be true or false")
     wsb_max_symbols = int(config["WSB_DISCOVERY_MAX_SYMBOLS"])
     wsb_timeout = float(config["WSB_CONTEXT_TIMEOUT_SECONDS"])
-    if not 1 <= portfolio_max_positions <= len(portfolio_symbols):
-        raise ValueError("PORTFOLIO_MAX_POSITIONS must be between 1 and the number of portfolio symbols")
+    # Autonomous discovery expands the daily candidate universe beyond the
+    # static seed list, so the cap on concurrent positions shouldn't be tied
+    # to len(portfolio_symbols) when discovery can supply the rest. Without
+    # discovery, the static list is the only source of candidates, so the
+    # original bound still applies.
+    portfolio_max_positions_ceiling = (
+        30 if config["PORTFOLIO_AUTONOMOUS_DISCOVERY"] else len(portfolio_symbols)
+    )
+    if not 1 <= portfolio_max_positions <= portfolio_max_positions_ceiling:
+        raise ValueError(
+            "PORTFOLIO_MAX_POSITIONS must be between 1 and "
+            f"{portfolio_max_positions_ceiling}"
+        )
     if not 30 <= portfolio_analysis_days <= 2000:
         raise ValueError("PORTFOLIO_ANALYSIS_DAYS must be between 30 and 2000")
     if not 5 <= portfolio_min_observations <= 500:

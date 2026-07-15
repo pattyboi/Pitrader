@@ -67,13 +67,22 @@ historical estimate and the out-of-sample result meet their configured minimums
 with enough observations. Because that validation measures a next-session
 return, the default holding horizon is one trading-day interval; positions are
 sold after `PORTFOLIO_MAX_HOLDING_DAYS` unless a staged replacement sells them
-first. Cash is split among open slots.
+first. Cash is split evenly among the open slots a given iteration fills.
 
-Once full, it replaces one holding only when a new candidate's historical
-expected return exceeds the weakest holding's by at least that same configured
-percentage. A holding that is not currently dipping is scored as a neutral
-`0%` expected edge (it is never force-rotated just because something else
-dipped).
+Each daily iteration evaluates every candidate symbol and may submit several
+trades in that same cycle — for example, multiple new positions, an overdue
+exit, and a replacement can all execute the same day — bounded by
+`PORTFOLIO_MAX_POSITIONS` and available cash, instead of trickling in one
+trade per day. A symbol already touched by one trade in an iteration (as a
+buy, a sell, or either leg of a staged replacement) is never reused by a
+different trade in that same pass.
+
+Once full, it may replace more than one holding in the same iteration — each
+replacement is independently cleared against the same threshold: a new
+candidate's historical expected return must exceed the weakest *unclaimed*
+holding's by at least the configured percentage. A holding that is not
+currently dipping is scored as a neutral `0%` expected edge (it is never
+force-rotated just because something else dipped).
 
 `PORTFOLIO_RISK_POSTURE` (`conservative` by default, or `risky`) reshapes how
 that ranking reads the same observations the agent already collects, without
@@ -92,7 +101,10 @@ Replacements are staged like the A/B rotation described below: the old
 position sells first, the replacement is bought as soon as the sale fills
 (only its sale budget is spent), and the staged state clears only when the
 replacement purchase itself fills, so restarts, rejections, and network drops
-cannot strand the cash. The strategy manages only symbols explicitly listed in
+cannot strand the cash. Several replacements can be staged concurrently in the
+same iteration, each tracked and restart-safe independently — a crash or
+restart mid-rotation reconciles every staged replacement on its own, not just
+one. The strategy manages only symbols explicitly listed in
 `PORTFOLIO_SYMBOLS` plus discovery symbols it previously persisted after they
 qualified; it never adopts or sells unrelated stocks in the same Alpaca
 account. Managed holdings always stay in the daily evaluation universe, so a
@@ -113,7 +125,12 @@ into B only after decision memory is mature, the predicted B-minus-A edge
 meets the normal profit threshold, and the probability meets
 `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by default). It is reported
 separately from ordinary portfolio candidates, so it does not turn the two
-systems into interchangeable ranking signals.
+systems into interchangeable ranking signals. It is evaluated exactly once
+per day, as a single decision made before the ordinary per-symbol pass
+described above, and it never competes for one of that pass's
+`PORTFOLIO_MAX_POSITIONS` slots. When it fires, Asset A and Asset B are
+excluded from ordinary building or replacement for the rest of that same
+iteration, so the same pair can't also be picked up by the per-symbol logic.
 
 For a small account funded in roughly $50 increments, start with one position
 and fractional shares. The default portfolio settings reserve $2 for price
@@ -357,21 +374,21 @@ chmod 600 config.json
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
 | `PORTFOLIO_ENABLED` | Enables the default watchlist-based portfolio mode | `true` |
 | `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
-| `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings; use `1` for a ~$50 account | `1` |
+| `PORTFOLIO_MAX_POSITIONS` | Maximum simultaneous portfolio holdings, and the ceiling on how many trades one iteration can act on; use `1` for a ~$50 account. Validated against the length of `PORTFOLIO_SYMBOLS` unless `PORTFOLIO_AUTONOMOUS_DISCOVERY` is `true`, in which case discovery can supply the rest of the candidate pool | `1` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
 | `PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` | Comparable historical dips needed for a symbol to qualify | `20` |
 | `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum cost-adjusted historical average next-session return; also the minimum replacement advantage | `1.0` |
 | `PORTFOLIO_OOS_MIN_OBSERVATIONS` | Minimum walk-forward, prior-only validation trades | `10` |
 | `PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT` | Minimum net average return in walk-forward validation | `0.0` |
 | `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return | `0.20` |
-| `PORTFOLIO_MAX_HOLDING_DAYS` | Maximum holding horizon, aligned to the next-session validation target | `1` |
+| `PORTFOLIO_MAX_HOLDING_DAYS` | Maximum holding horizon, aligned to the next-session validation target. Every holding that reaches this horizon exits the same day it becomes due, not just one per day | `1` |
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
 | `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
 | `PORTFOLIO_FRACTIONAL_SHARES` | Allows decimal-share market orders, needed for small balances | `true` |
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
-| `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity | `0.55` |
+| `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
 | `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news, ignores WSB hype); `risky` favors raw historical edge and leans into WSB-bullish mentions. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
 | `WSB_CONTEXT_ENABLED` | Reports public AltIndex WallStreetBets mentions for monitored symbols | `false` |
 | `WSB_DISCOVERY_ENABLED` | Adds top public WSB symbols to the portfolio research universe | `false` |

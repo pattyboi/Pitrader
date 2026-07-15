@@ -110,8 +110,13 @@ class AssetRotationStrategy(Strategy):
             )
         if self.vars.portfolio_pending_rotation:
             pending = self.vars.portfolio_pending_rotation
+            summary = ", ".join(
+                f"{source} to {entry['to']} ({entry['kind']})"
+                for source, entry in sorted(pending.items())
+            )
             self.log_message(
-                f"Restored portfolio rotation {pending['from']} to {pending['to']}; it will be reconciled next cycle.",
+                f"Restored {len(pending)} in-progress portfolio rotation(s): "
+                f"{summary}; reconciling next cycle.",
                 color="yellow",
             )
         self._refresh_wsb_snapshot_before_trading()
@@ -151,28 +156,69 @@ class AssetRotationStrategy(Strategy):
         raw = self.parameters.get("portfolio_rotation_state_file")
         return Path(str(raw)) if raw else None
 
-    def _load_portfolio_rotation(self) -> dict[str, Any] | None:
-        """Restore a single staged portfolio replacement after a restart."""
+    def _load_portfolio_rotation(self) -> dict[str, dict[str, Any]]:
+        """Restore every staged portfolio rotation after a restart.
+
+        Keyed by source ("from") symbol so a sell-fill callback can look its
+        entry up in O(1). Transparently migrates the old single-record shape
+        ({"from", "to", "budget"}) written by earlier versions into the new
+        keyed shape, defaulting its kind to "replacement" since that format
+        couldn't distinguish an Opportunistic Opportunity swap.
+        """
         path = self._portfolio_rotation_state_path()
         if path is None or not path.exists():
-            return None
+            return {}
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
-            if all(isinstance(state.get(key), str) and state[key] for key in ("from", "to")):
-                budget = float(state.get("budget", 0))
-                if math.isfinite(budget) and budget > 0:
-                    return {"from": state["from"].upper(), "to": state["to"].upper(), "budget": budget}
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        return None
+            return {}
+        if isinstance(state, dict) and all(
+            isinstance(state.get(key), str) and state[key] for key in ("from", "to")
+        ):
+            entry = self._parse_rotation_entry(state)
+            return {state["from"].upper(): entry} if entry else {}
+        if not isinstance(state, dict):
+            return {}
+        restored: dict[str, dict[str, Any]] = {}
+        for source, raw_entry in state.items():
+            if not isinstance(source, str) or not source.strip() or not isinstance(raw_entry, dict):
+                continue
+            entry = self._parse_rotation_entry(raw_entry)
+            if entry:
+                restored[source.upper()] = entry
+        return restored
 
-    def _set_portfolio_rotation(self, state: dict[str, Any] | None) -> None:
+    @staticmethod
+    def _parse_rotation_entry(raw_entry: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate a single {to, budget, kind} rotation record, or None."""
+        target = raw_entry.get("to")
+        if not isinstance(target, str) or not target.strip():
+            return None
+        try:
+            budget = float(raw_entry.get("budget", 0))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(budget) or budget <= 0:
+            return None
+        kind = raw_entry.get("kind")
+        if kind not in ("replacement", "opportunistic"):
+            kind = "replacement"
+        return {"to": target.upper(), "budget": budget, "kind": kind}
+
+    def _set_portfolio_rotation(self, state: dict[str, dict[str, Any]]) -> None:
+        """Persist the whole rotation collection atomically (whole-file swap).
+
+        Callers always pass a freshly rebuilt dict rather than mutating the
+        live one in place, matching the same discipline already used for
+        portfolio_holding_dates, so a concurrent read from the broker
+        callback thread never observes a partially updated collection.
+        """
         self.vars.portfolio_pending_rotation = state
         path = self._portfolio_rotation_state_path()
         if path is None:
             return
         try:
-            if state is None:
+            if not state:
                 path.unlink(missing_ok=True)
                 return
             temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -180,6 +226,36 @@ class AssetRotationStrategy(Strategy):
             temporary_path.replace(path)
         except OSError as exc:
             self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
+
+    def _add_portfolio_rotation(self, source: str, target: str, budget: float, kind: str) -> bool:
+        """Stage a new rotation, refusing if either symbol is already in flight.
+
+        Fills are matched by symbol, not order id, so a symbol referenced as
+        both a "from" in one entry and a "to" in another would be ambiguous.
+        Returns False (and logs, without changing state) rather than risk
+        creating that ambiguity.
+        """
+        pending = self.vars.portfolio_pending_rotation
+        claimed = set(pending.keys()) | {entry["to"] for entry in pending.values()}
+        if source in claimed or target in claimed:
+            self.log_message(
+                f"Refused to stage {source} to {target}: one of these symbols "
+                "already has an in-flight portfolio rotation.",
+                color="red",
+            )
+            return False
+        updated = dict(pending)
+        updated[source] = {"to": target, "budget": budget, "kind": kind}
+        self._set_portfolio_rotation(updated)
+        return True
+
+    def _remove_portfolio_rotation(self, source: str) -> None:
+        pending = self.vars.portfolio_pending_rotation
+        if source not in pending:
+            return
+        updated = dict(pending)
+        del updated[source]
+        self._set_portfolio_rotation(updated)
 
     def _portfolio_holding_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_holding_state_file")
@@ -333,6 +409,11 @@ class AssetRotationStrategy(Strategy):
                     f"Decision-memory observations: {report.get('decision_memory_observations', 'unavailable')}",
                     f"Predicted rotation edge: {report.get('rotation_edge_forecast', 'not ready')}",
                     f"Decision-memory explanation: {report.get('decision_memory_explanation', 'unavailable')}",
+                ]
+            if portfolio_mode:
+                lines += [
+                    "Portfolio actions this iteration:",
+                    *[f"- {action}" for action in report.get("portfolio_actions", [])],
                 ]
             lines += [
                 "Notable scored headlines:",
@@ -520,6 +601,11 @@ class AssetRotationStrategy(Strategy):
         sections = "".join(
             [
                 self._email_kv_section("Snapshot", snapshot_rows),
+                *(
+                    [self._email_bullet_section("Portfolio actions", report.get("portfolio_actions", []))]
+                    if portfolio_mode
+                    else []
+                ),
                 self._email_kv_section("News & Risk Signals", signal_rows),
                 self._email_kv_section("Learning & Forecasts", forecast_rows),
                 self._email_bullet_section(
@@ -963,9 +1049,8 @@ This automated message is not financial advice.
                     f"Could not read managed discovery symbols: {type(exc).__name__}: {exc}",
                     color="yellow",
                 )
-        pending = self.vars.portfolio_pending_rotation
-        if pending:
-            symbols.update((str(pending["from"]).upper(), str(pending["to"]).upper()))
+        for source, entry in self.vars.portfolio_pending_rotation.items():
+            symbols.update((str(source).upper(), str(entry["to"]).upper()))
         return symbols
 
     def _portfolio_held_positions(
@@ -1479,42 +1564,62 @@ This automated message is not financial advice.
             ),
         )
 
-        # Completing an in-flight rotation is never vetoed: the sale already
-        # happened and leaving the proceeds in cash is its own risk.
-        pending = self.vars.portfolio_pending_rotation
-        if pending:
-            source, target, budget = pending["from"], pending["to"], float(pending["budget"])
+        # Every phase below accumulates into `actions` and takes at most
+        # max_positions worth of trades in this one call, instead of the one
+        # trade per day the old waterfall-of-early-returns allowed. `held_working`
+        # is popped as sells are submitted so later phases in this same pass see
+        # an up-to-date view without waiting for a broker round-trip.
+        # `claimed_symbols` is the single source of truth preventing any symbol
+        # from being touched twice in one pass; it starts from every symbol
+        # already referenced by a surviving pending rotation.
+        actions: list[str] = []
+        held_working = dict(held)
+
+        # Phase 0: reconcile every existing pending rotation first. Completing
+        # an in-flight rotation is never vetoed: the sale already happened and
+        # leaving the proceeds in cash is its own risk. Iterate a snapshot so
+        # removals made mid-loop don't disturb iteration.
+        for source in sorted(self.vars.portfolio_pending_rotation):
+            entry = self.vars.portfolio_pending_rotation.get(source)
+            if entry is None:
+                continue
+            target, budget, kind = str(entry["to"]), float(entry["budget"]), str(entry["kind"])
             if held.get(source, Decimal("0")) > 0:
                 if self._has_active_order(source, "sell"):
-                    report["status"] = f"Portfolio pending: waiting for {source} sale"
-                    return
-                self._set_portfolio_rotation(None)
-                report["status"] = f"Portfolio rotation reset: {source} sale did not fill"
-                return
+                    actions.append(f"Portfolio pending: waiting for {source} sale")
+                    continue
+                self._remove_portfolio_rotation(source)
+                actions.append(f"Portfolio rotation reset: {source} sale did not fill")
+                continue
             if held.get(target, Decimal("0")) > 0 and not self._has_active_order(target, "buy"):
                 # The buy filled but the fill callback was lost (restart).
-                self._set_portfolio_rotation(None)
-                report["status"] = f"Portfolio rotation complete: the {target} purchase filled"
-                return
+                self._remove_portfolio_rotation(source)
+                actions.append(f"Portfolio rotation complete ({kind}): the {target} purchase filled")
+                continue
             price = self.get_last_price(target)
             if price is None or not math.isfinite(float(price)) or float(price) <= 0:
-                report["status"] = f"Portfolio pending: no valid {target} price"
-                return
+                actions.append(f"Portfolio pending: no valid {target} price")
+                continue
             outcome = self._buy_portfolio_symbol(target, float(price), budget)
             if outcome == "insufficient":
                 # Balances are confirmed by now; the rotation ends here.
-                self._set_portfolio_rotation(None)
-                report["status"] = (
-                    f"Portfolio rotation finished: cash is below the minimum {target} order"
-                )
+                self._remove_portfolio_rotation(source)
+                actions.append(f"Portfolio rotation finished: cash is below the minimum {target} order")
             elif outcome == "working":
-                report["status"] = f"Portfolio pending: waiting for the {target} purchase to fill"
+                actions.append(f"Portfolio pending: waiting for the {target} purchase to fill")
             else:
-                # The flag clears when the buy fills (on_filled_order), never
+                # The entry clears when the buy fills (on_filled_order), never
                 # on submission, so a rejected order is retried next cycle.
-                report["status"] = f"Portfolio {target} purchase submitted after {source} sale"
-            return
+                actions.append(f"Portfolio {target} purchase submitted after {source} sale")
+        claimed_symbols: set[str] = set(self.vars.portfolio_pending_rotation.keys()) | {
+            str(entry["to"]) for entry in self.vars.portfolio_pending_rotation.values()
+        }
 
+        # Phase 1: exit every holding that reached its holding horizon, not
+        # just the first one. This is a plain single-leg sell -- no paired
+        # buy, no rotation-slot usage -- and is never vetoed, exactly like
+        # completing a pending rotation above.
+        #
         # The portfolio signal is validated against next-session returns. Keep
         # actual holding duration aligned with that measured horizon, including
         # after restarts. A configured managed holding with no fill record is
@@ -1539,21 +1644,23 @@ This automated message is not financial advice.
             for symbol in held
             if self._holding_is_due(holding_dates[symbol], today, maximum_holding_days)
         )
-        if due_symbols:
-            source = due_symbols[0]
+        for source in due_symbols:
+            if source in claimed_symbols:
+                continue
             if self._has_active_order(source, "sell"):
-                report["status"] = f"Portfolio exit pending: waiting for {source} sale"
-                return
+                actions.append(f"Portfolio exit pending: waiting for {source} sale")
+                continue
             self.submit_order(
                 self.create_order(
                     source, quantity=held[source], side="sell", order_type="market", time_in_force="day"
                 )
             )
-            report["status"] = (
+            actions.append(
                 f"Portfolio exit submitted: {source} reached its "
                 f"{maximum_holding_days}-day holding horizon"
             )
-            return
+            held_working.pop(source, None)
+            claimed_symbols.add(source)
 
         signals = [self._portfolio_signal(symbol) for symbol in symbols]
         signals = [signal for signal in signals if signal is not None]
@@ -1589,8 +1696,10 @@ This automated message is not financial advice.
         opportunity_probability = opportunity.get("probability")
         opportunity_edge = opportunity.get("predicted_edge")
         opportunity_is_eligible = (
-            asset_a in held
-            and asset_b not in held
+            asset_a in held_working
+            and asset_b not in held_working
+            and asset_a not in claimed_symbols
+            and asset_b not in claimed_symbols
             and opportunity.get("status") == "ready"
             and float(opportunity.get("dip") or 0.0) >= float(self.parameters["dip_threshold_percent"])
             and opportunity_probability is not None
@@ -1609,93 +1718,166 @@ This automated message is not financial advice.
             f"OOS {float(s['oos_expected_profit']):+.2f}%/{s['oos_observations']}"
             for s in eligible
         ) or "none"
-        if not eligible and not opportunity_is_eligible:
-            report["status"] = "No portfolio trade: no portfolio signal or Opportunistic Opportunity met its thresholds"
-            return
-        if veto_reason:
-            report["status"] = veto_reason
+
+        signal_present = bool(eligible) or opportunity_is_eligible
+        if veto_reason and signal_present:
             self.log_message(
                 f"Portfolio signal present, but the trade was vetoed: {veto_reason}",
                 color="red",
             )
-            return
 
-        if opportunity_is_eligible:
+        # Phase 2: the Opportunistic Opportunity is evaluated exactly once, as
+        # a single non-looped decision, before Phase 3 gets to pick from
+        # `eligible`. Reserving both legs here (via claimed_symbols) is what
+        # structurally keeps it distinct from -- never folded into or
+        # competing for a slot within -- the up-to-max_positions batch below,
+        # even though PORTFOLIO_SYMBOLS defaults to include both assets. Since
+        # this function already runs at most once per trading day
+        # (sleeptime="1D"), that structural isolation is sufficient on its own
+        # to guarantee at most one Opportunistic Opportunity swap per day; no
+        # separate persisted rate limit is needed.
+        if opportunity_is_eligible and not veto_reason:
             if self._has_active_order(asset_a, "sell"):
-                report["status"] = "Opportunistic Opportunity pending: waiting for Asset A sale"
-                return
-            source_price = self.get_last_price(asset_a)
-            if source_price is None or float(source_price) <= 0:
-                report["status"] = "No Opportunistic Opportunity: Asset A price was unavailable"
-                return
-            budget = float(source_price) * float(held[asset_a])
-            self.submit_order(
-                self.create_order(
-                    asset_a, quantity=held[asset_a], side="sell", order_type="market", time_in_force="day"
-                )
-            )
-            self._set_portfolio_rotation({"from": asset_a, "to": asset_b, "budget": budget})
-            report["status"] = (
-                f"Opportunistic Opportunity submitted: {asset_a} to {asset_b} "
-                f"({float(opportunity_probability):.1%} historical win probability, "
-                f"{float(opportunity_edge):+.2f}% predicted edge)"
-            )
-            return
+                actions.append("Opportunistic Opportunity pending: waiting for Asset A sale")
+            else:
+                source_price = self.get_last_price(asset_a)
+                if source_price is None or float(source_price) <= 0:
+                    actions.append("No Opportunistic Opportunity: Asset A price was unavailable")
+                else:
+                    budget = float(source_price) * float(held_working[asset_a])
+                    self.submit_order(
+                        self.create_order(
+                            asset_a, quantity=held_working[asset_a], side="sell",
+                            order_type="market", time_in_force="day",
+                        )
+                    )
+                    if self._add_portfolio_rotation(asset_a, asset_b, budget, kind="opportunistic"):
+                        held_working.pop(asset_a, None)
+                        claimed_symbols.update({asset_a, asset_b})
+                        actions.append(
+                            f"Opportunistic Opportunity submitted: {asset_a} to {asset_b} "
+                            f"({float(opportunity_probability):.1%} historical win probability, "
+                            f"{float(opportunity_edge):+.2f}% predicted edge)"
+                        )
 
-        desired = eligible[:max_positions]
-        desired_symbols = {str(signal["symbol"]) for signal in desired}
-        target = next((signal for signal in desired if signal["symbol"] not in held), None)
-        if target is None:
-            # A recurring small deposit should grow the highest-ranked current
-            # holding instead of remaining idle once the portfolio is full.
-            cash = float(self.get_cash())
-            minimum_cash = float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0)) + float(
-                self.parameters.get("portfolio_min_order_dollars", 1.0)
-            )
-            if cash >= minimum_cash:
-                target = desired[0]
-                outcome = self._buy_portfolio_symbol(
-                    str(target["symbol"]), float(target["price"]), cash
-                )
-                report["status"] = f"Portfolio top-up: {target['symbol']} purchase {outcome}"
-                return
-            report["status"] = "No portfolio trade: current holdings match top signals and cash is below the minimum order"
-            return
-        if len(held) < max_positions:
-            slots_remaining = min(max_positions - len(held), len(desired_symbols.difference(held)))
-            outcome = self._buy_portfolio_symbol(str(target["symbol"]), float(target["price"]), float(self.get_cash()) / slots_remaining)
-            report["status"] = f"Portfolio build: {target['symbol']} purchase {outcome}"
-            return
+        # Phase 3: build empty slots, then replace weak holdings, then top up
+        # -- looping over every remaining ranked candidate this iteration
+        # instead of acting on just the single best one and waiting until
+        # tomorrow for the next.
+        if not veto_reason:
+            remaining_candidates = [
+                signal for signal in eligible if str(signal["symbol"]) not in claimed_symbols
+            ]
+            desired = remaining_candidates[:max_positions]
 
-        held_signals = {str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held}
-        # A holding with no current dip signal is scored neutral (0% expected
-        # edge), not punished: rotation happens only when the target's
-        # posture-adjusted edge beats holding by the configured margin. The
-        # old -100% default force-rotated any recovered holding every time
-        # some other symbol dipped, churning the portfolio. The posture lens
-        # only changes which holding looks weakest and by how much; the
-        # PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT floor below is unchanged.
-        source = min(
-            held,
-            key=lambda symbol: float(
-                held_signals.get(symbol, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
-            ),
-        )
-        source_score = float(held_signals.get(source, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"])
-        advantage = float(target["posture_adjusted_edge"]) - source_score
-        if advantage < minimum_profit:
-            report["status"] = f"No portfolio rotation: {target['symbol']} advantage {advantage:+.2f}% is below threshold"
-            return
-        source_price = self.get_last_price(source)
-        if source_price is None or float(source_price) <= 0 or self._has_active_order(source, "sell"):
-            report["status"] = f"No portfolio rotation: {source} is unavailable or has a working order"
-            return
-        budget = float(source_price) * float(held[source])
-        self.submit_order(
-            self.create_order(source, quantity=held[source], side="sell", order_type="market", time_in_force="day")
-        )
-        self._set_portfolio_rotation({"from": source, "to": str(target["symbol"]), "budget": budget})
-        report["status"] = f"Portfolio rotation submitted: {source} to {target['symbol']} (expected advantage {advantage:+.2f}%)"
+            builds_submitted = 0
+            for candidate in desired:
+                symbol = str(candidate["symbol"])
+                if symbol in held_working or symbol in claimed_symbols:
+                    continue
+                if len(held_working) + builds_submitted >= max_positions:
+                    break
+                slots_remaining = max(1, max_positions - (len(held_working) + builds_submitted))
+                budget = float(self.get_cash()) / slots_remaining
+                outcome = self._buy_portfolio_symbol(symbol, float(candidate["price"]), budget)
+                if outcome == "insufficient":
+                    # Cash is exhausted for new positions this pass; a
+                    # self-funded replacement below is unaffected.
+                    break
+                claimed_symbols.add(symbol)
+                builds_submitted += 1
+                actions.append(f"Portfolio build: {symbol} purchase {outcome}")
+
+            replacements_submitted = 0
+            if len(held_working) + builds_submitted >= max_positions:
+                # A holding with no current dip signal is scored neutral (0%
+                # expected edge), not punished: rotation happens only when the
+                # target's posture-adjusted edge beats holding by the
+                # configured margin. The old -100% default force-rotated any
+                # recovered holding every time some other symbol dipped,
+                # churning the portfolio. The posture lens only changes which
+                # holding looks weakest and by how much; the
+                # PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT floor is unchanged.
+                held_signals = {
+                    str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held_working
+                }
+                for candidate in remaining_candidates:
+                    target_symbol = str(candidate["symbol"])
+                    if target_symbol in held_working or target_symbol in claimed_symbols:
+                        continue
+                    unclaimed_held = [symbol for symbol in held_working if symbol not in claimed_symbols]
+                    if not unclaimed_held:
+                        break
+                    source = min(
+                        unclaimed_held,
+                        key=lambda symbol: float(
+                            held_signals.get(symbol, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
+                        ),
+                    )
+                    source_score = float(
+                        held_signals.get(source, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
+                    )
+                    advantage = float(candidate["posture_adjusted_edge"]) - source_score
+                    if advantage < minimum_profit:
+                        continue
+                    source_price = self.get_last_price(source)
+                    if source_price is None or float(source_price) <= 0 or self._has_active_order(source, "sell"):
+                        continue
+                    budget = float(source_price) * float(held_working[source])
+                    self.submit_order(
+                        self.create_order(
+                            source, quantity=held_working[source], side="sell",
+                            order_type="market", time_in_force="day",
+                        )
+                    )
+                    if self._add_portfolio_rotation(source, target_symbol, budget, kind="replacement"):
+                        held_working.pop(source, None)
+                        claimed_symbols.update({source, target_symbol})
+                        replacements_submitted += 1
+                        actions.append(
+                            f"Portfolio rotation submitted: {source} to {target_symbol} "
+                            f"(expected advantage {advantage:+.2f}%)"
+                        )
+
+            if builds_submitted == 0 and replacements_submitted == 0:
+                # A recurring small deposit should grow the highest-ranked
+                # current holding instead of remaining idle once the portfolio
+                # is full and every top candidate is already held.
+                top_up_candidate = next(
+                    (signal for signal in desired if str(signal["symbol"]) in held_working), None
+                )
+                cash = float(self.get_cash())
+                minimum_cash = float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0)) + float(
+                    self.parameters.get("portfolio_min_order_dollars", 1.0)
+                )
+                if top_up_candidate is not None and cash >= minimum_cash:
+                    symbol = str(top_up_candidate["symbol"])
+                    outcome = self._buy_portfolio_symbol(symbol, float(top_up_candidate["price"]), cash)
+                    actions.append(f"Portfolio top-up: {symbol} purchase {outcome}")
+
+        report["portfolio_actions"] = actions
+        report["status"] = self._summarize_portfolio_actions(actions, signal_present, veto_reason)
+
+    @staticmethod
+    def _summarize_portfolio_actions(
+        actions: list[str], signal_present: bool, veto_reason: str | None
+    ) -> str:
+        """Compose the single top-line status CLAUDE.md's email report needs.
+
+        Falls back to the historical single-sentence messages when at most
+        one thing happened this iteration (the common case, byte-identical to
+        the pre-rework behavior); composes a short multi-action summary
+        otherwise.
+        """
+        if not actions:
+            if veto_reason and signal_present:
+                return veto_reason
+            if not signal_present:
+                return "No portfolio trade: no portfolio signal or Opportunistic Opportunity met its thresholds"
+            return "No portfolio trade: current holdings match top signals and cash is below the minimum order"
+        if len(actions) == 1:
+            return actions[0]
+        return f"Portfolio: {len(actions)} actions this iteration -- " + "; ".join(actions)
 
     def on_trading_iteration(self) -> None:
         """Evaluate the dip and safely advance any required portfolio rotation."""
@@ -2049,15 +2231,25 @@ This automated message is not financial advice.
             elif side_text == "sell":
                 self._remove_portfolio_entry(str(symbol))
         if portfolio_pending:
-            if symbol == portfolio_pending["to"] and side_text == "buy":
-                self._set_portfolio_rotation(None)
-                self.log_message(
-                    f"Portfolio rotation complete: the {symbol} purchase filled.",
-                    color="green",
+            if side_text == "buy":
+                # Buy-fills are matched by scanning targets: N is bounded by
+                # portfolio_max_positions (small), and there is no order-id
+                # correlation to key off instead.
+                completed_source = next(
+                    (source for source, entry in portfolio_pending.items() if entry["to"] == symbol),
+                    None,
                 )
-                return
-            if symbol == portfolio_pending["from"] and side_text == "sell":
-                target = str(portfolio_pending["to"])
+                if completed_source is not None:
+                    kind = portfolio_pending[completed_source]["kind"]
+                    self._remove_portfolio_rotation(completed_source)
+                    self.log_message(
+                        f"Portfolio rotation complete ({kind}): the {symbol} purchase filled.",
+                        color="green",
+                    )
+                    return
+            elif side_text == "sell" and symbol in portfolio_pending:
+                entry = portfolio_pending[symbol]
+                target = str(entry["to"])
                 try:
                     target_price = self.get_last_price(target)
                     if (
@@ -2072,7 +2264,7 @@ This automated message is not financial advice.
                         )
                         return
                     outcome = self._buy_portfolio_symbol(
-                        target, float(target_price), float(portfolio_pending["budget"])
+                        target, float(target_price), float(entry["budget"])
                     )
                     if outcome == "insufficient":
                         # Proceeds may not have settled yet; the next daily
@@ -2137,15 +2329,16 @@ This automated message is not financial advice.
         )
 
         portfolio_pending = self.vars.portfolio_pending_rotation
-        if portfolio_pending and symbol == portfolio_pending["from"] and side == "sell":
-            # Nothing was sold, so the portfolio rotation never started.
-            self._set_portfolio_rotation(None)
+        if side == "sell" and symbol in portfolio_pending:
+            # Nothing was sold, so that portfolio rotation never started.
+            kind = portfolio_pending[symbol]["kind"]
+            self._remove_portfolio_rotation(symbol)
             self.log_message(
-                f"The {symbol} sale was canceled; the portfolio rotation is "
+                f"The {symbol} sale was canceled; the {kind} rotation is "
                 "reset and will be re-evaluated next cycle.",
                 color="yellow",
             )
-        # A canceled portfolio buy keeps the pending state so the next
+        # A canceled portfolio buy keeps its entry pending so the next
         # iteration retries the purchase with the cash still on hand.
 
         if not self.vars.pending_rotation:
