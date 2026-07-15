@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+NEWS_REQUEST_TIMEOUT_SECONDS = 15
+
 SEVERE_RISK_TERMS = (
     "bank failure",
     "cyberattack",
@@ -249,7 +251,20 @@ class WorldEventAnalyzer:
             end=now,
             limit=self.max_articles,
         )
-        response = NewsClient(api_key=api_key, secret_key=secret_key).get_news(request)
+        client = NewsClient(api_key=api_key, secret_key=secret_key)
+        # alpaca-py's REST client currently sends requests without a timeout.
+        # Wrap this client's private session in one place so an optional news
+        # outage cannot indefinitely block the trading iteration.
+        session = getattr(client, "_session", None)
+        if session is not None:
+            original_request = session.request
+
+            def request_with_timeout(*args: Any, **kwargs: Any) -> Any:
+                kwargs.setdefault("timeout", NEWS_REQUEST_TIMEOUT_SECONDS)
+                return original_request(*args, **kwargs)
+
+            session.request = request_with_timeout
+        response = client.get_news(request)
         dataframe = getattr(response, "df", None)
         if dataframe is None or dataframe.empty:
             return NewsContext(

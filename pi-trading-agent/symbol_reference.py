@@ -95,44 +95,69 @@ class SymbolReference:
         if not symbols:
             return False
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # The interval applies to already-known symbols, not to the whole
+        # database. Autonomous discovery changes the candidate list every day;
+        # newly seen symbols must be enriched immediately even when the last
+        # full refresh happened recently.
         with self._connect() as conn:
             self._create_schema(conn)
             last_refreshed = conn.execute(
                 "SELECT value FROM refresh_state WHERE name = 'last_refreshed'"
             ).fetchone()
+            full_refresh_due = True
             if last_refreshed:
                 try:
                     since = date.today() - date.fromisoformat(last_refreshed[0])
+                    full_refresh_due = since >= timedelta(days=self.refresh_days)
                 except ValueError:
-                    since = timedelta(days=self.refresh_days)
-                if since < timedelta(days=self.refresh_days):
-                    return False
+                    full_refresh_due = True
+            placeholders = ", ".join("?" for _ in symbols)
+            known = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT ticker FROM symbols WHERE ticker IN ({placeholders})", symbols
+                ).fetchall()
+            }
 
+        refresh_symbols = symbols if full_refresh_due else [symbol for symbol in symbols if symbol not in known]
+        if not refresh_symbols:
+            return False
+
+        # Do all network work without holding a DuckDB connection. The strategy
+        # runs this method in a background thread; readers can continue using
+        # the last complete snapshot while these bounded requests are pending.
+        try:
+            sec_by_ticker = self._load_sec_mapping()
+        except Exception:
+            sec_by_ticker = {}
+
+        headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
+        today = date.today().isoformat()
+        records: list[tuple[str, Any, Any, bool, str]] = []
+        for symbol in refresh_symbols:
+            alpaca_name = None
             try:
-                sec_by_ticker = self._load_sec_mapping()
+                asset = self._alpaca_fetcher(f"{self.assets_url}/{symbol}", headers)
+                if isinstance(asset, dict):
+                    alpaca_name = asset.get("name")
             except Exception:
-                sec_by_ticker = {}
-
-            headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
-            today = date.today().isoformat()
-            for symbol in symbols:
                 alpaca_name = None
-                try:
-                    asset = self._alpaca_fetcher(f"{self.assets_url}/{symbol}", headers)
-                    if isinstance(asset, dict):
-                        alpaca_name = asset.get("name")
-                except Exception:
-                    alpaca_name = None
-                sec_name = sec_by_ticker.get(symbol)
-                if alpaca_name is None and sec_name is None:
-                    # Neither source recognizes this ticker; do not record a
-                    # bare entry that would let downstream code trust it.
-                    continue
-                verified = (
-                    alpaca_name is not None
-                    and sec_name is not None
-                    and self._names_match(alpaca_name, sec_name)
-                )
+            sec_name = sec_by_ticker.get(symbol)
+            if alpaca_name is None and sec_name is None:
+                # Neither source recognizes this ticker; do not record a bare
+                # entry that would let downstream code trust it.
+                continue
+            verified = (
+                alpaca_name is not None
+                and sec_name is not None
+                and self._names_match(alpaca_name, sec_name)
+            )
+            records.append((symbol, alpaca_name, sec_name, verified, today))
+
+        with self._connect() as conn:
+            self._create_schema(conn)
+            for record in records:
                 conn.execute(
                     """
                     INSERT INTO symbols (ticker, alpaca_name, sec_name, verified, refreshed_date)
@@ -143,15 +168,16 @@ class SymbolReference:
                         verified = excluded.verified,
                         refreshed_date = excluded.refreshed_date
                     """,
-                    (symbol, alpaca_name, sec_name, verified, today),
+                    record,
                 )
-            conn.execute(
-                """
-                INSERT INTO refresh_state VALUES ('last_refreshed', ?)
-                ON CONFLICT (name) DO UPDATE SET value = excluded.value
-                """,
-                (today,),
-            )
+            if full_refresh_due:
+                conn.execute(
+                    """
+                    INSERT INTO refresh_state VALUES ('last_refreshed', ?)
+                    ON CONFLICT (name) DO UPDATE SET value = excluded.value
+                    """,
+                    (today,),
+                )
             conn.commit()
         return True
 

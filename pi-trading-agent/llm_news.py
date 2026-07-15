@@ -26,7 +26,10 @@ MAX_SUMMARY_CHARS = 400
 MIN_SCORE = -10
 MAX_SCORE = 10
 RISK_LEVELS = ("high", "elevated", "normal", "constructive")
-REQUEST_TIMEOUT_SECONDS = 60
+# This assessment is optional and fails open. Keep its wall-clock budget well
+# below the daily trading iteration so a provider outage cannot hold orders for
+# a full minute.
+REQUEST_TIMEOUT_SECONDS = 20
 # The reply is one short JSON object, but reasoning models (e.g. Gemini 2.5)
 # spend hidden "thinking" tokens from this same cap; too small a cap yields an
 # empty reply, which this layer treats as a failed (skipped) assessment.
@@ -229,7 +232,7 @@ class LLMNewsAnalyzer:
         client = anthropic.Anthropic(
             api_key=self._api_key(),
             timeout=float(REQUEST_TIMEOUT_SECONDS),
-            max_retries=2,
+            max_retries=0,
         )
         response = client.messages.create(
             model=self.model,

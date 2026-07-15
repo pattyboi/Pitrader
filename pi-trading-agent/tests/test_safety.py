@@ -1,8 +1,10 @@
 from pathlib import Path
 from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import logging
 import sqlite3
+import threading
 
 from adaptive_news_model import AdaptiveNewsModel
 from congress_context import CongressTradeAnalyzer
@@ -312,6 +314,140 @@ def test_symbol_reference_refresh_is_gated_by_the_interval(tmp_path: Path) -> No
     assert reference.refresh(["AAPL"], "key", "secret") is True
     assert reference.refresh(["AAPL"], "key", "secret") is False
     assert calls["count"] == 1
+
+
+def test_symbol_reference_refreshes_new_discovery_symbols_within_interval(tmp_path: Path) -> None:
+    calls: list[str] = []
+    names = {"AAPL": "Apple Inc.", "MSFT": "Microsoft Corp."}
+
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=lambda url, headers: (
+            calls.append(url.rsplit("/", 1)[-1])
+            or {"name": names[url.rsplit("/", 1)[-1]]}
+        ),
+        sec_fetcher=lambda url, timeout: [
+            {"ticker": symbol, "title": name} for symbol, name in names.items()
+        ],
+    )
+
+    assert reference.refresh(["AAPL"], "key", "secret") is True
+    assert reference.refresh(["AAPL", "MSFT"], "key", "secret") is True
+
+    assert calls == ["AAPL", "MSFT"]
+    assert reference.verified_symbols() == {"AAPL", "MSFT"}
+
+
+def test_checked_submission_treats_lumibot_error_status_as_rejection() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    messages: list[str] = []
+    order = SimpleNamespace(status="unprocessed", error_message="broker said no")
+    strategy.submit_order = lambda submitted: (
+        setattr(submitted, "status", "error") or submitted
+    )
+    strategy.log_message = lambda message, **kwargs: messages.append(message)
+
+    assert not strategy._submit_order_checked(order, "SPY buy")
+    assert "Broker rejected SPY buy" in messages[-1]
+
+
+def test_portfolio_rotation_is_staged_before_sell_and_rolled_back_on_rejection() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {}
+    strategy.vars = SimpleNamespace(portfolio_pending_rotation={})
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.create_order = lambda *args, **kwargs: SimpleNamespace(
+        status="unprocessed", error_message=""
+    )
+
+    def reject_after_observing_staged_state(order):
+        assert strategy.vars.portfolio_pending_rotation["SPY"]["to"] == "QQQ"
+        order.status = "error"
+        return order
+
+    strategy.submit_order = reject_after_observing_staged_state
+
+    accepted = strategy._submit_portfolio_rotation_sell(
+        "SPY", "QQQ", Decimal("2"), 1000.0, "replacement"
+    )
+
+    assert not accepted
+    assert strategy.vars.portfolio_pending_rotation == {}
+
+
+def test_symbol_reference_refresh_runs_outside_trading_thread() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"symbol_reference_enabled": True}
+    strategy._symbol_reference_refresh_lock = threading.Lock()
+    strategy._symbol_reference_pending_symbols = set()
+    strategy._symbol_reference_refresh_running = False
+    strategy.log_message = lambda *args, **kwargs: None
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingReference:
+        def refresh(self, symbols, api_key, secret_key):
+            started.set()
+            assert release.wait(timeout=2)
+            return True
+
+    strategy._symbol_reference = lambda: BlockingReference()
+    strategy._refresh_symbol_reference(["SPY"])
+
+    assert started.wait(timeout=1)
+    assert strategy._symbol_reference_refresh_running
+    release.set()
+
+
+def test_symbol_reference_refresh_queues_symbols_seen_during_active_refresh() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"symbol_reference_enabled": True}
+    strategy._symbol_reference_refresh_lock = threading.Lock()
+    strategy._symbol_reference_pending_symbols = set()
+    strategy._symbol_reference_refresh_running = False
+    strategy.log_message = lambda *args, **kwargs: None
+    first_started = threading.Event()
+    release_first = threading.Event()
+    finished = threading.Event()
+    batches: list[list[str]] = []
+
+    class RecordingReference:
+        def refresh(self, symbols, api_key, secret_key):
+            batches.append(symbols)
+            if len(batches) == 1:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            else:
+                finished.set()
+            return True
+
+    strategy._symbol_reference = lambda: RecordingReference()
+    strategy._refresh_symbol_reference(["SPY"])
+    assert first_started.wait(timeout=1)
+
+    strategy._refresh_symbol_reference(["QQQ"])
+    release_first.set()
+
+    assert finished.wait(timeout=1)
+    assert batches == [["SPY"], ["QQQ"]]
+
+
+def test_portfolio_history_requests_use_bounded_concurrency() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy._PORTFOLIO_HISTORY_WORKERS = 2
+    rendezvous = threading.Barrier(2)
+
+    def signal(symbol: str):
+        rendezvous.wait(timeout=1)
+        return {"symbol": symbol}
+
+    strategy._portfolio_signal = signal
+
+    assert strategy._portfolio_signals(["SPY", "QQQ"]) == [
+        {"symbol": "SPY"},
+        {"symbol": "QQQ"},
+    ]
 
 
 def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:

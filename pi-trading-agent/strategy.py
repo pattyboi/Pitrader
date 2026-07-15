@@ -7,6 +7,7 @@ import os
 import smtplib
 import ssl
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from email.message import EmailMessage
@@ -82,11 +83,17 @@ class AssetRotationStrategy(Strategy):
         "expired",
         "rejected",
     }
+    _FAILED_ORDER_STATUSES = {"cancel", "canceled", "cancelled", "error", "expired", "rejected"}
+    _PORTFOLIO_HISTORY_WORKERS = 4
 
     def initialize(self) -> None:
         """Configure one evaluation per trading day."""
         self.sleeptime = "1D"
         self._rotation_lock = threading.Lock()
+        self._portfolio_state_lock = threading.RLock()
+        self._symbol_reference_refresh_lock = threading.Lock()
+        self._symbol_reference_pending_symbols: set[str] = set()
+        self._symbol_reference_refresh_running = False
         self.vars.pending_rotation = self._load_pending_rotation()
         # Historical bars are fetched during the first evaluation, after the
         # broker has supplied current market data.
@@ -119,6 +126,12 @@ class AssetRotationStrategy(Strategy):
                 f"{summary}; reconciling next cycle.",
                 color="yellow",
             )
+        # Warm the slow, optional symbol metadata before the market opens. Any
+        # later discovery symbols are queued by _run_portfolio_iteration, but
+        # enrichment must never delay price evaluation or order submission.
+        self._refresh_symbol_reference(
+            [str(symbol).strip().upper() for symbol in self.parameters.get("portfolio_symbols", [])]
+        )
         self._refresh_wsb_snapshot_before_trading()
 
     def _rotation_state_path(self) -> Path | None:
@@ -136,12 +149,13 @@ class AssetRotationStrategy(Strategy):
         except (OSError, ValueError, json.JSONDecodeError):
             return False
 
-    def _set_pending_rotation(self, value: bool) -> None:
+    def _set_pending_rotation(self, value: bool) -> bool:
         """Update the rotation flag in memory and persist it atomically."""
+        previous = bool(getattr(self.vars, "pending_rotation", False))
         self.vars.pending_rotation = bool(value)
         path = self._rotation_state_path()
         if path is None:
-            return
+            return True
         try:
             temporary_path = path.with_suffix(path.suffix + ".tmp")
             temporary_path.write_text(
@@ -150,11 +164,22 @@ class AssetRotationStrategy(Strategy):
             )
             temporary_path.replace(path)
         except OSError as exc:
+            self.vars.pending_rotation = previous
             self.log_message(f"Could not persist rotation state: {exc}", color="red")
+            return False
+        return True
 
     def _portfolio_rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_rotation_state_file")
         return Path(str(raw)) if raw else None
+
+    def _portfolio_state_guard(self) -> threading.RLock:
+        """Return the shared lock protecting callback/iteration state swaps."""
+        lock = getattr(self, "_portfolio_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._portfolio_state_lock = lock
+        return lock
 
     def _load_portfolio_rotation(self) -> dict[str, dict[str, Any]]:
         """Restore every staged portfolio rotation after a restart.
@@ -205,7 +230,7 @@ class AssetRotationStrategy(Strategy):
             kind = "replacement"
         return {"to": target.upper(), "budget": budget, "kind": kind}
 
-    def _set_portfolio_rotation(self, state: dict[str, dict[str, Any]]) -> None:
+    def _set_portfolio_rotation(self, state: dict[str, dict[str, Any]]) -> bool:
         """Persist the whole rotation collection atomically (whole-file swap).
 
         Callers always pass a freshly rebuilt dict rather than mutating the
@@ -213,19 +238,24 @@ class AssetRotationStrategy(Strategy):
         portfolio_holding_dates, so a concurrent read from the broker
         callback thread never observes a partially updated collection.
         """
-        self.vars.portfolio_pending_rotation = state
-        path = self._portfolio_rotation_state_path()
-        if path is None:
-            return
-        try:
-            if not state:
-                path.unlink(missing_ok=True)
-                return
-            temporary_path = path.with_suffix(path.suffix + ".tmp")
-            temporary_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
-            temporary_path.replace(path)
-        except OSError as exc:
-            self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
+        with self._portfolio_state_guard():
+            previous = self.vars.portfolio_pending_rotation
+            self.vars.portfolio_pending_rotation = state
+            path = self._portfolio_rotation_state_path()
+            if path is None:
+                return True
+            try:
+                if not state:
+                    path.unlink(missing_ok=True)
+                    return True
+                temporary_path = path.with_suffix(path.suffix + ".tmp")
+                temporary_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+                temporary_path.replace(path)
+            except OSError as exc:
+                self.vars.portfolio_pending_rotation = previous
+                self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
+                return False
+            return True
 
     def _add_portfolio_rotation(self, source: str, target: str, budget: float, kind: str) -> bool:
         """Stage a new rotation, refusing if either symbol is already in flight.
@@ -235,27 +265,28 @@ class AssetRotationStrategy(Strategy):
         Returns False (and logs, without changing state) rather than risk
         creating that ambiguity.
         """
-        pending = self.vars.portfolio_pending_rotation
-        claimed = set(pending.keys()) | {entry["to"] for entry in pending.values()}
-        if source in claimed or target in claimed:
-            self.log_message(
-                f"Refused to stage {source} to {target}: one of these symbols "
-                "already has an in-flight portfolio rotation.",
-                color="red",
-            )
-            return False
-        updated = dict(pending)
-        updated[source] = {"to": target, "budget": budget, "kind": kind}
-        self._set_portfolio_rotation(updated)
-        return True
+        with self._portfolio_state_guard():
+            pending = self.vars.portfolio_pending_rotation
+            claimed = set(pending.keys()) | {entry["to"] for entry in pending.values()}
+            if source in claimed or target in claimed:
+                self.log_message(
+                    f"Refused to stage {source} to {target}: one of these symbols "
+                    "already has an in-flight portfolio rotation.",
+                    color="red",
+                )
+                return False
+            updated = dict(pending)
+            updated[source] = {"to": target, "budget": budget, "kind": kind}
+            return self._set_portfolio_rotation(updated)
 
     def _remove_portfolio_rotation(self, source: str) -> None:
-        pending = self.vars.portfolio_pending_rotation
-        if source not in pending:
-            return
-        updated = dict(pending)
-        del updated[source]
-        self._set_portfolio_rotation(updated)
+        with self._portfolio_state_guard():
+            pending = self.vars.portfolio_pending_rotation
+            if source not in pending:
+                return
+            updated = dict(pending)
+            del updated[source]
+            self._set_portfolio_rotation(updated)
 
     def _portfolio_holding_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_holding_state_file")
@@ -289,26 +320,33 @@ class AssetRotationStrategy(Strategy):
             return False
 
     def _set_portfolio_holding_dates(self, dates: dict[str, str]) -> None:
-        self.vars.portfolio_holding_dates = dates
-        path = self._portfolio_holding_state_path()
-        if path is None:
-            return
-        try:
-            temporary_path = path.with_suffix(path.suffix + ".tmp")
-            temporary_path.write_text(json.dumps(dates, sort_keys=True) + "\n", encoding="utf-8")
-            temporary_path.replace(path)
-        except OSError as exc:
-            self.log_message(f"Could not persist portfolio holding dates: {exc}", color="red")
+        with self._portfolio_state_guard():
+            previous = self.vars.portfolio_holding_dates
+            self.vars.portfolio_holding_dates = dates
+            path = self._portfolio_holding_state_path()
+            if path is None:
+                return
+            try:
+                temporary_path = path.with_suffix(path.suffix + ".tmp")
+                temporary_path.write_text(
+                    json.dumps(dates, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                temporary_path.replace(path)
+            except OSError as exc:
+                self.vars.portfolio_holding_dates = previous
+                self.log_message(f"Could not persist portfolio holding dates: {exc}", color="red")
 
     def _record_portfolio_entry(self, symbol: str) -> None:
-        dates = dict(self.vars.portfolio_holding_dates)
-        dates[str(symbol).upper()] = self.get_datetime().date().isoformat()
-        self._set_portfolio_holding_dates(dates)
+        with self._portfolio_state_guard():
+            dates = dict(self.vars.portfolio_holding_dates)
+            dates[str(symbol).upper()] = self.get_datetime().date().isoformat()
+            self._set_portfolio_holding_dates(dates)
 
     def _remove_portfolio_entry(self, symbol: str) -> None:
-        dates = dict(self.vars.portfolio_holding_dates)
-        dates.pop(str(symbol).upper(), None)
-        self._set_portfolio_holding_dates(dates)
+        with self._portfolio_state_guard():
+            dates = dict(self.vars.portfolio_holding_dates)
+            dates.pop(str(symbol).upper(), None)
+            self._set_portfolio_holding_dates(dates)
 
     @staticmethod
     def _holding_is_due(entry_date: str, today: date_type, maximum_days: int) -> bool:
@@ -338,6 +376,69 @@ class AssetRotationStrategy(Strategy):
             if status not in self._TERMINAL_ORDER_STATUSES:
                 return True
         return False
+
+    @staticmethod
+    def _order_status(order: Any) -> str:
+        """Normalize Lumibot enum/string statuses for submission checks."""
+        status = getattr(order, "status", "")
+        value = getattr(status, "value", status)
+        return str(value).strip().lower()
+
+    def _submit_order_checked(self, order: Any, description: str) -> bool:
+        """Submit and reject Lumibot's non-raising synchronous error result.
+
+        Alpaca's Lumibot broker catches API exceptions, sets ``order.status``
+        to ``error``, and returns the order. Callers therefore cannot use the
+        absence of an exception as proof that the broker accepted it.
+        """
+        submitted = self.submit_order(order)
+        if submitted is None:
+            self.log_message(
+                f"Broker did not accept {description}: submission returned no order.",
+                color="red",
+            )
+            return False
+        status = self._order_status(submitted)
+        if status in self._FAILED_ORDER_STATUSES:
+            error = str(getattr(submitted, "error_message", "") or "").strip()
+            suffix = f": {error}" if error else ""
+            self.log_message(
+                f"Broker rejected {description} (status={status}){suffix}.",
+                color="red",
+            )
+            return False
+        return True
+
+    def _submit_portfolio_rotation_sell(
+        self,
+        source: str,
+        target: str,
+        quantity: Decimal,
+        budget: float,
+        kind: str,
+    ) -> bool:
+        """Persist rotation intent before exposing its sell to the broker."""
+        if not self._add_portfolio_rotation(source, target, budget, kind):
+            return False
+        order = self.create_order(
+            source,
+            quantity=quantity,
+            side="sell",
+            order_type="market",
+            time_in_force="day",
+        )
+        try:
+            accepted = self._submit_order_checked(order, f"{source} sell for {kind} rotation")
+        except Exception:
+            # The persisted intent was created only for this submission. A
+            # later callback cannot have filled an order that raised before it
+            # was accepted, so removing it is safe.
+            self._remove_portfolio_rotation(source)
+            raise
+        if not accepted:
+            self._remove_portfolio_rotation(source)
+            return False
+        return True
 
     def _send_daily_email(self, report: dict[str, Any]) -> None:
         """Send at most one successful summary email per calendar day."""
@@ -440,7 +541,7 @@ class AssetRotationStrategy(Strategy):
             password = os.environ.get("EMAIL_SMTP_PASSWORD") or str(
                 self.parameters.get("email_smtp_password", "")
             )
-            with smtplib.SMTP(host, port, timeout=30) as smtp:
+            with smtplib.SMTP(host, port, timeout=15) as smtp:
                 smtp.ehlo()
                 if bool(self.parameters["email_use_tls"]):
                     # Verify the server certificate; the stdlib default does not.
@@ -1128,9 +1229,10 @@ This automated message is not financial advice.
 
         Buys fractional shares when PORTFOLIO_FRACTIONAL_SHARES is enabled
         (the default), otherwise whole shares. Returns "submitted" when a new
-        order was placed, "working" when a buy order is already in flight, or
-        "insufficient" when the spendable cash is below the minimum order (or
-        below one whole share in whole-share mode).
+        order was placed, "working" when a buy order is already in flight,
+        "rejected" when the broker synchronously refuses it, or "insufficient"
+        when the spendable cash is below the minimum order (or below one whole
+        share in whole-share mode).
         """
         with self._rotation_lock:
             if self._has_active_order(asset_b, "buy"):
@@ -1168,7 +1270,8 @@ This automated message is not financial advice.
                 order_type="market",
                 time_in_force="day",
             )
-            self.submit_order(buy_order)
+            if not self._submit_order_checked(buy_order, f"{asset_b} buy"):
+                return "rejected"
             self.log_message(
                 f"Submitted market buy for {quantity} shares of {asset_b}, the "
                 f"largest supported quantity from ${cash:.2f} cash "
@@ -1194,9 +1297,15 @@ This automated message is not financial advice.
                 quantity = math.floor(spendable / price)
             if quantity <= 0:
                 return "insufficient"
-            self.submit_order(
-                self.create_order(symbol, quantity=quantity, side="buy", order_type="market", time_in_force="day")
+            buy_order = self.create_order(
+                symbol,
+                quantity=quantity,
+                side="buy",
+                order_type="market",
+                time_in_force="day",
             )
+            if not self._submit_order_checked(buy_order, f"{symbol} portfolio buy"):
+                return "rejected"
             self.log_message(
                 f"Portfolio submitted buy of {quantity} {symbol} shares using up to ${budget:.2f}.",
                 color="green",
@@ -1302,6 +1411,18 @@ This automated message is not financial advice.
             "win_probability": (wins + 1) / (len(net_returns) + 2),
         }
 
+    def _portfolio_signals(
+        self, symbols: list[str]
+    ) -> list[dict[str, float | int | str | None] | None]:
+        """Fetch independent symbol histories through a small bounded pool."""
+        if not symbols:
+            return []
+        with ThreadPoolExecutor(
+            max_workers=min(self._PORTFOLIO_HISTORY_WORKERS, len(symbols)),
+            thread_name_prefix="portfolio-history",
+        ) as executor:
+            return list(executor.map(self._portfolio_signal, symbols))
+
     def _symbol_news_scores(
         self, news_context: NewsContext, candidates: set[str]
     ) -> dict[str, int]:
@@ -1395,7 +1516,7 @@ This automated message is not financial advice.
         )
 
     def _refresh_symbol_reference(self, symbols: list[str]) -> None:
-        """Keep the local cross-checked symbol mapping current, off the critical path.
+        """Queue a daemon refresh without delaying the trading iteration.
 
         A refresh failure must not affect trading: it only ever narrows or
         widens which per-symbol news attributions are trusted, never
@@ -1403,21 +1524,52 @@ This automated message is not financial advice.
         """
         if not bool(self.parameters.get("symbol_reference_enabled", True)):
             return
-        try:
-            refreshed = self._symbol_reference().refresh(
-                symbols,
-                os.environ.get("ALPACA_API_KEY", ""),
-                os.environ.get("ALPACA_API_SECRET", ""),
-            )
-            if refreshed:
-                self.log_message(
-                    f"Symbol reference refreshed for {len(symbols)} symbols.", color="blue"
-                )
-        except Exception as exc:
-            self.log_message(
-                f"Symbol reference refresh failed safely: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
+        normalized = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
+        if not normalized:
+            return
+        refresh_lock = getattr(self, "_symbol_reference_refresh_lock", None)
+        if refresh_lock is None:
+            refresh_lock = threading.Lock()
+            self._symbol_reference_refresh_lock = refresh_lock
+        with refresh_lock:
+            pending = getattr(self, "_symbol_reference_pending_symbols", None)
+            if pending is None:
+                pending = set()
+                self._symbol_reference_pending_symbols = pending
+            pending.update(normalized)
+            if bool(getattr(self, "_symbol_reference_refresh_running", False)):
+                return
+            self._symbol_reference_refresh_running = True
+
+        def refresh_in_background() -> None:
+            while True:
+                with refresh_lock:
+                    if not self._symbol_reference_pending_symbols:
+                        self._symbol_reference_refresh_running = False
+                        return
+                    batch = sorted(self._symbol_reference_pending_symbols)
+                    self._symbol_reference_pending_symbols.clear()
+                try:
+                    refreshed = self._symbol_reference().refresh(
+                        batch,
+                        os.environ.get("ALPACA_API_KEY", ""),
+                        os.environ.get("ALPACA_API_SECRET", ""),
+                    )
+                    if refreshed:
+                        self.log_message(
+                            f"Symbol reference refreshed for {len(batch)} symbols.", color="blue"
+                        )
+                except Exception as exc:
+                    self.log_message(
+                        f"Symbol reference refresh failed safely: {type(exc).__name__}: {exc}",
+                        color="yellow",
+                    )
+
+        threading.Thread(
+            target=refresh_in_background,
+            name="symbol-reference-refresh",
+            daemon=True,
+        ).start()
 
     def _portfolio_symbols(
         self,
@@ -1607,6 +1759,10 @@ This automated message is not financial advice.
                 actions.append(f"Portfolio rotation finished: cash is below the minimum {target} order")
             elif outcome == "working":
                 actions.append(f"Portfolio pending: waiting for the {target} purchase to fill")
+            elif outcome == "rejected":
+                actions.append(
+                    f"Portfolio pending: broker rejected the {target} purchase; retrying next cycle"
+                )
             else:
                 # The entry clears when the buy fills (on_filled_order), never
                 # on submission, so a rejected order is retried next cycle.
@@ -1650,11 +1806,16 @@ This automated message is not financial advice.
             if self._has_active_order(source, "sell"):
                 actions.append(f"Portfolio exit pending: waiting for {source} sale")
                 continue
-            self.submit_order(
-                self.create_order(
-                    source, quantity=held[source], side="sell", order_type="market", time_in_force="day"
-                )
+            exit_order = self.create_order(
+                source,
+                quantity=held[source],
+                side="sell",
+                order_type="market",
+                time_in_force="day",
             )
+            if not self._submit_order_checked(exit_order, f"{source} holding-horizon sell"):
+                actions.append(f"Portfolio exit rejected: {source} sale was not accepted")
+                continue
             actions.append(
                 f"Portfolio exit submitted: {source} reached its "
                 f"{maximum_holding_days}-day holding horizon"
@@ -1662,7 +1823,10 @@ This automated message is not financial advice.
             held_working.pop(source, None)
             claimed_symbols.add(source)
 
-        signals = [self._portfolio_signal(symbol) for symbol in symbols]
+        # Alpaca requests for separate symbols are independent. A small fixed
+        # pool removes the observed serial latency without creating an
+        # unbounded burst against the broker API.
+        signals = self._portfolio_signals(symbols)
         signals = [signal for signal in signals if signal is not None]
         # The risky/conservative reasoning pattern only reshapes ranking and
         # tie-breaking below; the eligibility floor two lines down still
@@ -1745,13 +1909,13 @@ This automated message is not financial advice.
                     actions.append("No Opportunistic Opportunity: Asset A price was unavailable")
                 else:
                     budget = float(source_price) * float(held_working[asset_a])
-                    self.submit_order(
-                        self.create_order(
-                            asset_a, quantity=held_working[asset_a], side="sell",
-                            order_type="market", time_in_force="day",
-                        )
-                    )
-                    if self._add_portfolio_rotation(asset_a, asset_b, budget, kind="opportunistic"):
+                    if self._submit_portfolio_rotation_sell(
+                        asset_a,
+                        asset_b,
+                        held_working[asset_a],
+                        budget,
+                        kind="opportunistic",
+                    ):
                         held_working.pop(asset_a, None)
                         claimed_symbols.update({asset_a, asset_b})
                         actions.append(
@@ -1784,6 +1948,9 @@ This automated message is not financial advice.
                     # Cash is exhausted for new positions this pass; a
                     # self-funded replacement below is unaffected.
                     break
+                if outcome == "rejected":
+                    actions.append(f"Portfolio build rejected: {symbol} purchase was not accepted")
+                    continue
                 claimed_symbols.add(symbol)
                 builds_submitted += 1
                 actions.append(f"Portfolio build: {symbol} purchase {outcome}")
@@ -1824,13 +1991,13 @@ This automated message is not financial advice.
                     if source_price is None or float(source_price) <= 0 or self._has_active_order(source, "sell"):
                         continue
                     budget = float(source_price) * float(held_working[source])
-                    self.submit_order(
-                        self.create_order(
-                            source, quantity=held_working[source], side="sell",
-                            order_type="market", time_in_force="day",
-                        )
-                    )
-                    if self._add_portfolio_rotation(source, target_symbol, budget, kind="replacement"):
+                    if self._submit_portfolio_rotation_sell(
+                        source,
+                        target_symbol,
+                        held_working[source],
+                        budget,
+                        kind="replacement",
+                    ):
                         held_working.pop(source, None)
                         claimed_symbols.update({source, target_symbol})
                         replacements_submitted += 1
@@ -1998,6 +2165,10 @@ This automated message is not financial advice.
                         report["status"] = (
                             f"Pending: waiting for the open {asset_b} purchase to fill"
                         )
+                    elif outcome == "rejected":
+                        report["status"] = (
+                            f"Pending: broker rejected the {asset_b} purchase; retrying next cycle"
+                        )
                     else:
                         # Below the minimum purchasable amount: the rotation
                         # is complete by design.
@@ -2151,8 +2322,20 @@ This automated message is not financial advice.
                 order_type="market",
                 time_in_force="day",
             )
-            self.submit_order(sell_order)
-            self._set_pending_rotation(True)
+            if not self._set_pending_rotation(True):
+                report["status"] = (
+                    f"No trade: could not persist the pending {asset_a} rotation safely"
+                )
+                return
+            try:
+                accepted = self._submit_order_checked(sell_order, f"{asset_a} rotation sell")
+            except Exception:
+                self._set_pending_rotation(False)
+                raise
+            if not accepted:
+                self._set_pending_rotation(False)
+                report["status"] = f"No trade: broker rejected the {asset_a} rotation sale"
+                return
             report["status"] = f"Submitted market sale of {asset_a} to rotate into {asset_b}"
             self.log_message(
                 f"Dip signal triggered. Submitted market sale of {quantity_a} "
@@ -2274,6 +2457,12 @@ This automated message is not financial advice.
                             "case the sale proceeds have not settled yet.",
                             color="yellow",
                         )
+                    elif outcome == "rejected":
+                        self.log_message(
+                            f"The broker rejected the {target} purchase; the pending "
+                            "rotation remains recorded for the next cycle.",
+                            color="red",
+                        )
                 except Exception as exc:
                     self.log_message(
                         f"Portfolio post-sale purchase failed safely and will be "
@@ -2311,6 +2500,12 @@ This automated message is not financial advice.
                     f"The {asset_b} purchase will be retried next cycle in case "
                     "the sale proceeds have not settled yet.",
                     color="yellow",
+                )
+            elif outcome == "rejected":
+                self.log_message(
+                    f"The broker rejected the {asset_b} purchase; the pending "
+                    "rotation remains recorded for the next cycle.",
+                    color="red",
                 )
         except Exception as exc:
             self.log_message(
