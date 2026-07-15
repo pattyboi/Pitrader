@@ -73,7 +73,9 @@ iteration fills.
 
 Every holding is checked against its own unrealized return each iteration,
 starting the day it's bought (using the broker's own cost basis, not a fixed
-schedule): it's sold as soon as it gains at least `PORTFOLIO_TAKE_PROFIT_PERCENT`
+schedule) and priced against the live bid — what a market sell would actually
+realize, not the last trade, which can sit anywhere inside the spread: it's
+sold as soon as it gains at least `PORTFOLIO_TAKE_PROFIT_PERCENT`
 or drops at least `PORTFOLIO_STOP_LOSS_PERCENT`, whichever comes first. A
 position sitting between those two bounds — no confirmed gain, no unacceptable
 loss — is left alone rather than force-sold on a schedule, unless a staged

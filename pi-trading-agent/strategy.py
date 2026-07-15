@@ -1356,12 +1356,10 @@ This automated message is not financial advice.
                 outcomes.append(returns[index] - round_trip_cost_percent)
         return outcomes
 
-    def _live_spread_percent(self, symbol: str) -> float | None:
-        """Best-effort live bid/ask spread, as a round-trip cost estimate.
+    def _get_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        """Live (bid, ask) for symbol, or None on any missing/invalid/one-sided quote.
 
-        Returns None on any missing/invalid/one-sided quote so the caller can
-        fail open to the configured flat PORTFOLIO_ROUND_TRIP_COST_PERCENT.
-        Never raises: a quote failure here must not block the whole signal.
+        Never raises: a quote failure here must not block the caller.
         """
         try:
             quote = self.get_quote(symbol)
@@ -1376,9 +1374,41 @@ This automated message is not financial advice.
             return None
         if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= bid:
             return None
+        return bid, ask
+
+    def _live_spread_percent(self, symbol: str) -> float | None:
+        """Best-effort live bid/ask spread, as a round-trip cost estimate.
+
+        Returns None on any missing/invalid/one-sided quote so the caller can
+        fail open to the configured flat PORTFOLIO_ROUND_TRIP_COST_PERCENT.
+        """
+        bid_ask = self._get_bid_ask(symbol)
+        if bid_ask is None:
+            return None
+        bid, ask = bid_ask
         mid = (bid + ask) / 2.0
         spread_percent = ((ask - bid) / mid) * 100.0
         return min(spread_percent, self._PORTFOLIO_LIVE_SPREAD_CAP_PERCENT)
+
+    def _realizable_sale_price(self, symbol: str) -> float | None:
+        """Price a market sell of this symbol would actually realize.
+
+        A market sell fills against the live bid, not the last trade --
+        which can sit anywhere inside the spread and make an exit threshold
+        look closer than it really is. Falls back to get_last_price on any
+        missing/invalid quote so a data hiccup can't block an exit.
+        """
+        bid_ask = self._get_bid_ask(symbol)
+        if bid_ask is not None:
+            return bid_ask[0]
+        last_price = self.get_last_price(symbol)
+        if last_price is None:
+            return None
+        try:
+            value = float(last_price)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
 
     def _portfolio_signal(
         self, symbol: str
@@ -1837,10 +1867,14 @@ This automated message is not financial advice.
         # Cost basis is Alpaca's own avg_entry_price (via entry_prices,
         # sourced in _portfolio_held_positions), not anything tracked
         # locally, so it's correct across restarts and partial fills.
-        # Take-profit and stop-loss are evaluated every iteration starting
-        # day one -- loss containment should not wait for a day counter to
-        # elapse. A holding sitting between the stop and the target (no
-        # determined gain, no unacceptable loss) is left to run.
+        # Compared against the live bid via _realizable_sale_price, not
+        # get_last_price's last *trade* -- a market sell fills against the
+        # bid, and on a sub-$100 position the gap between the two can be
+        # the difference between a real gain and spread noise. Take-profit
+        # and stop-loss are evaluated every iteration starting day one --
+        # loss containment should not wait for a day counter to elapse. A
+        # holding sitting between the stop and the target (no determined
+        # gain, no unacceptable loss) is left to run.
         # PORTFOLIO_HOLDING_HORIZON_MAX_DAYS is the hard backstop so a
         # stagnant or illiquid symbol -- or one with no cost-basis data at
         # all -- can't occupy a portfolio slot forever if Phase 3's
@@ -1866,14 +1900,9 @@ This automated message is not financial advice.
         exit_reasons: dict[str, str] = {}
         for symbol in held:
             entry_price = entry_prices.get(symbol)
-            current_price = self.get_last_price(symbol)
-            if (
-                entry_price is not None
-                and current_price is not None
-                and math.isfinite(float(current_price))
-                and float(current_price) > 0
-            ):
-                unrealized_percent = ((float(current_price) - entry_price) / entry_price) * 100.0
+            current_price = self._realizable_sale_price(symbol)
+            if entry_price is not None and current_price is not None:
+                unrealized_percent = ((current_price - entry_price) / entry_price) * 100.0
                 if unrealized_percent >= take_profit_percent:
                     exit_reasons[symbol] = f"take-profit reached ({unrealized_percent:+.2f}%)"
                     continue

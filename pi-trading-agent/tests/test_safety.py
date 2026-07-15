@@ -149,6 +149,30 @@ def test_live_spread_percent_fails_open_on_a_missing_or_invalid_quote() -> None:
     assert strategy._live_spread_percent("DOWN") is None
 
 
+def test_realizable_sale_price_prefers_the_live_bid_over_last_trade() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_quote = lambda symbol: SimpleNamespace(bid=99.0, ask=101.0)
+    strategy.get_last_price = lambda symbol: 100.5  # would overstate an exit vs. the real bid
+
+    assert strategy._realizable_sale_price("THIN") == 99.0
+
+
+def test_realizable_sale_price_falls_back_to_last_trade_without_a_quote() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_quote = lambda symbol: None
+    strategy.get_last_price = lambda symbol: 100.5
+
+    assert strategy._realizable_sale_price("NOQUOTE") == 100.5
+
+
+def test_realizable_sale_price_is_none_when_nothing_is_available() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_quote = lambda symbol: None
+    strategy.get_last_price = lambda symbol: None
+
+    assert strategy._realizable_sale_price("DARK") is None
+
+
 def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:
     # The first five results establish a 2% gross edge. The sixth return is
     # then an out-of-sample trade selected from those five prior results.
