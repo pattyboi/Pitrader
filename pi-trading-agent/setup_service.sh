@@ -57,7 +57,7 @@ WorkingDirectory=${PROJECT_DIR}
 ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/main.py
 Restart=always
 RestartSec=30
-TimeoutStopSec=90
+TimeoutStopSec=15
 KillSignal=SIGINT
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true

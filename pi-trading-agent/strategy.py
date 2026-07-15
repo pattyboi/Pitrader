@@ -1807,8 +1807,19 @@ class AssetRotationStrategy(Strategy):
         """Record broker-confirmed executions in the Lumibot log."""
         symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
         side = getattr(order, "side", "unknown")
+        # `quantity`/`price` here are the broker trade-update event's own fields,
+        # which for an order that fills across multiple partial executions are
+        # only the size/price of the LAST individual execution, not the order's
+        # total. Use the order's total requested quantity and weighted-average
+        # fill price instead so the log and journal reflect the whole trade.
+        total_quantity = getattr(order, "quantity", None)
+        fill_price = getattr(order, "get_fill_price", lambda: None)()
+        if total_quantity is None:
+            total_quantity = quantity
+        if fill_price is None:
+            fill_price = price
         self.log_message(
-            f"Filled {side} order: {quantity} shares of {symbol} at ${price:.2f}.",
+            f"Filled {side} order: {total_quantity} shares of {symbol} at ${fill_price:.2f}.",
             color="green",
         )
         try:
@@ -1818,8 +1829,8 @@ class AssetRotationStrategy(Strategy):
                 self.get_datetime().date().isoformat(),
                 str(symbol),
                 str(side),
-                float(price),
-                float(quantity),
+                float(fill_price),
+                float(total_quantity),
             )
         except Exception as exc:
             self.log_message(
