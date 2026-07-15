@@ -47,7 +47,9 @@ class AssetRotationStrategy(Strategy):
         "portfolio_oos_min_observations": 10,
         "portfolio_oos_min_net_profit_percent": 0.0,
         "portfolio_round_trip_cost_percent": 0.20,
-        "portfolio_max_holding_days": 1,
+        "portfolio_take_profit_percent": 1.0,
+        "portfolio_stop_loss_percent": 0.5,
+        "portfolio_holding_horizon_max_days": 15,
         "portfolio_risk_posture": "conservative",
     }
 
@@ -1156,8 +1158,14 @@ This automated message is not financial advice.
 
     def _portfolio_held_positions(
         self, managed_symbols: set[str]
-    ) -> dict[str, Decimal] | None:
-        """Return managed long stock positions, or None on broker-read failure."""
+    ) -> tuple[dict[str, Decimal], dict[str, float]] | None:
+        """Return (quantities, avg entry prices) for managed long stock positions.
+
+        None on broker-read failure. The entry price comes straight from the
+        broker's own cost basis (Alpaca's avg_entry_price, surfaced by Lumibot
+        as Position.avg_fill_price) rather than anything tracked locally, so
+        it reflects the true fill price even across restarts or partial fills.
+        """
         try:
             positions = self.get_positions() or []
         except Exception as exc:
@@ -1168,6 +1176,7 @@ This automated message is not financial advice.
             )
             return None
         held: dict[str, Decimal] = {}
+        entry_prices: dict[str, float] = {}
         for position in positions:
             asset = getattr(position, "asset", None)
             symbol = getattr(asset, "symbol", None)
@@ -1182,7 +1191,15 @@ This automated message is not financial advice.
             quantity = self._quantity(position)
             if quantity > 0:
                 held[normalized_symbol] = quantity
-        return held
+                avg_fill_price = getattr(position, "avg_fill_price", None)
+                if avg_fill_price is not None:
+                    try:
+                        price_value = float(avg_fill_price)
+                        if math.isfinite(price_value) and price_value > 0:
+                            entry_prices[normalized_symbol] = price_value
+                    except (TypeError, ValueError):
+                        pass
+        return held, entry_prices
 
     def _market_veto_reason(
         self,
@@ -1626,10 +1643,11 @@ This automated message is not financial advice.
         max_positions = int(self.parameters["portfolio_max_positions"])
 
         managed_symbols = self._managed_portfolio_symbols()
-        held = self._portfolio_held_positions(managed_symbols)
-        if held is None:
+        positions_result = self._portfolio_held_positions(managed_symbols)
+        if positions_result is None:
             report["status"] = "No portfolio trade: account positions were unavailable"
             return
+        held, entry_prices = positions_result
         report["portfolio_holdings"] = (
             ", ".join(f"{symbol}={quantity}" for symbol, quantity in sorted(held.items())) or "none"
         )
@@ -1771,16 +1789,24 @@ This automated message is not financial advice.
             str(entry["to"]) for entry in self.vars.portfolio_pending_rotation.values()
         }
 
-        # Phase 1: exit every holding that reached its holding horizon, not
-        # just the first one. This is a plain single-leg sell -- no paired
-        # buy, no rotation-slot usage -- and is never vetoed, exactly like
-        # completing a pending rotation above.
+        # Phase 1: manage every current holding for profit-taking and loss
+        # containment, not just the first one. This is a plain single-leg
+        # sell -- no paired buy, no rotation-slot usage -- and is never
+        # vetoed, exactly like completing a pending rotation above.
         #
-        # The portfolio signal is validated against next-session returns. Keep
-        # actual holding duration aligned with that measured horizon, including
-        # after restarts. A configured managed holding with no fill record is
-        # conservatively dated today on first observation rather than sold
-        # immediately.
+        # Cost basis is Alpaca's own avg_entry_price (via entry_prices,
+        # sourced in _portfolio_held_positions), not anything tracked
+        # locally, so it's correct across restarts and partial fills.
+        # Take-profit and stop-loss are evaluated every iteration starting
+        # day one -- loss containment should not wait for a day counter to
+        # elapse. A holding sitting between the stop and the target (no
+        # determined gain, no unacceptable loss) is left to run.
+        # PORTFOLIO_HOLDING_HORIZON_MAX_DAYS is the hard backstop so a
+        # stagnant or illiquid symbol -- or one with no cost-basis data at
+        # all -- can't occupy a portfolio slot forever if Phase 3's
+        # replacement logic never finds it a challenger. A configured managed
+        # holding with no fill record is conservatively dated today on first
+        # observation rather than sold immediately.
         holding_dates = dict(self.vars.portfolio_holding_dates)
         today = self.get_datetime().date()
         new_dates = False
@@ -1794,12 +1820,29 @@ This automated message is not financial advice.
                 new_dates = True
         if new_dates:
             self._set_portfolio_holding_dates(holding_dates)
-        maximum_holding_days = int(self.parameters.get("portfolio_max_holding_days", 1))
-        due_symbols = sorted(
-            symbol
-            for symbol in held
-            if self._holding_is_due(holding_dates[symbol], today, maximum_holding_days)
-        )
+        take_profit_percent = float(self.parameters.get("portfolio_take_profit_percent", 1.0))
+        stop_loss_percent = float(self.parameters.get("portfolio_stop_loss_percent", 0.5))
+        backstop_days = int(self.parameters.get("portfolio_holding_horizon_max_days", 15))
+        exit_reasons: dict[str, str] = {}
+        for symbol in held:
+            entry_price = entry_prices.get(symbol)
+            current_price = self.get_last_price(symbol)
+            if (
+                entry_price is not None
+                and current_price is not None
+                and math.isfinite(float(current_price))
+                and float(current_price) > 0
+            ):
+                unrealized_percent = ((float(current_price) - entry_price) / entry_price) * 100.0
+                if unrealized_percent >= take_profit_percent:
+                    exit_reasons[symbol] = f"take-profit reached ({unrealized_percent:+.2f}%)"
+                    continue
+                if unrealized_percent <= -stop_loss_percent:
+                    exit_reasons[symbol] = f"stop-loss reached ({unrealized_percent:+.2f}%)"
+                    continue
+            if self._holding_is_due(holding_dates[symbol], today, backstop_days):
+                exit_reasons[symbol] = f"{backstop_days}-day holding backstop reached"
+        due_symbols = sorted(exit_reasons)
         for source in due_symbols:
             if source in claimed_symbols:
                 continue
@@ -1813,13 +1856,10 @@ This automated message is not financial advice.
                 order_type="market",
                 time_in_force="day",
             )
-            if not self._submit_order_checked(exit_order, f"{source} holding-horizon sell"):
+            if not self._submit_order_checked(exit_order, f"{source} exit sell ({exit_reasons[source]})"):
                 actions.append(f"Portfolio exit rejected: {source} sale was not accepted")
                 continue
-            actions.append(
-                f"Portfolio exit submitted: {source} reached its "
-                f"{maximum_holding_days}-day holding horizon"
-            )
+            actions.append(f"Portfolio exit submitted: {source} {exit_reasons[source]}")
             held_working.pop(source, None)
             claimed_symbols.add(source)
 

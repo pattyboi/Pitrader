@@ -64,10 +64,18 @@ costs. It also runs a chronological walk-forward check: each validation trade
 is selected only from earlier observations, never its own realised return. It
 opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
 historical estimate and the out-of-sample result meet their configured minimums
-with enough observations. Because that validation measures a next-session
-return, the default holding horizon is one trading-day interval; positions are
-sold after `PORTFOLIO_MAX_HOLDING_DAYS` unless a staged replacement sells them
-first. Cash is split evenly among the open slots a given iteration fills.
+with enough observations. Cash is split evenly among the open slots a given
+iteration fills.
+
+Every holding is checked against its own unrealized return each iteration,
+starting the day it's bought (using the broker's own cost basis, not a fixed
+schedule): it's sold as soon as it gains at least `PORTFOLIO_TAKE_PROFIT_PERCENT`
+or drops at least `PORTFOLIO_STOP_LOSS_PERCENT`, whichever comes first. A
+position sitting between those two bounds — no confirmed gain, no unacceptable
+loss — is left alone rather than force-sold on a schedule, unless a staged
+replacement sells it first. As a backstop, `PORTFOLIO_HOLDING_HORIZON_MAX_DAYS`
+force-exits a holding regardless of price once it's been held that long, so a
+stagnant or illiquid symbol can't occupy a portfolio slot forever.
 
 Each daily iteration evaluates every candidate symbol and may submit several
 trades in that same cycle — for example, multiple new positions, an overdue
@@ -381,7 +389,9 @@ chmod 600 config.json
 | `PORTFOLIO_OOS_MIN_OBSERVATIONS` | Minimum walk-forward, prior-only validation trades | `10` |
 | `PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT` | Minimum net average return in walk-forward validation | `0.0` |
 | `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return | `0.20` |
-| `PORTFOLIO_MAX_HOLDING_DAYS` | Maximum holding horizon, aligned to the next-session validation target. Every holding that reaches this horizon exits the same day it becomes due, not just one per day | `1` |
+| `PORTFOLIO_TAKE_PROFIT_PERCENT` | Unrealized gain (vs. the broker's own cost basis) at which a holding is sold, checked every iteration from the day it's bought | `1.0` |
+| `PORTFOLIO_STOP_LOSS_PERCENT` | Unrealized loss (vs. the broker's own cost basis) at which a holding is sold, checked every iteration from the day it's bought | `0.5` |
+| `PORTFOLIO_HOLDING_HORIZON_MAX_DAYS` | Backstop: force-exits a holding after this many days regardless of price, even if neither the take-profit nor stop-loss bound has been hit | `15` |
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
 | `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |

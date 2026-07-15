@@ -187,7 +187,9 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_OOS_MIN_OBSERVATIONS": 10,
         "PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT": 0.0,
         "PORTFOLIO_ROUND_TRIP_COST_PERCENT": 0.20,
-        "PORTFOLIO_MAX_HOLDING_DAYS": 1,
+        "PORTFOLIO_TAKE_PROFIT_PERCENT": 1.0,
+        "PORTFOLIO_STOP_LOSS_PERCENT": 0.5,
+        "PORTFOLIO_HOLDING_HORIZON_MAX_DAYS": 15,
         "PORTFOLIO_AUTONOMOUS_DISCOVERY": False,
         "PORTFOLIO_DISCOVERY_BATCH_SIZE": 12,
         "PORTFOLIO_DISCOVERY_REFRESH_DAYS": 7,
@@ -222,7 +224,9 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_oos_min_observations = int(config["PORTFOLIO_OOS_MIN_OBSERVATIONS"])
     portfolio_oos_min_profit = float(config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"])
     portfolio_round_trip_cost = float(config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"])
-    portfolio_max_holding_days = int(config["PORTFOLIO_MAX_HOLDING_DAYS"])
+    portfolio_take_profit_percent = float(config["PORTFOLIO_TAKE_PROFIT_PERCENT"])
+    portfolio_stop_loss_percent = float(config["PORTFOLIO_STOP_LOSS_PERCENT"])
+    portfolio_holding_horizon_max_days = int(config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"])
     if not isinstance(config["PORTFOLIO_AUTONOMOUS_DISCOVERY"], bool):
         raise TypeError("PORTFOLIO_AUTONOMOUS_DISCOVERY must be true or false")
     discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
@@ -263,8 +267,12 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT must be between 0 and 100")
     if not 0.0 <= portfolio_round_trip_cost <= 10.0:
         raise ValueError("PORTFOLIO_ROUND_TRIP_COST_PERCENT must be between 0 and 10")
-    if not 1 <= portfolio_max_holding_days <= 20:
-        raise ValueError("PORTFOLIO_MAX_HOLDING_DAYS must be between 1 and 20")
+    if not 0.05 <= portfolio_take_profit_percent <= 100.0:
+        raise ValueError("PORTFOLIO_TAKE_PROFIT_PERCENT must be between 0.05 and 100")
+    if not 0.05 <= portfolio_stop_loss_percent <= 100.0:
+        raise ValueError("PORTFOLIO_STOP_LOSS_PERCENT must be between 0.05 and 100")
+    if not 1 <= portfolio_holding_horizon_max_days <= 60:
+        raise ValueError("PORTFOLIO_HOLDING_HORIZON_MAX_DAYS must be between 1 and 60")
     if not 1 <= discovery_batch_size <= 30:
         raise ValueError("PORTFOLIO_DISCOVERY_BATCH_SIZE must be between 1 and 30")
     if not 1 <= discovery_refresh_days <= 90:
@@ -296,7 +304,9 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_OOS_MIN_OBSERVATIONS"] = portfolio_oos_min_observations
     config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"] = portfolio_oos_min_profit
     config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"] = portfolio_round_trip_cost
-    config["PORTFOLIO_MAX_HOLDING_DAYS"] = portfolio_max_holding_days
+    config["PORTFOLIO_TAKE_PROFIT_PERCENT"] = portfolio_take_profit_percent
+    config["PORTFOLIO_STOP_LOSS_PERCENT"] = portfolio_stop_loss_percent
+    config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"] = portfolio_holding_horizon_max_days
     config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] = discovery_batch_size
     config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"] = discovery_refresh_days
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
@@ -561,7 +571,9 @@ def main() -> int:
                 "portfolio_oos_min_observations": config["PORTFOLIO_OOS_MIN_OBSERVATIONS"],
                 "portfolio_oos_min_net_profit_percent": config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"],
                 "portfolio_round_trip_cost_percent": config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"],
-                "portfolio_max_holding_days": config["PORTFOLIO_MAX_HOLDING_DAYS"],
+                "portfolio_take_profit_percent": config["PORTFOLIO_TAKE_PROFIT_PERCENT"],
+                "portfolio_stop_loss_percent": config["PORTFOLIO_STOP_LOSS_PERCENT"],
+                "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
                 "portfolio_holding_state_file": str(BASE_DIR / ".portfolio_holding_state.json"),
                 "portfolio_rotation_state_file": str(BASE_DIR / ".portfolio_rotation_state.json"),
                 "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],

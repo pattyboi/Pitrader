@@ -109,11 +109,13 @@ def test_news_model_keeps_weekend_next_session_return(tmp_path: Path) -> None:
 def test_portfolio_ignores_unmanaged_account_positions() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.get_positions = lambda: [
-        SimpleNamespace(asset=SimpleNamespace(symbol="AAPL", asset_type="stock"), quantity="2"),
-        SimpleNamespace(asset=SimpleNamespace(symbol="SPY", asset_type="stock"), quantity="3"),
+        SimpleNamespace(asset=SimpleNamespace(symbol="AAPL", asset_type="stock"), quantity="2", avg_fill_price="150.0"),
+        SimpleNamespace(asset=SimpleNamespace(symbol="SPY", asset_type="stock"), quantity="3", avg_fill_price="400.0"),
     ]
 
-    assert strategy._portfolio_held_positions({"SPY"}) == {"SPY": 3}
+    held, entry_prices = strategy._portfolio_held_positions({"SPY"})
+    assert held == {"SPY": 3}
+    assert entry_prices == {"SPY": 400.0}
 
 
 def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:
