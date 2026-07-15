@@ -10,13 +10,16 @@ A Lumibot/Alpaca trading agent that runs as a systemd service on a Raspberry Pi.
 
 ## Commands
 
-There are no tests and no linter configured. Python 3.13 runs on the target; deps are in `requirements.txt` (lumibot, alpaca-py, pandas), installed into `.venv/` by the installer.
+The pytest suite in `tests/test_safety.py` is the regression net for the decision logic (exit reasons, position-count math, walk-forward validation, posture adjustments, quote/spread fallbacks) — run it after any strategy change. Decision logic is deliberately extracted into small methods testable on a bare `AssetRotationStrategy.__new__` instance with stubbed collaborators; keep new logic in that shape. No linter is configured. Python 3.13 runs on the target; deps are in `requirements.txt` (lumibot, alpaca-py, pandas, pytest), installed into `.venv/` by the installer.
 
 ```bash
 cd pi-trading-agent
 
 # Install venv + systemd unit, enable and start the service
 sudo ./setup_service.sh
+
+# Run the test suite
+.venv/bin/python -m pytest tests/ -q
 
 # Run in the foreground (uses .venv, reads config.json from the script's own directory)
 .venv/bin/python main.py

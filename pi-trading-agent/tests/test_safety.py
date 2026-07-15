@@ -6,6 +6,8 @@ import logging
 import sqlite3
 import threading
 
+import pytest
+
 from adaptive_news_model import AdaptiveNewsModel
 from congress_context import CongressTradeAnalyzer
 from news_context import NewsContext, WorldEventAnalyzer
@@ -280,6 +282,80 @@ def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
     conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10, "bearish")
 
     assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
+
+
+def _exit_test_strategy(bid_by_symbol: dict[str, float | None]) -> AssetRotationStrategy:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "portfolio_take_profit_percent": 1.0,
+        "portfolio_stop_loss_percent": 0.5,
+        "portfolio_holding_horizon_max_days": 15,
+    }
+    strategy._realizable_sale_price = lambda symbol: bid_by_symbol.get(symbol)
+    return strategy
+
+
+@pytest.mark.parametrize(
+    ("bid", "expected_reason"),
+    [
+        (101.0, "take-profit"),  # +1.00% >= 1.0% target
+        (99.5, "stop-loss"),  # -0.50% <= -0.5% stop
+        (100.4, None),  # between bounds: left to run
+        (99.6, None),  # a loss smaller than the stop: left to run
+    ],
+)
+def test_portfolio_exit_reasons_apply_the_configured_bounds(
+    bid: float, expected_reason: str | None
+) -> None:
+    strategy = _exit_test_strategy({"SPY": bid})
+    today = date(2026, 7, 15)
+
+    reasons = strategy._portfolio_exit_reasons(
+        {"SPY": Decimal("1")}, {"SPY": 100.0}, {"SPY": today.isoformat()}, today
+    )
+
+    if expected_reason is None:
+        assert reasons == {}
+    else:
+        assert expected_reason in reasons["SPY"]
+
+
+def test_portfolio_exit_reasons_backstop_catches_a_stagnant_or_unpriceable_holding() -> None:
+    strategy = _exit_test_strategy({"FLAT": 100.2, "DARK": None})
+    today = date(2026, 7, 15)
+    long_ago = (today - timedelta(days=20)).isoformat()
+
+    reasons = strategy._portfolio_exit_reasons(
+        {"FLAT": Decimal("1"), "DARK": Decimal("1")},
+        {"FLAT": 100.0},  # DARK has no cost basis at all
+        {"FLAT": long_ago, "DARK": long_ago},
+        today,
+    )
+
+    assert "backstop" in reasons["FLAT"]  # between bounds for 20 days: horizon fires
+    assert "backstop" in reasons["DARK"]  # unpriceable: only the horizon can exit it
+
+
+def test_portfolio_exit_reasons_label_a_gain_as_take_profit_even_when_overdue() -> None:
+    strategy = _exit_test_strategy({"SPY": 102.0})
+    today = date(2026, 7, 15)
+
+    reasons = strategy._portfolio_exit_reasons(
+        {"SPY": Decimal("1")}, {"SPY": 100.0}, {"SPY": (today - timedelta(days=30)).isoformat()}, today
+    )
+
+    assert "take-profit" in reasons["SPY"]
+
+
+def test_portfolio_exit_reasons_never_sell_a_fresh_holding_without_cost_basis() -> None:
+    strategy = _exit_test_strategy({"NEW": 100.0})
+    today = date(2026, 7, 15)
+
+    reasons = strategy._portfolio_exit_reasons(
+        {"NEW": Decimal("1")}, {}, {"NEW": today.isoformat()}, today
+    )
+
+    assert reasons == {}
 
 
 def test_optimal_position_count_never_exceeds_the_configured_ceiling() -> None:

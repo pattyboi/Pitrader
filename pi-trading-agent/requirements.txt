@@ -4,3 +4,4 @@ pandas>=2.2,<3.0
 requests>=2.31,<3.0
 anthropic>=0.116,<1.0
 duckdb>=1.2,<2.0
+pytest>=9.0,<10.0

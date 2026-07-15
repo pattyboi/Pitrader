@@ -1418,6 +1418,40 @@ This automated message is not financial advice.
             return None
         return value if math.isfinite(value) and value > 0 else None
 
+    def _portfolio_exit_reasons(
+        self,
+        held: dict[str, Decimal],
+        entry_prices: dict[str, float],
+        holding_dates: dict[str, str],
+        today: date_type,
+    ) -> dict[str, str]:
+        """Decide which holdings exit today, and why, without submitting anything.
+
+        Take-profit and stop-loss compare the broker's cost basis against the
+        realizable (bid-side) price; a holding between those bounds is left to
+        run. The holding-horizon backstop catches everything else -- including
+        a holding whose cost basis or price is unavailable -- so a stagnant or
+        unpriceable symbol can't occupy a slot forever.
+        """
+        take_profit_percent = float(self.parameters.get("portfolio_take_profit_percent", 1.0))
+        stop_loss_percent = float(self.parameters.get("portfolio_stop_loss_percent", 0.5))
+        backstop_days = int(self.parameters.get("portfolio_holding_horizon_max_days", 15))
+        exit_reasons: dict[str, str] = {}
+        for symbol in held:
+            entry_price = entry_prices.get(symbol)
+            current_price = self._realizable_sale_price(symbol)
+            if entry_price is not None and current_price is not None:
+                unrealized_percent = ((current_price - entry_price) / entry_price) * 100.0
+                if unrealized_percent >= take_profit_percent:
+                    exit_reasons[symbol] = f"take-profit reached ({unrealized_percent:+.2f}%)"
+                    continue
+                if unrealized_percent <= -stop_loss_percent:
+                    exit_reasons[symbol] = f"stop-loss reached ({unrealized_percent:+.2f}%)"
+                    continue
+            if self._holding_is_due(holding_dates.get(symbol, today.isoformat()), today, backstop_days):
+                exit_reasons[symbol] = f"{backstop_days}-day holding backstop reached"
+        return exit_reasons
+
     def _portfolio_signal(
         self, symbol: str
     ) -> dict[str, float | int | str | None] | None:
@@ -1605,7 +1639,9 @@ This automated message is not financial advice.
         """How many of today's ranked candidates are worth splitting capital across.
 
         `candidate_edges` is `(expected_profit_percent, return_stdev_percent)`
-        per eligible candidate, already ranked best-edge-first. Scores each
+        per eligible candidate, in the caller's posture-adjusted ranking order
+        -- the order buys actually happen in, so each prefix scored below is
+        exactly the basket that many buys would create. Scores each
         feasible position count n by the Sharpe-like ratio of an equal-weighted,
         n-position basket -- mean edge divided by portfolio risk, where risk
         assumes zero correlation between candidates (equal-weighted variance of
@@ -1839,8 +1875,11 @@ This automated message is not financial advice.
         # settled A-versus-B observations already kept in decision memory.
         asset_a = str(self.parameters["asset_a"]).upper()
         asset_b = str(self.parameters["asset_b"]).upper()
+        # proxy_price is this same asset_b, fetched moments ago for learning;
+        # reusing it keeps the forecast and the learning update on one price
+        # snapshot instead of two reads that could straddle a tick.
         opportunity = self._opportunistic_opportunity(
-            asset_a, asset_b, self.get_last_price(asset_a), self.get_last_price(asset_b), news_context
+            asset_a, asset_b, self.get_last_price(asset_a), proxy_price, news_context
         )
         probability = opportunity.get("probability")
         report.update(
@@ -1912,25 +1951,12 @@ This automated message is not financial advice.
         # Phase 1: manage every current holding for profit-taking and loss
         # containment, not just the first one. This is a plain single-leg
         # sell -- no paired buy, no rotation-slot usage -- and is never
-        # vetoed, exactly like completing a pending rotation above.
-        #
-        # Cost basis is Alpaca's own avg_entry_price (via entry_prices,
-        # sourced in _portfolio_held_positions), not anything tracked
-        # locally, so it's correct across restarts and partial fills.
-        # Compared against the live bid via _realizable_sale_price, not
-        # get_last_price's last *trade* -- a market sell fills against the
-        # bid, and on a sub-$100 position the gap between the two can be
-        # the difference between a real gain and spread noise. Take-profit
-        # and stop-loss are evaluated every iteration starting day one --
-        # loss containment should not wait for a day counter to elapse. A
-        # holding sitting between the stop and the target (no determined
-        # gain, no unacceptable loss) is left to run.
-        # PORTFOLIO_HOLDING_HORIZON_MAX_DAYS is the hard backstop so a
-        # stagnant or illiquid symbol -- or one with no cost-basis data at
-        # all -- can't occupy a portfolio slot forever if Phase 3's
-        # replacement logic never finds it a challenger. A configured managed
-        # holding with no fill record is conservatively dated today on first
-        # observation rather than sold immediately.
+        # vetoed, exactly like completing a pending rotation above. The
+        # decision itself (take-profit / stop-loss against the broker's own
+        # cost basis and the realizable bid-side price, with the holding-
+        # horizon backstop) lives in _portfolio_exit_reasons. A configured
+        # managed holding with no fill record is conservatively dated today
+        # on first observation rather than sold immediately.
         holding_dates = dict(self.vars.portfolio_holding_dates)
         today = self.get_datetime().date()
         new_dates = False
@@ -1944,23 +1970,7 @@ This automated message is not financial advice.
                 new_dates = True
         if new_dates:
             self._set_portfolio_holding_dates(holding_dates)
-        take_profit_percent = float(self.parameters.get("portfolio_take_profit_percent", 1.0))
-        stop_loss_percent = float(self.parameters.get("portfolio_stop_loss_percent", 0.5))
-        backstop_days = int(self.parameters.get("portfolio_holding_horizon_max_days", 15))
-        exit_reasons: dict[str, str] = {}
-        for symbol in held:
-            entry_price = entry_prices.get(symbol)
-            current_price = self._realizable_sale_price(symbol)
-            if entry_price is not None and current_price is not None:
-                unrealized_percent = ((current_price - entry_price) / entry_price) * 100.0
-                if unrealized_percent >= take_profit_percent:
-                    exit_reasons[symbol] = f"take-profit reached ({unrealized_percent:+.2f}%)"
-                    continue
-                if unrealized_percent <= -stop_loss_percent:
-                    exit_reasons[symbol] = f"stop-loss reached ({unrealized_percent:+.2f}%)"
-                    continue
-            if self._holding_is_due(holding_dates[symbol], today, backstop_days):
-                exit_reasons[symbol] = f"{backstop_days}-day holding backstop reached"
+        exit_reasons = self._portfolio_exit_reasons(held, entry_prices, holding_dates, today)
         due_symbols = sorted(exit_reasons)
         for source in due_symbols:
             if source in claimed_symbols:
