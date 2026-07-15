@@ -48,7 +48,21 @@ class MarketOpenLoggingAlpaca(Alpaca):
         self.logger.info(
             "Sleeping until the market opens (%s)", format_market_open_time(market_open)
         )
-        self.sleep(max(0, time_to_open))
+        # Lumibot's own Broker.sleep() is a single uninterruptible time.sleep(),
+        # which can block this thread for hours and made a clean process stop
+        # impossible (systemd's SIGINT/SIGTERM never got noticed; the service
+        # only ever exited via the stop timeout's SIGKILL). Wait on the
+        # executor's stop_event instead, in short slices, so a requested stop
+        # is picked up within a second instead of at the next market open.
+        stop_event = getattr(getattr(strategy, "_executor", None), "stop_event", None)
+        remaining = max(0, time_to_open)
+        if stop_event is None:
+            self.sleep(remaining)
+            return
+        while remaining > 0 and not stop_event.is_set():
+            slice_seconds = min(1.0, remaining)
+            stop_event.wait(slice_seconds)
+            remaining -= slice_seconds
 
 
 def load_config(path: Path) -> dict[str, Any]:
