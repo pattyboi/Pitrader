@@ -60,8 +60,12 @@ symbols in `PORTFOLIO_SYMBOLS`; it does not search the market or add stocks on
 its own. For every symbol it measures the current dip and the average
 next-session return after comparable historical dips. That average is reduced
 by `PORTFOLIO_ROUND_TRIP_COST_PERCENT` to account for estimated entry and exit
-costs. It also runs a chronological walk-forward check: each validation trade
-is selected only from earlier observations, never its own realised return. It
+costs — floored, per symbol, by that symbol's own live bid/ask spread when a
+quote is available, so a thinly traded symbol can't look cheaper to trade
+than it actually is (this matters most on small orders, where the spread is
+a larger share of the target edge). It also runs a chronological
+walk-forward check: each validation trade is selected only from earlier
+observations, never its own realised return. It
 opens up to `PORTFOLIO_MAX_POSITIONS` positions only when both the net
 historical estimate and the out-of-sample result meet their configured minimums
 with enough observations. Cash is split evenly among the open slots a given
@@ -388,7 +392,7 @@ chmod 600 config.json
 | `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum cost-adjusted historical average next-session return; also the minimum replacement advantage | `1.0` |
 | `PORTFOLIO_OOS_MIN_OBSERVATIONS` | Minimum walk-forward, prior-only validation trades | `10` |
 | `PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT` | Minimum net average return in walk-forward validation | `0.0` |
-| `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return | `0.20` |
+| `PORTFOLIO_ROUND_TRIP_COST_PERCENT` | Estimated total entry-and-exit cost deducted from each historical return; used as a floor, not a ceiling — a symbol's own live bid/ask spread overrides it when the spread is wider | `0.20` |
 | `PORTFOLIO_TAKE_PROFIT_PERCENT` | Unrealized gain (vs. the broker's own cost basis) at which a holding is sold, checked every iteration from the day it's bought | `1.0` |
 | `PORTFOLIO_STOP_LOSS_PERCENT` | Unrealized loss (vs. the broker's own cost basis) at which a holding is sold, checked every iteration from the day it's bought | `0.5` |
 | `PORTFOLIO_HOLDING_HORIZON_MAX_DAYS` | Backstop: force-exits a holding after this many days regardless of price, even if neither the take-profit nor stop-loss bound has been hit | `15` |

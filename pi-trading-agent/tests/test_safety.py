@@ -118,6 +118,37 @@ def test_portfolio_ignores_unmanaged_account_positions() -> None:
     assert entry_prices == {"SPY": 400.0}
 
 
+def test_live_spread_percent_reads_bid_ask_from_the_quote() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_quote = lambda symbol: SimpleNamespace(bid=99.0, ask=101.0)
+
+    # (101 - 99) / mid(100) * 100 = 2.0%
+    assert strategy._live_spread_percent("THIN") == 2.0
+
+
+def test_live_spread_percent_is_capped_against_a_bad_print() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_quote = lambda symbol: SimpleNamespace(bid=1.0, ask=50.0)
+
+    assert strategy._live_spread_percent("BAD") == AssetRotationStrategy._PORTFOLIO_LIVE_SPREAD_CAP_PERCENT
+
+
+def test_live_spread_percent_fails_open_on_a_missing_or_invalid_quote() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+
+    strategy.get_quote = lambda symbol: SimpleNamespace(bid=None, ask=101.0)
+    assert strategy._live_spread_percent("NOBID") is None
+
+    strategy.get_quote = lambda symbol: SimpleNamespace(bid=101.0, ask=99.0)  # crossed/invalid
+    assert strategy._live_spread_percent("CROSSED") is None
+
+    def _raise(symbol: str) -> None:
+        raise RuntimeError("data source unavailable")
+
+    strategy.get_quote = _raise
+    assert strategy._live_spread_percent("DOWN") is None
+
+
 def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:
     # The first five results establish a 2% gross edge. The sixth return is
     # then an out-of-sample trade selected from those five prior results.

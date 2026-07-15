@@ -87,6 +87,10 @@ class AssetRotationStrategy(Strategy):
     }
     _FAILED_ORDER_STATUSES = {"cancel", "canceled", "cancelled", "error", "expired", "rejected"}
     _PORTFOLIO_HISTORY_WORKERS = 4
+    # Alpaca's free quote feed is IEX-only, not full NBBO -- a bad or thin
+    # print should never make a symbol's live spread reading look enormous
+    # and swamp the flat cost estimate it is only meant to floor.
+    _PORTFOLIO_LIVE_SPREAD_CAP_PERCENT = 5.0
 
     def initialize(self) -> None:
         """Configure one evaluation per trading day."""
@@ -1352,6 +1356,30 @@ This automated message is not financial advice.
                 outcomes.append(returns[index] - round_trip_cost_percent)
         return outcomes
 
+    def _live_spread_percent(self, symbol: str) -> float | None:
+        """Best-effort live bid/ask spread, as a round-trip cost estimate.
+
+        Returns None on any missing/invalid/one-sided quote so the caller can
+        fail open to the configured flat PORTFOLIO_ROUND_TRIP_COST_PERCENT.
+        Never raises: a quote failure here must not block the whole signal.
+        """
+        try:
+            quote = self.get_quote(symbol)
+        except Exception:
+            return None
+        if quote is None:
+            return None
+        try:
+            bid = float(quote.bid)
+            ask = float(quote.ask)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= bid:
+            return None
+        mid = (bid + ask) / 2.0
+        spread_percent = ((ask - bid) / mid) * 100.0
+        return min(spread_percent, self._PORTFOLIO_LIVE_SPREAD_CAP_PERCENT)
+
     def _portfolio_signal(
         self, symbol: str
     ) -> dict[str, float | int | str | None] | None:
@@ -1392,8 +1420,20 @@ This automated message is not financial advice.
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         if current_dip < threshold or not returns:
             return None
-        round_trip_cost = float(
+        configured_round_trip_cost = float(
             self.parameters.get("portfolio_round_trip_cost_percent", 0.20)
+        )
+        # The configured value is one flat guess applied to every symbol
+        # regardless of liquidity. A live bid/ask spread is a per-symbol
+        # floor under it -- never a full replacement, since Alpaca's free
+        # quote feed is IEX-only -- so a thinly traded discovered symbol
+        # can't look cheaper to trade than it actually is on a sub-$100
+        # order where the spread is a much larger share of the target edge.
+        live_spread = self._live_spread_percent(symbol)
+        round_trip_cost = (
+            max(configured_round_trip_cost, live_spread)
+            if live_spread is not None
+            else configured_round_trip_cost
         )
         net_returns = [value - round_trip_cost for value in returns]
         walk_forward_returns = self._walk_forward_net_returns(
