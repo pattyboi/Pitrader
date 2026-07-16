@@ -34,6 +34,34 @@ class MarketOpenLoggingAlpaca(Alpaca):
     unchanged while including the next calendar-derived market-open time.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._market_hours_cache: dict[tuple, Any] = {}
+
+    def market_hours(self, market="NASDAQ", close=True, next=False, date=None):
+        """Cache Lumibot's per-call market-calendar recomputation.
+
+        Broker.market_hours() (lumibot/brokers/broker.py) rebuilds the whole
+        trading calendar -- including the NYSE holiday list, which pandas
+        regenerates via a slow dateutil.relativedelta loop -- from scratch on
+        every call, with no memoization upstream. _handle_lifecycle_methods()
+        calls this (via market_close_time()) on every tick of Lumibot's live
+        loop, which only sleeps 1 second between ticks and runs continuously
+        around the clock regardless of this strategy's own "1D" sleeptime.
+        That pegged a Pi core at ~33% CPU 24/7 recomputing an answer that
+        cannot change within a calendar day. Cache by (effective date,
+        market, close, next); entries from a previous day are dropped since
+        they're never queried again.
+        """
+        effective_date = (date if date is not None else datetime.now(timezone.utc)).date()
+        cache_key = (effective_date, market, close, next)
+        cache = self._market_hours_cache
+        for stale_key in [key for key in cache if key[0] != effective_date]:
+            del cache[stale_key]
+        if cache_key not in cache:
+            cache[cache_key] = super().market_hours(market=market, close=close, next=next, date=date)
+        return cache[cache_key]
+
     def _await_market_to_open(self, timedelta=None, strategy=None):
         if self.is_market_open():
             return
@@ -175,10 +203,9 @@ def load_config(path: Path) -> dict[str, Any]:
     if lookback_days < 2:
         raise ValueError("RECENT_HIGH_LOOKBACK_DAYS must be at least 2")
 
-    # Portfolio mode is the default. Autonomous discovery, when also enabled,
-    # expands the configured seed watchlist through a bounded scan.
+    # Autonomous discovery, when enabled, expands the configured seed
+    # watchlist through a bounded scan.
     portfolio_defaults = {
-        "PORTFOLIO_ENABLED": True,
         "PORTFOLIO_SYMBOLS": [asset_a, asset_b],
         "PORTFOLIO_MAX_POSITIONS": 1,
         "PORTFOLIO_ANALYSIS_DAYS": 252,
@@ -193,22 +220,16 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_AUTONOMOUS_DISCOVERY": False,
         "PORTFOLIO_DISCOVERY_BATCH_SIZE": 12,
         "PORTFOLIO_DISCOVERY_REFRESH_DAYS": 7,
+        "PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS": 5.0,
+        "PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME": 100000,
         "PORTFOLIO_FRACTIONAL_SHARES": True,
         "PORTFOLIO_CASH_RESERVE_DOLLARS": 2.0,
         "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
         "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
         "PORTFOLIO_RISK_POSTURE": "conservative",
-        "WSB_CONTEXT_ENABLED": False,
-        "WSB_DISCOVERY_ENABLED": False,
-        "WSB_DISCOVERY_MAX_SYMBOLS": 10,
-        "WSB_CONTEXT_TIMEOUT_SECONDS": 10.0,
-        "CONGRESS_CONTEXT_ENABLED": False,
-        "CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0,
     }
     for key, default in portfolio_defaults.items():
         config.setdefault(key, default)
-    if not isinstance(config["PORTFOLIO_ENABLED"], bool):
-        raise TypeError("PORTFOLIO_ENABLED must be true or false")
     raw_symbols = config["PORTFOLIO_SYMBOLS"]
     if not isinstance(raw_symbols, list):
         raise TypeError("PORTFOLIO_SYMBOLS must be a JSON array of symbols")
@@ -231,17 +252,13 @@ def load_config(path: Path) -> dict[str, Any]:
         raise TypeError("PORTFOLIO_AUTONOMOUS_DISCOVERY must be true or false")
     discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
     discovery_refresh_days = int(config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"])
+    discovery_min_price = float(config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"])
+    discovery_min_avg_volume = float(config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"])
     if not isinstance(config["PORTFOLIO_FRACTIONAL_SHARES"], bool):
         raise TypeError("PORTFOLIO_FRACTIONAL_SHARES must be true or false")
     portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
     portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
     opportunity_min_probability = float(config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"])
-    if not isinstance(config["WSB_CONTEXT_ENABLED"], bool):
-        raise TypeError("WSB_CONTEXT_ENABLED must be true or false")
-    if not isinstance(config["WSB_DISCOVERY_ENABLED"], bool):
-        raise TypeError("WSB_DISCOVERY_ENABLED must be true or false")
-    wsb_max_symbols = int(config["WSB_DISCOVERY_MAX_SYMBOLS"])
-    wsb_timeout = float(config["WSB_CONTEXT_TIMEOUT_SECONDS"])
     # Autonomous discovery expands the daily candidate universe beyond the
     # static seed list, so the cap on concurrent positions shouldn't be tied
     # to len(portfolio_symbols) when discovery can supply the rest. Without
@@ -277,6 +294,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("PORTFOLIO_DISCOVERY_BATCH_SIZE must be between 1 and 30")
     if not 1 <= discovery_refresh_days <= 90:
         raise ValueError("PORTFOLIO_DISCOVERY_REFRESH_DAYS must be between 1 and 90")
+    if not 0.0 <= discovery_min_price <= 1000.0:
+        raise ValueError("PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS must be between 0 and 1000")
+    if not 0.0 <= discovery_min_avg_volume <= 100_000_000:
+        raise ValueError("PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME must be between 0 and 100000000")
     if not 0.0 <= portfolio_cash_reserve <= 1000.0:
         raise ValueError("PORTFOLIO_CASH_RESERVE_DOLLARS must be between 0 and 1000")
     if not 1.0 <= portfolio_min_order <= 1000.0:
@@ -287,15 +308,6 @@ def load_config(path: Path) -> dict[str, Any]:
     if risk_posture not in ("conservative", "risky"):
         raise ValueError("PORTFOLIO_RISK_POSTURE must be conservative or risky")
     config["PORTFOLIO_RISK_POSTURE"] = risk_posture
-    if not 1 <= wsb_max_symbols <= 20:
-        raise ValueError("WSB_DISCOVERY_MAX_SYMBOLS must be between 1 and 20")
-    if not 1.0 <= wsb_timeout <= 30.0:
-        raise ValueError("WSB_CONTEXT_TIMEOUT_SECONDS must be between 1 and 30")
-    if not isinstance(config["CONGRESS_CONTEXT_ENABLED"], bool):
-        raise TypeError("CONGRESS_CONTEXT_ENABLED must be true or false")
-    congress_timeout = float(config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"])
-    if not 1.0 <= congress_timeout <= 30.0:
-        raise ValueError("CONGRESS_CONTEXT_TIMEOUT_SECONDS must be between 1 and 30")
     config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
     config["PORTFOLIO_MAX_POSITIONS"] = portfolio_max_positions
     config["PORTFOLIO_ANALYSIS_DAYS"] = portfolio_analysis_days
@@ -309,12 +321,11 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"] = portfolio_holding_horizon_max_days
     config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] = discovery_batch_size
     config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"] = discovery_refresh_days
+    config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"] = discovery_min_price
+    config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"] = discovery_min_avg_volume
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
     config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
     config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
-    config["WSB_DISCOVERY_MAX_SYMBOLS"] = wsb_max_symbols
-    config["WSB_CONTEXT_TIMEOUT_SECONDS"] = wsb_timeout
-    config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"] = congress_timeout
 
     if not isinstance(config["EMAIL_REPORT_ENABLED"], bool):
         raise TypeError("EMAIL_REPORT_ENABLED must be true or false")
@@ -561,8 +572,6 @@ def main() -> int:
                 "email_to_address": config["EMAIL_TO_ADDRESS"],
                 "email_use_tls": config["EMAIL_USE_TLS"],
                 "email_state_file": str(BASE_DIR / ".last_email_report"),
-                "rotation_state_file": str(BASE_DIR / ".rotation_state.json"),
-                "portfolio_enabled": config["PORTFOLIO_ENABLED"],
                 "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
                 "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
                 "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
@@ -579,19 +588,14 @@ def main() -> int:
                 "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
                 "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
                 "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
+                "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
+                "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
                 "portfolio_universe_state_file": str(BASE_DIR / ".autonomous_universe.json"),
                 "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
                 "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
                 "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
                 "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
                 "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
-                "wsb_context_enabled": config["WSB_CONTEXT_ENABLED"],
-                "wsb_discovery_enabled": config["WSB_DISCOVERY_ENABLED"],
-                "wsb_discovery_max_symbols": config["WSB_DISCOVERY_MAX_SYMBOLS"],
-                "wsb_context_timeout_seconds": config["WSB_CONTEXT_TIMEOUT_SECONDS"],
-                "wsb_context_state_file": str(BASE_DIR / ".wsb_context_snapshot.json"),
-                "congress_context_enabled": config["CONGRESS_CONTEXT_ENABLED"],
-                "congress_context_timeout_seconds": config["CONGRESS_CONTEXT_TIMEOUT_SECONDS"],
                 "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
                 "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
                 "news_max_articles": config["NEWS_MAX_ARTICLES"],
@@ -638,11 +642,10 @@ def main() -> int:
         trader = Trader()
         trader.add_strategy(strategy)
         logger.info(
-            "Starting %s trading for %s/%s%s",
+            "Starting %s portfolio trading (proxy assets %s/%s)",
             "paper" if config["IS_PAPER_TRADING"] else "LIVE",
             config["ASSET_A"],
             config["ASSET_B"],
-            " (portfolio mode enabled)" if config["PORTFOLIO_ENABLED"] else "",
         )
         trader.run_all()
         return 0

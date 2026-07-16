@@ -1,12 +1,11 @@
 # Raspberry Pi Trading Agent
 
-This project runs a small Lumibot strategy against an Alpaca account. By
-default it runs **portfolio mode**: it watches a small list of symbols for a
-configured percentage dip from their recent high and, when a comparable
-historical dip has reliably paid off, rotates cash into the best-qualifying
-one. A separate, simpler **asset-to-asset rotation** mode (Asset A → Asset B)
-is also available on its own, and portfolio mode also runs it internally as
-one labelled opportunity among its candidates.
+This project runs a small Lumibot strategy against an Alpaca account. It runs
+**portfolio mode**: it watches a small list of symbols for a configured
+percentage dip from their recent high and, when a comparable historical dip
+has reliably paid off, rotates cash into the best-qualifying one. It also
+runs a labelled Asset A → Asset B "Opportunistic Opportunity" check
+internally as one candidate among the others.
 
 Start with Alpaca paper trading. Paper trading uses simulated money and is the
 appropriate place to learn how the agent behaves. Do not enable live trading
@@ -22,7 +21,6 @@ understand the risks.
 
 - [How the strategy trades](#how-the-strategy-trades)
   - [Portfolio mode (default)](#portfolio-mode-default)
-  - [Asset-to-asset rotation mechanics](#asset-to-asset-rotation-mechanics)
 - [Project files](#project-files)
 - [Quick start](#quick-start)
   - [What you need](#what-you-need)
@@ -35,8 +33,6 @@ understand the risks.
   - [Daily email report](#daily-email-report)
   - [World-event and news awareness](#world-event-and-news-awareness)
   - [Local symbol cross-reference](#local-symbol-cross-reference)
-  - [WallStreetBets context and discovery](#wallstreetbets-context-and-discovery)
-  - [Congressional-trading context](#congressional-trading-context)
   - [LLM news assessment](#llm-news-assessment)
   - [Adaptive news learning](#adaptive-news-learning)
   - [Decision memory: learning from its own rotations](#decision-memory-learning-from-its-own-rotations)
@@ -114,44 +110,43 @@ that ranking reads the same observations the agent already collects, without
 ever changing `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` itself or which
 candidates clear it in the first place. `conservative` favors a symbol with a
 steadier history — it penalizes return variance and a negative news-score day
-harder, and ignores WallStreetBets mentions as noise. `risky` favors raw
-historical edge — it barely discounts variance or a bad-news day, and adds a
-small bonus when a candidate is currently WSB-mentioned with bullish
-sentiment (a bearish WSB read is a small penalty either way). The adjustment
-is capped at ±3 percentage points, so it can reorder which qualifying
-candidate looks best and which holding looks weakest, but it can never turn a
-trade that fails the minimum-profit floor into one that passes.
+harder. `risky` favors raw historical edge — it barely discounts variance or a
+bad-news day. The adjustment is capped at ±3 percentage points, so it can
+reorder which qualifying candidate looks best and which holding looks
+weakest, but it can never turn a trade that fails the minimum-profit floor
+into one that passes.
 
-Replacements are staged like the A/B rotation described below: the old
-position sells first, the replacement is bought as soon as the sale fills
-(only its sale budget is spent), and the staged state clears only when the
-replacement purchase itself fills, so restarts, rejections, and network drops
-cannot strand the cash. Several replacements can be staged concurrently in the
-same iteration, each tracked and restart-safe independently — a crash or
-restart mid-rotation reconciles every staged replacement on its own, not just
-one. The strategy manages only symbols explicitly listed in
-`PORTFOLIO_SYMBOLS` plus discovery symbols it previously persisted after they
-qualified; it never adopts or sells unrelated stocks in the same Alpaca
-account. Managed holdings always stay in the daily evaluation universe, so a
-position bought by the strategy can never become invisible to it. The
-world-event keyword guard, the optional LLM assessment, and the
-mature adaptive-news forecast can each veto a *new* portfolio purchase or
-replacement exactly as they veto an A/B rotation; completing an in-flight
+Replacements are staged in two steps: the old position sells first, the
+replacement is bought as soon as the sale fills (only its sale budget is
+spent), and the staged state clears only when the replacement purchase
+itself fills, so restarts, rejections, and network drops cannot strand the
+cash. Several replacements can be staged concurrently in the same iteration,
+each tracked and restart-safe independently — a crash or restart mid-rotation
+reconciles every staged replacement on its own, not just one. The strategy
+manages only symbols explicitly listed in `PORTFOLIO_SYMBOLS` plus discovery
+symbols it previously persisted after they qualified; it never adopts or
+sells unrelated stocks in the same Alpaca account. Managed holdings always
+stay in the daily evaluation universe, so a position bought by the strategy
+can never become invisible to it. The world-event keyword guard, the
+optional LLM assessment, and the mature adaptive-news forecast can each veto
+a *new* portfolio purchase or replacement; completing an in-flight
 replacement is never vetoed. This estimated historical return is not a real or
 guaranteed profit; it is a filter for paper-trading and must be validated before
 any live use.
 
-Within portfolio mode, the A/B rotation mechanics described below are
-evaluated separately as an **Opportunistic Opportunity**. When Asset B has
-dipped and Asset A is held, the agent uses settled prior A/B observations to
-estimate the chance that B will beat A next session. Its probability is
-Laplace-smoothed: `(wins + 1) / (prior observations + 2)`. It can rotate A
-into B only after decision memory is mature, the predicted B-minus-A edge
-meets the normal profit threshold, and the probability meets
-`PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by default). It is reported
-separately from ordinary portfolio candidates, so it does not turn the two
-systems into interchangeable ranking signals. It is evaluated exactly once
-per day, as a single decision made before the ordinary per-symbol pass
+Within portfolio mode, an Asset A → Asset B pair (`ASSET_A`/`ASSET_B` in
+config) is evaluated separately every iteration as an **Opportunistic
+Opportunity**: when Asset B has dipped and Asset A is held, the agent uses
+settled prior A/B observations to estimate the chance that B will beat A next
+session. Its probability is Laplace-smoothed: `(wins + 1) / (prior
+observations + 2)`. It can rotate A into B only after decision memory is
+mature, the predicted B-minus-A edge meets the normal profit threshold, and
+the probability meets `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` (55% by
+default). If it fires, the sale of Asset A and purchase of Asset B are staged
+the same restart-safe two-step way as an ordinary replacement above. It is
+reported separately from ordinary portfolio candidates, so it does not turn
+the two systems into interchangeable ranking signals. It is evaluated exactly
+once per day, as a single decision made before the ordinary per-symbol pass
 described above, and it never competes for one of that pass's
 `PORTFOLIO_MAX_POSITIONS` slots. When it fires, Asset A and Asset B are
 excluded from ordinary building or replacement for the rest of that same
@@ -167,61 +162,28 @@ fractional trading for the account and symbol.
 `PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
 uses the Alpaca asset directory (the paper or live host matching the
 configured trading mode) to rotate through a small batch of active, tradable
-US-equity symbols each day. A symbol becomes part of the persisted learned
-watchlist only after it passes the same historical-dip criteria; it is not
-traded merely because Alpaca lists it. Currently held symbols are re-confirmed
-in that learned list every day, so a holding is never trimmed out of the
-universe while it is still owned. The market-wide news guard remains in force.
-Discovery failure is fail-safe: the agent falls back to the static watchlist
-and places no discovery-driven order.
+US-equity symbols each day. A discovered symbol is also checked, every day it
+is evaluated, against `PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS` and
+`PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME` — a low-priced or thinly traded symbol is
+dropped before the historical-dip criteria are even considered, since a small
+account is more exposed to a wide spread and a stale quote. This same floor
+also applies to the static watchlist and current holdings, since it reuses
+the price/volume data already fetched for the dip signal rather than a
+separate pass — a holding whose liquidity later collapses simply stops being
+reconsidered for top-ups (its take-profit/stop-loss exit is unaffected and can
+still sell it on schedule). A symbol becomes part of the persisted learned
+watchlist only after it passes both the liquidity floor and the historical-dip
+criteria; it is not traded merely because Alpaca lists it. Currently held
+symbols are re-confirmed in that learned list every day, so a holding is never
+trimmed out of the universe while it is still owned. The market-wide news
+guard remains in force. Discovery failure is fail-safe: the agent falls back
+to the static watchlist and places no discovery-driven order.
 
-Enable both settings only after observing the behavior in paper trading:
+Enable discovery only after observing the behavior in paper trading:
 
 ```json
-"PORTFOLIO_ENABLED": true,
 "PORTFOLIO_AUTONOMOUS_DISCOVERY": true
 ```
-
-### Asset-to-asset rotation mechanics
-
-Set `PORTFOLIO_ENABLED` to `false` to run this as the entire strategy instead
-of one signal inside portfolio mode. The default configuration uses:
-
-- Asset A: `SPY`
-- Asset B: `QQQ`
-- Dip threshold: `5%`
-- Recent-high window: `20` daily bars
-
-For example, suppose QQQ's highest daily high during the selected window was
-`$500`. A 5% dip level is `$475`:
-
-```text
-Dip percentage = (recent high - current price) / recent high × 100
-Dip percentage = ($500 - $475) / $500 × 100 = 5%
-```
-
-If QQQ is at or below that level and the account owns SPY, the agent performs
-this sequence:
-
-1. Submit a market order to sell the entire long SPY position.
-2. Wait for Alpaca to confirm that the sale filled.
-3. Read the available cash and current QQQ price.
-4. Submit a market order for the maximum QQQ quantity (fractional by default)
-   that roughly 99% of the available cash can purchase. About 1% is held back,
-   plus the configured cash reserve, so a small upward price move between the
-   quote and the fill cannot cause the order to be rejected or overspend the
-   account.
-5. Leave the safety buffer, the cash reserve, and anything below the minimum
-   order amount unused.
-
-The rotation is tracked in a small state file, so a reboot, crash, or rejected
-order between the sale and the purchase does not strand the cash: the agent
-reconciles its state against actual positions and open orders on the next
-evaluation and finishes the rotation.
-
-The agent does **not** automatically create the initial Asset A position. It
-also does not rotate from Asset B back into Asset A. After a completed A-to-B
-rotation, it will take no further rotation action unless Asset A is held again.
 
 ## Project files
 
@@ -236,8 +198,7 @@ pi-trading-agent/
 ├── trade_memory.py      DuckDB journal and learning from past rotation signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
-├── congress_context.py Public STOCK Act disclosure context (research-only)
-├── wsb_context.py      Public AltIndex WallStreetBets context and discovery
+├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
 ├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
 ├── strategy.py         Daily dip and rotation logic
 └── setup_service.sh    Virtual environment and systemd installer
@@ -253,11 +214,10 @@ snapshots, decisions, and fills (never credentials or balances).
 On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
 requiring a DuckDB extension download. The local symbol cross-reference keeps
 its own small DuckDB database, `.symbol_reference.duckdb`.
-`.rotation_state.json` remembers a rotation that is partway through (sold
-Asset A, not yet bought Asset B) so restarts cannot strand the cash. Portfolio
-mode keeps its own equivalents: `.portfolio_rotation_state.json` for a staged
-replacement and `.autonomous_universe.json` for the discovery cursor and
-learned watchlist.
+`.portfolio_rotation_state.json` remembers a staged replacement (sold one
+symbol, not yet bought its replacement) so restarts cannot strand the cash,
+and `.autonomous_universe.json` tracks the discovery cursor and learned
+watchlist.
 
 ## Quick start
 
@@ -397,7 +357,6 @@ chmod 600 config.json
 | `ASSET_B` | Asset whose dip is measured and purchased | `"QQQ"` |
 | `DIP_THRESHOLD_PERCENT` | Required fall from the recent high | `5.0` |
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
-| `PORTFOLIO_ENABLED` | Enables the default watchlist-based portfolio mode | `true` |
 | `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
 | `PORTFOLIO_MAX_POSITIONS` | Ceiling on simultaneous portfolio holdings and on how many trades one iteration can act on; use `1` for a ~$50 account. The actual number used each iteration is this value or the capital/edge-optimal count, whichever is smaller — see "How the strategy trades" above. Validated against the length of `PORTFOLIO_SYMBOLS` unless `PORTFOLIO_AUTONOMOUS_DISCOVERY` is `true`, in which case discovery can supply the rest of the candidate pool | `1` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
@@ -412,15 +371,13 @@ chmod 600 config.json
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
 | `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
+| `PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS` | Minimum last price for a symbol to stay in the evaluated universe; `0` disables | `5.0` |
+| `PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME` | Minimum recent average daily share volume for a symbol to stay in the evaluated universe; `0` disables | `100000` |
 | `PORTFOLIO_FRACTIONAL_SHARES` | Allows decimal-share market orders, needed for small balances | `true` |
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
-| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news, ignores WSB hype); `risky` favors raw historical edge and leans into WSB-bullish mentions. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
-| `WSB_CONTEXT_ENABLED` | Reports public AltIndex WallStreetBets mentions for monitored symbols | `false` |
-| `WSB_DISCOVERY_ENABLED` | Adds top public WSB symbols to the portfolio research universe | `false` |
-| `WSB_DISCOVERY_MAX_SYMBOLS` | Maximum WSB symbols evaluated per cycle | `10` |
-| `WSB_CONTEXT_TIMEOUT_SECONDS` | Maximum wait for the public tracker page | `10.0` |
+| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news harder); `risky` favors raw historical edge. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -443,8 +400,6 @@ chmod 600 config.json
 | `NEWS_SCORE_REFINEMENT_ENABLED` | Applies recency decay and duplicate-event dampening to the keyword score; changes its exact value, so off by default | `false` |
 | `SYMBOL_REFERENCE_ENABLED` | Cross-checks Alpaca's per-article symbol tags against a second source before trusting them for per-symbol ranking | `true` |
 | `SYMBOL_REFERENCE_REFRESH_DAYS` | Days between local symbol-mapping refreshes | `7` |
-| `CONGRESS_CONTEXT_ENABLED` | Adds Kadoa public disclosure context to logs/email; never affects orders | `false` |
-| `CONGRESS_CONTEXT_TIMEOUT_SECONDS` | Maximum wait for the public Kadoa dataset | `10.0` |
 | `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
 | `DECISION_MEMORY_BLOCK_ENABLED` | Allows mature decision memory to veto a rotation | `false` |
 | `DECISION_MEMORY_MIN_OBSERVATIONS` | Comparable dip signals needed before a forecast | `40` |
@@ -556,9 +511,7 @@ trading. When enabled, the agent attempts to send one summary after its daily
 market evaluation. The report includes:
 
 - Evaluation date and time.
-- Asset A and Asset B symbols, prices, quantities, recent high, and calculated
-  dip when available (A/B mode), or current holdings, signal candidates, and
-  discovered symbols (portfolio mode).
+- Current holdings, signal candidates, and discovered symbols.
 - The configured dip threshold.
 - News, LLM, and adaptive-learning summaries.
 - The action taken or the reason no action was taken.
@@ -762,49 +715,6 @@ trusts Alpaca's raw article tags unfiltered — exactly today's behavior.
 ```json
 "SYMBOL_REFERENCE_ENABLED": true,
 "SYMBOL_REFERENCE_REFRESH_DAYS": 7
-```
-
-### WallStreetBets context and discovery
-
-AltIndex publishes a public tracker of WallStreetBets ticker mentions and
-sentiment from the preceding 24 hours. Enable `WSB_CONTEXT_ENABLED` to add
-matching mentions to the log and daily email. Enable
-`WSB_DISCOVERY_ENABLED` to add the tracker’s top symbols to that day’s
-portfolio research universe; symbols still need to pass the existing price
-history, walk-forward, risk, and order checks before they can be bought.
-The agent fetches one snapshot during initialization before trade evaluations,
-persists it in `.wsb_context_snapshot.json`, and reuses it for 24 hours. It
-does not repeatedly poll AltIndex during the day.
-
-```json
-"WSB_CONTEXT_ENABLED": true,
-"WSB_DISCOVERY_ENABLED": true,
-"WSB_DISCOVERY_MAX_SYMBOLS": 10,
-"WSB_CONTEXT_TIMEOUT_SECONDS": 10.0
-```
-
-WSB data is not a buy signal and never changes position size or bypasses the
-validated portfolio filters. If the tracker cannot be reached or its public
-markup changes, the agent fails open and evaluates its regular universe.
-
-### Congressional-trading context
-
-When enabled, the agent retrieves Kadoa's open-source ticker summary assembled
-from House, Senate, and executive-branch STOCK Act disclosures. For each asset
-being evaluated it reports the disclosed trade count, unique filers, purchases,
-and sales in the log and daily email.
-
-This is deliberately **research context only**. STOCK Act reports can be filed
-well after the transaction, and Kadoa's aggregate ticker file does not turn a
-disclosure into a timely recommendation. It cannot create a trade, choose a
-symbol, change order size, or veto a price-based decision. If Kadoa or GitHub
-is unavailable, the agent records the failure and continues normally.
-
-Enable it after reviewing the delayed-data limitation:
-
-```json
-"CONGRESS_CONTEXT_ENABLED": true,
-"CONGRESS_CONTEXT_TIMEOUT_SECONDS": 10.0
 ```
 
 ### LLM news assessment
@@ -1045,27 +955,24 @@ and starts clean rather than trusting damaged observations.
 
 ### Understanding common log messages
 
-`Starting paper trading for SPY/QQQ`
+`Starting paper portfolio trading (proxy assets SPY/QQQ)`
 
 : The configuration loaded successfully and the broker lifecycle started.
 
-`SPY=$... (... shares), QQQ=$... (... shares), ...-day high=$..., dip=...%`
+`Opportunistic Opportunity submitted: SPY to QQQ ...`
 
-: The daily evaluation succeeded. This message reports both prices and
-positions, the recent high, and the calculated dip.
+: Asset B (the configured `ASSET_B`) met the Opportunistic Opportunity's
+criteria and the agent submitted the sale of Asset A.
 
-`Dip signal triggered. Submitted market sale ...`
+`Filled sell order: ... shares of SPY at $....`
 
-: Asset B met the threshold and the agent submitted the sale of Asset A.
+: Alpaca confirmed a sale (either an ordinary portfolio exit/replacement or
+the Opportunistic Opportunity's Asset A leg).
 
-`Filled sell order ...`
+`Portfolio rotation complete (...): the ... purchase filled.`
 
-: Alpaca confirmed the Asset A sale.
-
-`Submitted market buy ...`
-
-: The agent submitted the maximum whole-share Asset B purchase supported by
-the available cash.
+: The replacement purchase (ordinary or Opportunistic Opportunity) filled,
+completing the staged two-step rotation.
 
 `Price data unavailable ... retrying next cycle`
 
@@ -1237,22 +1144,26 @@ copied incorrectly, regenerate the key pair in Alpaca and update both values.
 This can be correct. Check all of these conditions:
 
 - The market is in an appropriate trading session.
-- Asset B's calculated dip meets or exceeds the configured threshold.
-- The account owns a positive long quantity of Asset A.
+- At least one candidate's cost-adjusted historical dip signal meets
+  `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and the out-of-sample minimums.
+- There is spendable cash of at least `PORTFOLIO_MIN_ORDER_DOLLARS`.
 - There is no unresolved order already pending at the broker.
 - The symbols have current and historical data.
 
-The agent does not buy Asset A for you.
+The agent does not buy an initial position for you; it only rotates cash it
+already holds into a qualifying candidate.
 
-### Asset A sold but Asset B was not bought
+### A symbol was sold but its replacement was not bought
 
 Review the logs and Alpaca order activity first. A connection failure or missing
 price immediately after the sale can delay the purchase until the next strategy
-cycle. Insufficient cash for one whole Asset B share also prevents a purchase.
-The pending rotation is stored in `.rotation_state.json` and retried
-automatically on the next evaluation, including after a rejected order or a
-reboot. Do not manually create a duplicate order until you have checked
-Alpaca's open, filled, rejected, and canceled orders.
+cycle. Insufficient settled cash for the replacement's minimum order size also
+prevents a purchase. The pending rotation is stored in
+`.portfolio_rotation_state.json` (this covers both an ordinary portfolio
+replacement and the Opportunistic Opportunity's Asset A → Asset B swap) and
+retried automatically on the next evaluation, including after a rejected
+order or a reboot. Do not manually create a duplicate order until you have
+checked Alpaca's open, filled, rejected, and canceled orders.
 
 ### Dependency installation fails
 

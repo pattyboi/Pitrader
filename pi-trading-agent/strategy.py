@@ -20,8 +20,6 @@ from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
-from congress_context import CongressContext, CongressTradeAnalyzer
-from wsb_context import WSBContext, WallStreetBetsAnalyzer, WallStreetBetsSnapshot
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 from symbol_reference import SymbolReference
 
@@ -37,13 +35,9 @@ class AssetRotationStrategy(Strategy):
         "email_report_enabled": False,
         "news_context_enabled": True,
         "news_learning_enabled": True,
-        "congress_context_enabled": False,
-        "wsb_context_enabled": False,
-        "wsb_discovery_enabled": False,
         "llm_news_enabled": False,
         "decision_memory_enabled": True,
         "decision_memory_block_enabled": False,
-        "portfolio_enabled": True,
         "portfolio_oos_min_observations": 10,
         "portfolio_oos_min_net_profit_percent": 0.0,
         "portfolio_round_trip_cost_percent": 0.20,
@@ -59,17 +53,14 @@ class AssetRotationStrategy(Strategy):
 
     # How strongly the risky/conservative reasoning pattern reshapes a
     # symbol's historical edge in _posture_adjusted_edge: conservative leans
-    # on consistency (penalizing variance and bad-news days harder, ignoring
-    # WSB hype), risky leans on raw edge (barely discounting variance or
-    # negative news, and leaning into WSB-bullish momentum). These never
-    # change PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself, only which
-    # already-qualifying candidate looks best and which holding looks
+    # on consistency (penalizing variance and bad-news days harder), risky
+    # leans on raw edge (barely discounting variance or negative news).
+    # These never change PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself, only
+    # which already-qualifying candidate looks best and which holding looks
     # weakest.
     _POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
     _POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
     _POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
-    _POSTURE_WSB_BULLISH_BONUS = {"conservative": 0.0, "risky": 0.25}
-    _POSTURE_WSB_BEARISH_PENALTY = {"conservative": 0.20, "risky": 0.05}
     _POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
 
     # Order statuses that mean an order can no longer fill. Anything else is
@@ -100,27 +91,11 @@ class AssetRotationStrategy(Strategy):
         self._symbol_reference_refresh_lock = threading.Lock()
         self._symbol_reference_pending_symbols: set[str] = set()
         self._symbol_reference_refresh_running = False
-        self.vars.pending_rotation = self._load_pending_rotation()
         # Historical bars are fetched during the first evaluation, after the
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
         self.vars.portfolio_holding_dates = self._load_portfolio_holding_dates()
-        if self.vars.pending_rotation and bool(self.parameters.get("portfolio_enabled", False)):
-            # The A/B rotation flag is meaningless in portfolio mode and the
-            # portfolio branch never reconciles it; clear it so a later switch
-            # back to A/B mode starts from a truthful state.
-            self._set_pending_rotation(False)
-            self.log_message(
-                "Cleared a stale A/B rotation flag; portfolio mode is active.",
-                color="yellow",
-            )
-        if self.vars.pending_rotation:
-            self.log_message(
-                "Restored an in-progress rotation from disk; it will be "
-                "reconciled on the next trading iteration.",
-                color="yellow",
-            )
         if self.vars.portfolio_pending_rotation:
             pending = self.vars.portfolio_pending_rotation
             summary = ", ".join(
@@ -138,42 +113,6 @@ class AssetRotationStrategy(Strategy):
         self._refresh_symbol_reference(
             [str(symbol).strip().upper() for symbol in self.parameters.get("portfolio_symbols", [])]
         )
-        self._refresh_wsb_snapshot_before_trading()
-
-    def _rotation_state_path(self) -> Path | None:
-        raw = self.parameters.get("rotation_state_file")
-        return Path(str(raw)) if raw else None
-
-    def _load_pending_rotation(self) -> bool:
-        """Restore the in-progress rotation flag after a restart."""
-        path = self._rotation_state_path()
-        if path is None or not path.exists():
-            return False
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            return bool(state.get("pending_rotation", False))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
-
-    def _set_pending_rotation(self, value: bool) -> bool:
-        """Update the rotation flag in memory and persist it atomically."""
-        previous = bool(getattr(self.vars, "pending_rotation", False))
-        self.vars.pending_rotation = bool(value)
-        path = self._rotation_state_path()
-        if path is None:
-            return True
-        try:
-            temporary_path = path.with_suffix(path.suffix + ".tmp")
-            temporary_path.write_text(
-                json.dumps({"pending_rotation": bool(value)}) + "\n",
-                encoding="utf-8",
-            )
-            temporary_path.replace(path)
-        except OSError as exc:
-            self.vars.pending_rotation = previous
-            self.log_message(f"Could not persist rotation state: {exc}", color="red")
-            return False
-        return True
 
     def _portfolio_rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_rotation_state_file")
@@ -463,40 +402,21 @@ class AssetRotationStrategy(Strategy):
             )
             message["From"] = str(self.parameters["email_from_address"])
             message["To"] = str(self.parameters["email_to_address"])
-            portfolio_mode = report.get("portfolio_mode") == "enabled"
             lines = [
                 "Raspberry Pi Trading Agent Daily Summary",
                 "",
                 f"Date: {report_date}",
                 f"Evaluation time: {self.get_datetime().isoformat()}",
-            ]
-            if portfolio_mode:
-                lines += [
-                    "Mode: portfolio",
-                    f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
-                    f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
-                    f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
-                    f"Effective max positions today: "
-                    f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
-                    f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
-                    f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
-                    f"WSB discovery symbols: {report.get('wsb_discovered_symbols', 'none')}",
-                    f"Discovery status: {report.get('discovery_status', 'ok')}",
-                    f"Dip threshold: {report['threshold']:.2f}%",
-                ]
-            else:
-                lines += [
-                    f"Asset A: {report['asset_a']}",
-                    f"Asset B: {report['asset_b']}",
-                    f"Asset A price: {report.get('price_a', 'unavailable')}",
-                    f"Asset B price: {report.get('price_b', 'unavailable')}",
-                    f"Asset A quantity: {report.get('quantity_a', 'unavailable')}",
-                    f"Asset B quantity: {report.get('quantity_b', 'unavailable')}",
-                    f"Recent high: {report.get('recent_high', 'unavailable')}",
-                    f"Calculated dip: {report.get('dip_percent', 'unavailable')}",
-                    f"Dip threshold: {report['threshold']:.2f}%",
-                ]
-            lines += [
+                "Mode: portfolio",
+                f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
+                f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
+                f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
+                f"Effective max positions today: "
+                f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
+                f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
+                f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
+                f"Discovery status: {report.get('discovery_status', 'ok')}",
+                f"Dip threshold: {report['threshold']:.2f}%",
                 f"News risk level: {report.get('news_risk_level', 'unavailable')}",
                 f"News score: {report.get('news_score', 'unavailable')}",
                 f"News articles checked: {report.get('news_article_count', 'unavailable')}",
@@ -507,31 +427,13 @@ class AssetRotationStrategy(Strategy):
                 f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                 f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                 f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
-                f"Congressional-trading context: {report.get('congress_explanation', 'unavailable')}",
-                f"WallStreetBets context: {report.get('wsb_explanation', 'unavailable')}",
                 f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
                 f"Opportunistic Opportunity probability: {report.get('opportunistic_opportunity_probability', 'unavailable')}",
                 f"Opportunistic Opportunity evidence: {report.get('opportunistic_opportunity_explanation', 'unavailable')}",
-            ]
-            if not portfolio_mode:
-                # Decision memory models the A/B rotation edge specifically.
-                lines += [
-                    f"Decision-memory observations: {report.get('decision_memory_observations', 'unavailable')}",
-                    f"Predicted rotation edge: {report.get('rotation_edge_forecast', 'not ready')}",
-                    f"Decision-memory explanation: {report.get('decision_memory_explanation', 'unavailable')}",
-                ]
-            if portfolio_mode:
-                lines += [
-                    "Portfolio actions this iteration:",
-                    *[f"- {action}" for action in report.get("portfolio_actions", [])],
-                ]
-            lines += [
+                "Portfolio actions this iteration:",
+                *[f"- {action}" for action in report.get("portfolio_actions", [])],
                 "Notable scored headlines:",
                 *[f"- {headline}" for headline in report.get("news_headlines", [])],
-                "Congressional-trading highlights:",
-                *[f"- {highlight}" for highlight in report.get("congress_highlights", [])],
-                "WallStreetBets highlights:",
-                *[f"- {highlight}" for highlight in report.get("wsb_highlights", [])],
                 f"Result: {report['status']}",
                 "",
                 "Review all orders and positions in the Alpaca dashboard.",
@@ -539,7 +441,7 @@ class AssetRotationStrategy(Strategy):
             ]
             message.set_content("\n".join(lines))
             message.add_alternative(
-                self._render_email_html(report, report_date, portfolio_mode),
+                self._render_email_html(report, report_date),
                 subtype="html",
             )
 
@@ -635,41 +537,25 @@ class AssetRotationStrategy(Strategy):
             + "</ul>"
         )
 
-    def _render_email_html(
-        self, report: dict[str, Any], report_date: str, portfolio_mode: bool
-    ) -> str:
+    def _render_email_html(self, report: dict[str, Any], report_date: str) -> str:
         """Build a styled HTML alternative body mirroring the plain-text report."""
         status = str(report["status"])
         badge_bg, badge_fg = self._email_status_theme(status)
-        mode_label = "Portfolio mode" if portfolio_mode else "Asset rotation mode"
+        mode_label = "Portfolio mode"
 
-        if portfolio_mode:
-            snapshot_rows = [
-                ("Risk posture", report.get("portfolio_risk_posture", "unavailable")),
-                ("Holdings", report.get("portfolio_holdings", "unavailable")),
-                ("Signal candidates", report.get("portfolio_candidates", "unavailable")),
-                (
-                    "Effective max positions today",
-                    f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
-                    f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
-                ),
-                ("Discovered symbols", report.get("discovered_symbols", "none")),
-                ("WSB discovery symbols", report.get("wsb_discovered_symbols", "none")),
-                ("Discovery status", report.get("discovery_status", "ok")),
-                ("Dip threshold", f"{report['threshold']:.2f}%"),
-            ]
-        else:
-            snapshot_rows = [
-                ("Asset A", report.get("asset_a", "unavailable")),
-                ("Asset B", report.get("asset_b", "unavailable")),
-                ("Asset A price", self._email_value(report.get("price_a"), money=True)),
-                ("Asset B price", self._email_value(report.get("price_b"), money=True)),
-                ("Asset A quantity", report.get("quantity_a", "unavailable")),
-                ("Asset B quantity", report.get("quantity_b", "unavailable")),
-                ("Recent high", report.get("recent_high", "unavailable")),
-                ("Calculated dip", report.get("dip_percent", "unavailable")),
-                ("Dip threshold", f"{report['threshold']:.2f}%"),
-            ]
+        snapshot_rows = [
+            ("Risk posture", report.get("portfolio_risk_posture", "unavailable")),
+            ("Holdings", report.get("portfolio_holdings", "unavailable")),
+            ("Signal candidates", report.get("portfolio_candidates", "unavailable")),
+            (
+                "Effective max positions today",
+                f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
+                f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
+            ),
+            ("Discovered symbols", report.get("discovered_symbols", "none")),
+            ("Discovery status", report.get("discovery_status", "ok")),
+            ("Dip threshold", f"{report['threshold']:.2f}%"),
+        ]
 
         signal_rows = [
             ("News risk level", report.get("news_risk_level", "unavailable")),
@@ -685,8 +571,6 @@ class AssetRotationStrategy(Strategy):
             ("Learning observations", report.get("learning_observations", "unavailable")),
             ("Learned return forecast", report.get("learned_forecast", "not ready")),
             ("Learning explanation", report.get("learning_explanation", "unavailable")),
-            ("Congressional-trading context", report.get("congress_explanation", "unavailable")),
-            ("WallStreetBets context", report.get("wsb_explanation", "unavailable")),
             (
                 "Opportunistic Opportunity",
                 report.get("opportunistic_opportunity_status", "unavailable"),
@@ -700,37 +584,15 @@ class AssetRotationStrategy(Strategy):
                 report.get("opportunistic_opportunity_explanation", "unavailable"),
             ),
         ]
-        if not portfolio_mode:
-            forecast_rows[3:3] = [
-                (
-                    "Decision-memory observations",
-                    report.get("decision_memory_observations", "unavailable"),
-                ),
-                ("Predicted rotation edge", report.get("rotation_edge_forecast", "not ready")),
-                (
-                    "Decision-memory explanation",
-                    report.get("decision_memory_explanation", "unavailable"),
-                ),
-            ]
 
         sections = "".join(
             [
                 self._email_kv_section("Snapshot", snapshot_rows),
-                *(
-                    [self._email_bullet_section("Portfolio actions", report.get("portfolio_actions", []))]
-                    if portfolio_mode
-                    else []
-                ),
+                self._email_bullet_section("Portfolio actions", report.get("portfolio_actions", [])),
                 self._email_kv_section("News & Risk Signals", signal_rows),
                 self._email_kv_section("Learning & Forecasts", forecast_rows),
                 self._email_bullet_section(
                     "Notable scored headlines", report.get("news_headlines", [])
-                ),
-                self._email_bullet_section(
-                    "Congressional-trading highlights", report.get("congress_highlights", [])
-                ),
-                self._email_bullet_section(
-                    "WallStreetBets highlights", report.get("wsb_highlights", [])
                 ),
             ]
         )
@@ -800,66 +662,6 @@ This automated message is not financial advice.
                 available=False,
                 risk_level="unavailable",
                 explanation=f"News retrieval failed: {type(exc).__name__}: {exc}",
-            )
-
-    def _get_congress_context(self, symbols: list[str]) -> CongressContext:
-        """Return delayed public-disclosure context without affecting orders."""
-        if not bool(self.parameters.get("congress_context_enabled", False)):
-            return CongressContext(
-                available=False,
-                explanation="Congressional-trading context is disabled in config.json.",
-            )
-        context = CongressTradeAnalyzer(
-            timeout_seconds=float(self.parameters.get("congress_context_timeout_seconds", 10.0))
-        ).analyze(symbols)
-        self.log_message(context.explanation, color="blue")
-        for highlight in context.highlights:
-            self.log_message(f"Congressional-trading evidence: {highlight}", color="blue")
-        return context
-
-    def _get_wsb_context(self, symbols: list[str]) -> WSBContext:
-        """Return public WSB context, failing open when the tracker is unavailable."""
-        if not (
-            bool(self.parameters.get("wsb_context_enabled", False))
-            or bool(self.parameters.get("wsb_discovery_enabled", False))
-        ):
-            return WSBContext(
-                available=False,
-                explanation="WallStreetBets context and discovery are disabled in config.json.",
-            )
-        context = self._wsb_snapshot().context(symbols)
-        self.log_message(context.explanation, color="blue")
-        for highlight in context.highlights:
-            self.log_message(f"WallStreetBets evidence: {highlight}", color="blue")
-        return context
-
-    def _wsb_snapshot(self) -> WallStreetBetsSnapshot:
-        return WallStreetBetsSnapshot(
-            Path(str(self.parameters["wsb_context_state_file"])),
-            WallStreetBetsAnalyzer(
-                timeout_seconds=float(self.parameters.get("wsb_context_timeout_seconds", 10.0))
-            ),
-        )
-
-    def _refresh_wsb_snapshot_before_trading(self) -> None:
-        """Refresh the single WSB snapshot before the day's trade evaluations."""
-        if not (
-            bool(self.parameters.get("wsb_context_enabled", False))
-            or bool(self.parameters.get("wsb_discovery_enabled", False))
-        ):
-            return
-        try:
-            refreshed = self._wsb_snapshot().refresh_if_due()
-            self.log_message(
-                "WallStreetBets snapshot refreshed before trading."
-                if refreshed
-                else "WallStreetBets snapshot is within its 24-hour refresh window.",
-                color="blue",
-            )
-        except Exception as exc:
-            self.log_message(
-                f"WallStreetBets pre-trade refresh failed safely: {type(exc).__name__}: {exc}",
-                color="yellow",
             )
 
     def _get_llm_news_assessment(self, news_context: NewsContext) -> LLMNewsAssessment:
@@ -1153,10 +955,7 @@ This automated message is not financial advice.
             for symbol in self.parameters["portfolio_symbols"]
             if str(symbol).strip()
         }
-        if (
-            bool(self.parameters.get("portfolio_autonomous_discovery", False))
-            or bool(self.parameters.get("wsb_discovery_enabled", False))
-        ):
+        if bool(self.parameters.get("portfolio_autonomous_discovery", False)):
             try:
                 symbols.update(self._autonomous_universe().managed_symbols())
             except Exception as exc:
@@ -1252,62 +1051,6 @@ This automated message is not financial advice.
                 f"{learning_result.predicted_return_percent:+.2f}%"
             )
         return None
-
-    def _buy_asset_b_with_available_cash(self, asset_b: str, price_b: float) -> str:
-        """Submit the largest Asset B buy the cash safely supports.
-
-        Buys fractional shares when PORTFOLIO_FRACTIONAL_SHARES is enabled
-        (the default), otherwise whole shares. Returns "submitted" when a new
-        order was placed, "working" when a buy order is already in flight,
-        "rejected" when the broker synchronously refuses it, or "insufficient"
-        when the spendable cash is below the minimum order (or below one whole
-        share in whole-share mode).
-        """
-        with self._rotation_lock:
-            if self._has_active_order(asset_b, "buy"):
-                self.log_message(
-                    f"A buy order for {asset_b} is already working; "
-                    "not submitting another.",
-                    color="yellow",
-                )
-                return "working"
-
-            cash = float(self.get_cash())
-            spendable = cash * (1.0 - self.CASH_BUFFER_FRACTION) - float(
-                self.parameters.get("portfolio_cash_reserve_dollars", 0.0)
-            )
-            if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
-                self.log_message(
-                    f"No purchase submitted: spendable cash ${spendable:.2f} "
-                    "is below the configured minimum order amount.",
-                    color="yellow",
-                )
-                return "insufficient"
-            if bool(self.parameters.get("fractional_shares", False)):
-                quantity: Decimal | int = (Decimal(str(spendable)) / Decimal(str(price_b))).quantize(
-                    Decimal("1.000000000"), rounding=ROUND_DOWN
-                )
-            else:
-                quantity = math.floor(spendable / price_b)
-            if quantity <= 0:
-                return "insufficient"
-
-            buy_order = self.create_order(
-                asset_b,
-                quantity=quantity,
-                side="buy",
-                order_type="market",
-                time_in_force="day",
-            )
-            if not self._submit_order_checked(buy_order, f"{asset_b} buy"):
-                return "rejected"
-            self.log_message(
-                f"Submitted market buy for {quantity} shares of {asset_b}, the "
-                f"largest supported quantity from ${cash:.2f} cash "
-                f"after a {self.CASH_BUFFER_FRACTION:.0%} safety buffer.",
-                color="green",
-            )
-            return "submitted"
 
     def _buy_portfolio_symbol(self, symbol: str, price: float, budget: float) -> str:
         """Buy a whole or fractional quantity within a stated portfolio budget."""
@@ -1478,6 +1221,21 @@ This automated message is not financial advice.
         price = self.get_last_price(symbol)
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
+        # A low-priced or thin-volume symbol can still clear the profit/OOS
+        # filters below on a small backtest sample; for a sub-$100 account
+        # neither the static watchlist nor a held position should be
+        # re-evaluated once it falls under a sane liquidity floor. Checked
+        # here (not just at discovery) since it reuses the bars/price already
+        # fetched above rather than a second data pass, and it re-applies
+        # every day rather than only at first discovery.
+        min_price = float(self.parameters.get("portfolio_discovery_min_price_dollars", 0.0))
+        if min_price > 0 and float(price) < min_price:
+            return None
+        min_avg_volume = float(self.parameters.get("portfolio_discovery_min_avg_volume", 0.0))
+        if min_avg_volume > 0 and "volume" in bars.df.columns:
+            recent_volume = bars.df["volume"].dropna().tail(lookback)
+            if recent_volume.empty or float(recent_volume.mean()) < min_avg_volume:
+                return None
         threshold = float(self.parameters["dip_threshold_percent"])
         returns: list[float] = []
         # Historical dips are measured against the *previous* lookback bars,
@@ -1598,17 +1356,15 @@ This automated message is not financial advice.
         signal: dict[str, float | int | str | None],
         posture: str,
         news_score: float | int | None,
-        wsb_sentiment: str | None,
     ) -> float:
         """Reshape a symbol's historical edge through a risky or conservative lens.
 
         Conservative leans on consistency: it penalizes return variance and a
-        negative news day harder, and ignores WSB mentions as noise. Risky
-        leans on raw edge: it barely discounts variance or bad news, and
-        leans into WSB-bullish momentum while shrugging off bearish chatter.
-        This never changes PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself; it
-        only reweights which already-qualifying candidate looks best and
-        which current holding looks weakest.
+        negative news day harder. Risky leans on raw edge: it barely
+        discounts variance or bad news. This never changes
+        PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself; it only reweights which
+        already-qualifying candidate looks best and which current holding
+        looks weakest.
         """
         posture = posture if posture in ("conservative", "risky") else "conservative"
         expected_profit = float(signal["expected_profit"])
@@ -1621,10 +1377,6 @@ This automated message is not financial advice.
         if news_score is not None:
             capped_score = max(-10.0, min(10.0, float(news_score)))
             adjustment -= max(0.0, -capped_score) * AssetRotationStrategy._POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
-        if wsb_sentiment == "bullish":
-            adjustment += AssetRotationStrategy._POSTURE_WSB_BULLISH_BONUS[posture]
-        elif wsb_sentiment == "bearish":
-            adjustment -= AssetRotationStrategy._POSTURE_WSB_BEARISH_PENALTY[posture]
         max_adjustment = AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
         adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
         return expected_profit + adjustment
@@ -1776,10 +1528,7 @@ This automated message is not financial advice.
             return symbols
 
     def _remember_discovered_symbols(self, symbols: list[str]) -> None:
-        if not (
-            bool(self.parameters.get("portfolio_autonomous_discovery", False))
-            or bool(self.parameters.get("wsb_discovery_enabled", False))
-        ):
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
             return
         try:
             self._autonomous_universe().remember(symbols)
@@ -1808,27 +1557,7 @@ This automated message is not financial advice.
             ", ".join(f"{symbol}={quantity}" for symbol, quantity in sorted(held.items())) or "none"
         )
         symbols = self._portfolio_symbols(report, held, managed_symbols)
-        wsb_context = self._get_wsb_context(symbols)
-        if bool(self.parameters.get("wsb_discovery_enabled", False)) and wsb_context.available:
-            wsb_symbols = [
-                item.symbol
-                for item in wsb_context.mentions[: int(self.parameters["wsb_discovery_max_symbols"])]
-            ]
-            symbols = list(dict.fromkeys(symbols + wsb_symbols))
-            report["wsb_discovered_symbols"] = ", ".join(wsb_symbols) or "none"
-        report.update(
-            wsb_explanation=wsb_context.explanation,
-            wsb_highlights=wsb_context.highlights,
-        )
         self._refresh_symbol_reference(symbols)
-        congress_context = self._get_congress_context(symbols)
-        report.update(
-            congress_symbols_matched=(
-                congress_context.matched_symbols if congress_context.available else "unavailable"
-            ),
-            congress_explanation=congress_context.explanation,
-            congress_highlights=congress_context.highlights,
-        )
 
         news_context = self._get_news_context()
         report.update(
@@ -2003,9 +1732,6 @@ This automated message is not financial advice.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
         market_wide_news_score = news_context.score if news_context.available else None
         symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
-        wsb_sentiment_by_symbol = (
-            {item.symbol: item.sentiment for item in wsb_context.mentions} if wsb_context.available else {}
-        )
         for signal in signals:
             symbol = str(signal["symbol"])
             # A symbol with dedicated coverage today (even a genuinely
@@ -2013,7 +1739,7 @@ This automated message is not financial advice.
             # symbol with no coverage at all falls back to it.
             news_score = symbol_news_scores.get(symbol, market_wide_news_score)
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
-                signal, risk_posture, news_score, wsb_sentiment_by_symbol.get(symbol)
+                signal, risk_posture, news_score
             )
         report["portfolio_risk_posture"] = risk_posture
         eligible = [
@@ -2233,301 +1959,13 @@ This automated message is not financial advice.
         return f"Portfolio: {len(actions)} actions this iteration -- " + "; ".join(actions)
 
     def on_trading_iteration(self) -> None:
-        """Evaluate the dip and safely advance any required portfolio rotation."""
+        """Evaluate today's portfolio dip signals and advance any pending rotation."""
         report = {
-            "asset_a": str(self.parameters["asset_a"]).upper(),
-            "asset_b": str(self.parameters["asset_b"]).upper(),
             "threshold": float(self.parameters["dip_threshold_percent"]),
             "status": "Evaluation started",
         }
         try:
-            if bool(self.parameters.get("portfolio_enabled", False)):
-                report["portfolio_mode"] = "enabled"
-                self._run_portfolio_iteration(report)
-                return
-            asset_a = str(self.parameters["asset_a"]).upper()
-            asset_b = str(self.parameters["asset_b"]).upper()
-            threshold = float(self.parameters["dip_threshold_percent"])
-            lookback = int(self.parameters["recent_high_lookback_days"])
-            congress_context = self._get_congress_context([asset_a, asset_b])
-            report.update(
-                congress_symbols_matched=(
-                    congress_context.matched_symbols if congress_context.available else "unavailable"
-                ),
-                congress_explanation=congress_context.explanation,
-                congress_highlights=congress_context.highlights,
-            )
-            news_context = self._get_news_context()
-            report.update(
-                news_risk_level=news_context.risk_level,
-                news_score=news_context.score if news_context.available else "unavailable",
-                news_article_count=(
-                    news_context.article_count if news_context.available else "unavailable"
-                ),
-                news_explanation=news_context.explanation,
-                news_headlines=news_context.headlines,
-            )
-
-            llm_assessment = self._get_llm_news_assessment(news_context)
-            report.update(
-                llm_risk_level=llm_assessment.risk_level,
-                llm_score=(
-                    llm_assessment.score if llm_assessment.available else "unavailable"
-                ),
-                llm_reasoning=(
-                    llm_assessment.reasoning
-                    if llm_assessment.available
-                    else llm_assessment.explanation
-                ),
-            )
-
-            price_a = self.get_last_price(asset_a)
-            price_b = self.get_last_price(asset_b)
-            position_a = self.get_position(asset_a)
-            position_b = self.get_position(asset_b)
-            quantity_a = self._quantity(position_a)
-            quantity_b = self._quantity(position_b)
-            report.update(
-                price_a=price_a,
-                price_b=price_b,
-                quantity_a=str(quantity_a),
-                quantity_b=str(quantity_b),
-            )
-
-            if price_a is None or price_b is None:
-                report["status"] = "No trade: current price data was unavailable"
-                self.log_message(
-                    f"Price data unavailable for {asset_a} or {asset_b}; retrying next cycle.",
-                    color="red",
-                )
-                return
-            price_a = float(price_a)
-            price_b = float(price_b)
-            if not math.isfinite(price_a) or not math.isfinite(price_b) or price_a <= 0 or price_b <= 0:
-                report["status"] = "No trade: invalid non-positive price received"
-                self.log_message("Invalid non-positive market price received; no trade made.", color="red")
-                return
-
-            self._backfill_decision_memory(asset_a, asset_b)
-
-            learning_result = self._update_adaptive_learning(price_b, news_context)
-            report.update(
-                learning_observations=learning_result.observations,
-                learned_forecast=(
-                    f"{learning_result.predicted_return_percent:+.2f}%"
-                    if learning_result.ready
-                    and learning_result.predicted_return_percent is not None
-                    else "not ready"
-                ),
-                learning_explanation=learning_result.explanation,
-            )
-
-            # A previous iteration may have submitted the sale. Reconcile the
-            # persisted rotation flag against live positions and open orders.
-            if self.vars.pending_rotation:
-                if quantity_a > 0:
-                    if self._has_active_order(asset_a, "sell"):
-                        report["status"] = f"Pending: waiting for the {asset_a} sale to fill"
-                        self.log_message(
-                            f"Waiting for the {asset_a} sale to fill before buying {asset_b}.",
-                            color="yellow",
-                        )
-                        return
-                    # The sale died without a callback (canceled, rejected, or
-                    # lost across a restart). Re-evaluate the signal fresh.
-                    self._set_pending_rotation(False)
-                    self.log_message(
-                        f"The pending {asset_a} sale is no longer working; "
-                        "re-evaluating the dip signal from scratch.",
-                        color="yellow",
-                    )
-                else:
-                    outcome = self._buy_asset_b_with_available_cash(asset_b, price_b)
-                    if outcome == "submitted":
-                        report["status"] = (
-                            f"Submitted purchase of {asset_b} after completed sale"
-                        )
-                    elif outcome == "working":
-                        report["status"] = (
-                            f"Pending: waiting for the open {asset_b} purchase to fill"
-                        )
-                    elif outcome == "rejected":
-                        report["status"] = (
-                            f"Pending: broker rejected the {asset_b} purchase; retrying next cycle"
-                        )
-                    else:
-                        # Below the minimum purchasable amount: the rotation
-                        # is complete by design.
-                        self._set_pending_rotation(False)
-                        report["status"] = (
-                            f"Rotation finished: remaining cash is below the "
-                            f"minimum {asset_b} purchase"
-                        )
-                    return
-
-            bars = self.get_historical_prices(asset_b, lookback, "day")
-            if bars is None or bars.df is None or bars.df.empty or "high" not in bars.df:
-                report["status"] = "No trade: historical price data was unavailable"
-                self.log_message(
-                    f"Historical data unavailable for {asset_b}; retrying next cycle.",
-                    color="red",
-                )
-                return
-
-            valid_highs = bars.df["high"].dropna()
-            if valid_highs.empty:
-                report["status"] = "No trade: historical data contained no valid highs"
-                self.log_message(f"No valid daily highs returned for {asset_b}.", color="red")
-                return
-
-            recent_high = float(valid_highs.max())
-            if not math.isfinite(recent_high) or recent_high <= 0:
-                report["status"] = "No trade: historical data contained an invalid high"
-                self.log_message("Invalid recent high received; no trade made.", color="red")
-                return
-            dip_percent = ((recent_high - price_b) / recent_high) * 100.0
-            report.update(
-                recent_high=f"${recent_high:.2f}",
-                dip_percent=f"{dip_percent:.2f}%",
-            )
-            self.log_message(
-                f"{asset_a}=${price_a:.2f} ({quantity_a} shares), "
-                f"{asset_b}=${price_b:.2f} ({quantity_b} shares), "
-                f"{lookback}-day high=${recent_high:.2f}, dip={dip_percent:.2f}%.",
-                color="blue",
-            )
-
-            decision_memory = self._update_decision_memory(
-                price_a, price_b, dip_percent, news_context
-            )
-            report.update(
-                decision_memory_recorded=True,
-                decision_memory_observations=decision_memory.observations,
-                rotation_edge_forecast=(
-                    f"{decision_memory.predicted_edge_percent:+.2f}%"
-                    if decision_memory.ready and decision_memory.predicted_edge_percent is not None
-                    else "not ready"
-                ),
-                decision_memory_explanation=decision_memory.explanation,
-            )
-
-            if dip_percent < threshold:
-                report["status"] = "No trade: Asset B did not meet the dip threshold"
-                return
-            if quantity_a <= 0:
-                report["status"] = f"No trade: no long {asset_a} position was available"
-                self.log_message(
-                    f"{asset_b} meets the {threshold:.2f}% dip threshold, but no "
-                    f"long {asset_a} position is available to rotate.",
-                    color="yellow",
-                )
-                return
-
-            should_block_for_news = (
-                news_context.available
-                and bool(self.parameters["news_block_on_high_risk"])
-                and news_context.score <= int(self.parameters["news_high_risk_score"])
-            )
-            if should_block_for_news:
-                report["status"] = (
-                    f"Trade blocked: high world-event risk score {news_context.score}"
-                )
-                self.log_message(
-                    f"Dip signal met, but rotation was blocked by the configured "
-                    f"world-event risk guard (score {news_context.score}).",
-                    color="red",
-                )
-                return
-
-            should_block_for_llm = (
-                llm_assessment.available
-                and bool(self.parameters["llm_news_block_on_high_risk"])
-                and llm_assessment.score <= int(self.parameters["llm_news_block_score"])
-            )
-            if should_block_for_llm:
-                report["status"] = (
-                    f"Trade blocked: LLM news assessment score "
-                    f"{llm_assessment.score:+d}"
-                )
-                self.log_message(
-                    f"Dip signal met, but rotation was blocked by the LLM news "
-                    f"assessment (score {llm_assessment.score:+d}): "
-                    f"{llm_assessment.reasoning}",
-                    color="red",
-                )
-                return
-
-            learned_risk_block = (
-                bool(self.parameters["news_learning_block_enabled"])
-                and learning_result.ready
-                and learning_result.predicted_return_percent is not None
-                and learning_result.correlation is not None
-                and abs(learning_result.correlation)
-                >= float(self.parameters["news_learning_min_correlation"])
-                and learning_result.predicted_return_percent
-                <= float(self.parameters["news_predicted_return_block_percent"])
-            )
-            if learned_risk_block:
-                forecast = learning_result.predicted_return_percent
-                report["status"] = (
-                    f"Trade blocked: adaptive model forecast {forecast:+.2f}%"
-                )
-                self.log_message(
-                    f"Dip signal met, but rotation was blocked by the mature adaptive "
-                    f"news model forecast of {forecast:+.2f}% for the next session.",
-                    color="red",
-                )
-                return
-
-            should_block_for_decision_memory = (
-                bool(self.parameters.get("decision_memory_block_enabled", False))
-                and decision_memory.ready
-                and decision_memory.predicted_edge_percent is not None
-                and decision_memory.correlation is not None
-                and abs(decision_memory.correlation)
-                >= float(self.parameters["decision_memory_min_correlation"])
-                and decision_memory.predicted_edge_percent
-                <= float(self.parameters["decision_memory_edge_block_percent"])
-            )
-            if should_block_for_decision_memory:
-                forecast = decision_memory.predicted_edge_percent
-                report["status"] = (
-                    f"Trade blocked: decision-memory edge forecast {forecast:+.2f}%"
-                )
-                self.log_message(
-                    f"Dip signal met, but decision memory forecast that holding {asset_a} "
-                    f"should outperform {asset_b} by {-forecast:+.2f}% next session.",
-                    color="red",
-                )
-                return
-
-            sell_order = self.create_order(
-                asset_a,
-                quantity=quantity_a,
-                side="sell",
-                order_type="market",
-                time_in_force="day",
-            )
-            if not self._set_pending_rotation(True):
-                report["status"] = (
-                    f"No trade: could not persist the pending {asset_a} rotation safely"
-                )
-                return
-            try:
-                accepted = self._submit_order_checked(sell_order, f"{asset_a} rotation sell")
-            except Exception:
-                self._set_pending_rotation(False)
-                raise
-            if not accepted:
-                self._set_pending_rotation(False)
-                report["status"] = f"No trade: broker rejected the {asset_a} rotation sale"
-                return
-            report["status"] = f"Submitted market sale of {asset_a} to rotate into {asset_b}"
-            self.log_message(
-                f"Dip signal triggered. Submitted market sale of {quantity_a} "
-                f"shares of {asset_a}; {asset_b} will be bought after the fill.",
-                color="green",
-            )
+            self._run_portfolio_iteration(report)
         except Exception as exc:
             report["status"] = f"Evaluation error: {type(exc).__name__}: {exc}"
             # Network and broker failures are logged and retried on the next
@@ -2585,20 +2023,16 @@ This automated message is not financial advice.
         # Continue the rotation immediately after Alpaca confirms the sale.
         # The next daily iteration remains a fallback if this callback cannot
         # obtain fresh account or price data during a temporary outage.
-        asset_a = str(self.parameters["asset_a"]).upper()
-        asset_b = str(self.parameters["asset_b"]).upper()
         side_text = str(side).lower()
 
-        # Portfolio rotations follow the same two-phase pattern as A/B: buy
-        # the replacement as soon as the source sale fills (instead of waiting
-        # a full day for the next iteration), and clear the pending flag only
-        # when the replacement purchase itself fills.
+        # Buy the replacement as soon as the source sale fills (instead of
+        # waiting a full day for the next iteration), and clear the pending
+        # flag only when the replacement purchase itself fills.
         portfolio_pending = self.vars.portfolio_pending_rotation
-        if bool(self.parameters.get("portfolio_enabled", False)):
-            if side_text == "buy":
-                self._record_portfolio_entry(str(symbol))
-            elif side_text == "sell":
-                self._remove_portfolio_entry(str(symbol))
+        if side_text == "buy":
+            self._record_portfolio_entry(str(symbol))
+        elif side_text == "sell":
+            self._remove_portfolio_entry(str(symbol))
         if portfolio_pending:
             if side_text == "buy":
                 # Buy-fills are matched by scanning targets: N is bounded by
@@ -2657,49 +2091,6 @@ This automated message is not financial advice.
                     )
                 return
 
-        # The Asset B purchase filled: the rotation is complete.
-        if self.vars.pending_rotation and symbol == asset_b and side_text == "buy":
-            self._set_pending_rotation(False)
-            self.log_message(
-                f"Rotation complete: the {asset_b} purchase filled.", color="green"
-            )
-            return
-
-        if not self.vars.pending_rotation or symbol != asset_a or side_text != "sell":
-            return
-
-        try:
-            price_b = self.get_last_price(asset_b)
-            if price_b is None or float(price_b) <= 0:
-                self.log_message(
-                    f"The {asset_a} sale filled, but {asset_b} has no valid price; "
-                    "the purchase will be retried next cycle.",
-                    color="yellow",
-                )
-                return
-            outcome = self._buy_asset_b_with_available_cash(asset_b, float(price_b))
-            if outcome == "insufficient":
-                # Cash may not have settled yet; keep the rotation pending so
-                # the next iteration retries with confirmed balances and only
-                # then declares the rotation finished.
-                self.log_message(
-                    f"The {asset_b} purchase will be retried next cycle in case "
-                    "the sale proceeds have not settled yet.",
-                    color="yellow",
-                )
-            elif outcome == "rejected":
-                self.log_message(
-                    f"The broker rejected the {asset_b} purchase; the pending "
-                    "rotation remains recorded for the next cycle.",
-                    color="red",
-                )
-        except Exception as exc:
-            self.log_message(
-                f"Post-sale purchase failed safely and will be retried: "
-                f"{type(exc).__name__}: {exc}",
-                color="red",
-            )
-
     def on_canceled_order(self, order: Any) -> None:
         """Keep the rotation state truthful when the broker kills an order."""
         symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
@@ -2720,20 +2111,4 @@ This automated message is not financial advice.
                 color="yellow",
             )
         # A canceled portfolio buy keeps its entry pending so the next
-        # iteration retries the purchase with the cash still on hand.
-
-        if not self.vars.pending_rotation:
-            return
-
-        asset_a = str(self.parameters["asset_a"]).upper()
-        if symbol == asset_a and side == "sell":
-            # Nothing was sold, so the rotation never started. Clear the flag
-            # and let the next iteration evaluate the dip signal fresh.
-            self._set_pending_rotation(False)
-            self.log_message(
-                f"The {asset_a} sale was canceled; the rotation is reset and "
-                "the signal will be re-evaluated next cycle.",
-                color="yellow",
-            )
-        # A canceled Asset B buy keeps pending_rotation set, so the next
         # iteration retries the purchase with the cash still on hand.

@@ -6,13 +6,12 @@ import logging
 import sqlite3
 import threading
 
+import pandas as pd
 import pytest
 
 from adaptive_news_model import AdaptiveNewsModel
-from congress_context import CongressTradeAnalyzer
 from news_context import NewsContext, WorldEventAnalyzer
 from symbol_reference import SymbolReference
-from wsb_context import WallStreetBetsAnalyzer, WallStreetBetsSnapshot
 from strategy import AssetRotationStrategy
 from trade_memory import TradeMemory
 from main import _DropOptionalLumiwealthWarning, format_market_open_time
@@ -21,21 +20,6 @@ from main import _DropOptionalLumiwealthWarning, format_market_open_time
 def test_market_open_time_is_logged_in_eastern_time() -> None:
     assert format_market_open_time(datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
     assert format_market_open_time(datetime(2026, 1, 14, 14, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
-
-
-def test_congress_context_reports_disclosure_aggregates_without_a_trade_signal() -> None:
-    analyzer = CongressTradeAnalyzer(
-        fetcher=lambda _url, _timeout: [
-            {"ticker": "SPY", "trade_count": 8, "filer_count": 3, "purchases": 6, "sales": 1}
-        ]
-    )
-
-    context = analyzer.analyze(["SPY", "QQQ"])
-
-    assert context.available
-    assert context.matched_symbols == 1
-    assert "SPY: 8 disclosed trades" in context.highlights[0]
-    assert "not a trading signal" in context.explanation
 
 
 def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) -> None:
@@ -53,34 +37,6 @@ def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) 
     assert probability.observations == 2
     assert probability.wins == 1
     assert probability.probability == 0.5
-
-
-def test_wsb_context_parses_public_tracker_rows() -> None:
-    page = '''<tr><td><a href="https://altindex.com/ticker/nvda">NVIDIA</a></td>
-    <td>140<br /><span>12%</span></td>
-    <td><span class="badge--sentiment-bullish">Bullish</span></td></tr>'''
-
-    context = WallStreetBetsAnalyzer(fetcher=lambda _url, _timeout: page).analyze(["NVDA"])
-
-    assert context.available
-    assert context.mentions[0].symbol == "NVDA"
-    assert context.mentions[0].mentions == 140
-    assert context.mentions[0].sentiment == "bullish"
-
-
-def test_wsb_snapshot_reuses_one_fetch_for_24_hours(tmp_path: Path) -> None:
-    page = '''<tr><td><a href="https://altindex.com/ticker/nvda">NVIDIA</a></td>
-    <td>140<br /></td><td><span class="badge--sentiment-bullish">Bullish</span></td></tr>'''
-    calls = []
-    snapshot = WallStreetBetsSnapshot(
-        tmp_path / "wsb.json",
-        WallStreetBetsAnalyzer(fetcher=lambda _url, _timeout: calls.append(True) or page),
-    )
-
-    assert snapshot.refresh_if_due()
-    assert not snapshot.refresh_if_due()
-    assert snapshot.context(["NVDA"]).available
-    assert len(calls) == 1
 
 
 def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
@@ -247,15 +203,15 @@ def test_posture_adjusted_edge_keeps_the_expected_profit_floor_unchanged() -> No
     # or subtracted around it.
     signal = {"expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None, None) == 1.0
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None, None) == 1.0
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None) == 1.0
+    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None) == 1.0
 
 
 def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
     volatile = {"expected_profit": 3.0, "return_stdev": 4.0, "win_probability": 0.5}
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(volatile, "conservative", None, None)
-    risky = AssetRotationStrategy._posture_adjusted_edge(volatile, "risky", None, None)
+    conservative = AssetRotationStrategy._posture_adjusted_edge(volatile, "conservative", None)
+    risky = AssetRotationStrategy._posture_adjusted_edge(volatile, "risky", None)
 
     assert conservative < risky < 3.0
 
@@ -263,23 +219,16 @@ def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
 def test_conservative_posture_discounts_bad_news_harder_than_risky() -> None:
     signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -8, None)
-    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8, None)
+    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -8)
+    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8)
 
     assert conservative < risky < 2.0
-
-
-def test_risky_posture_leans_into_wsb_bullish_momentum_conservative_ignores_it() -> None:
-    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
-
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None, "bullish") > 2.0
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None, "bullish") == 2.0
 
 
 def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
     extreme = {"expected_profit": 5.0, "return_stdev": 1000.0, "win_probability": 1.0}
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10, "bearish")
+    conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10)
 
     assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
 
@@ -619,6 +568,51 @@ def test_portfolio_history_requests_use_bounded_concurrency() -> None:
         {"symbol": "SPY"},
         {"symbol": "QQQ"},
     ]
+
+
+def _signal_test_strategy(last_price: float, volume: list[float]) -> AssetRotationStrategy:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "portfolio_analysis_days": 252,
+        "recent_high_lookback_days": 3,
+        "dip_threshold_percent": 5.0,
+        "portfolio_round_trip_cost_percent": 0.20,
+        "portfolio_oos_min_observations": 10,
+        "portfolio_min_expected_profit_percent": 1.0,
+        "portfolio_discovery_min_price_dollars": 5.0,
+        "portfolio_discovery_min_avg_volume": 100000,
+    }
+    bars = SimpleNamespace(
+        df=pd.DataFrame(
+            {
+                "high": [100.0, 100.0, 100.0, 100.0, 100.0],
+                "close": [100.0, 100.0, 100.0, 90.0, 95.0],
+                "volume": volume,
+            }
+        )
+    )
+    strategy.get_historical_prices = lambda *_args, **_kwargs: bars
+    strategy.get_last_price = lambda _symbol: last_price
+    strategy._get_bid_ask = lambda _symbol: None
+    return strategy
+
+
+def test_portfolio_signal_rejects_a_symbol_below_the_price_floor() -> None:
+    strategy = _signal_test_strategy(last_price=3.0, volume=[200000] * 5)
+
+    assert strategy._portfolio_signal("PENNY") is None
+
+
+def test_portfolio_signal_rejects_a_symbol_below_the_volume_floor() -> None:
+    strategy = _signal_test_strategy(last_price=50.0, volume=[1000] * 5)
+
+    assert strategy._portfolio_signal("THIN") is None
+
+
+def test_portfolio_signal_accepts_a_symbol_clearing_both_floors() -> None:
+    strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
+
+    assert strategy._portfolio_signal("OK") is not None
 
 
 def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:
