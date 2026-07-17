@@ -4,9 +4,10 @@ import json
 import math
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date as date_type, timedelta
 from pathlib import Path
 from typing import Any
+
+from market_sessions import is_next_trading_session
 
 
 @dataclass
@@ -43,16 +44,12 @@ class AdaptiveNewsModel:
         if pending and pending.get("date") != evaluation_date:
             prior_price = float(pending.get("price", 0))
             prior_score = int(pending.get("news_score", 0))
-            try:
-                gap = date_type.fromisoformat(evaluation_date) - date_type.fromisoformat(
-                    str(pending["date"])
-                )
-            except (KeyError, TypeError, ValueError):
-                gap = timedelta.max
-            # A delayed process restart must not label a multi-day move as a
-            # next-session outcome. Four calendar days permits weekends and a
-            # single market holiday, matching decision-memory settlement.
-            if timedelta(0) < gap <= timedelta(days=4) and prior_price > 0 and current_price > 0:
+            prior_date = str(pending.get("date", ""))
+            if (
+                is_next_trading_session(prior_date, evaluation_date)
+                and prior_price > 0
+                and current_price > 0
+            ):
                 return_percent = ((current_price - prior_price) / prior_price) * 100.0
                 if math.isfinite(return_percent):
                     observations.append(

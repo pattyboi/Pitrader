@@ -12,6 +12,7 @@ a caller can simply skip the article.
 import json
 import logging
 import re
+from hashlib import sha256
 from datetime import date
 from pathlib import Path
 
@@ -108,6 +109,13 @@ def _load_cache() -> dict:
         return {}
 
 
+def _cache_key(url: str, watchlist: list[str]) -> str:
+    """Key model output by every input that can change its verdict."""
+    symbols = sorted({str(symbol).strip().upper() for symbol in watchlist if str(symbol).strip()})
+    digest = sha256("\0".join([MODEL, *symbols]).encode("utf-8")).hexdigest()[:16]
+    return f"{date.today().isoformat()}:{digest}:{url}"
+
+
 def _save_cache(cache: dict) -> None:
     CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
 
@@ -144,7 +152,7 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
     article is skipped (fetch/extraction failure, too low-signal, or any
     other problem). Cached per (url, calendar day)."""
     try:
-        cache_key = f"{url}_{date.today()}"
+        cache_key = _cache_key(url, watchlist)
         cache = _load_cache()
         if cache_key in cache:
             return cache[cache_key]

@@ -7,17 +7,11 @@ never stores API credentials, account balances, or order identifiers.
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import date as date_type, timedelta
 from pathlib import Path
 
 import duckdb
 
-# An unsettled observation older than this is never settled: after a longer
-# service outage, "price today" would record a multi-day return as if it were
-# a single session and poison the learned relationship. Four calendar days
-# covers weekends and single-holiday gaps.
-MAX_SETTLEMENT_GAP_DAYS = 4
-
+from market_sessions import is_next_trading_session
 
 @dataclass
 class RotationForecast:
@@ -231,19 +225,18 @@ class TradeMemory:
 
     @staticmethod
     def _settle_prior_observations(conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float) -> None:
-        try:
-            cutoff = (date_type.fromisoformat(date) - timedelta(days=MAX_SETTLEMENT_GAP_DAYS)).isoformat()
-        except ValueError:
-            return
         rows = conn.execute(
             """
             SELECT evaluation_date, price_a, price_b FROM observations
-            WHERE evaluation_date < ? AND evaluation_date >= ?
+            WHERE evaluation_date < ?
               AND relative_return_percent IS NULL
+            ORDER BY evaluation_date DESC LIMIT 1
             """,
-            (date, cutoff),
+            (date,),
         ).fetchall()
         for prior_date, prior_a, prior_b in rows:
+            if not is_next_trading_session(str(prior_date), date):
+                continue
             if prior_a <= 0 or prior_b <= 0:
                 continue
             return_a = ((price_a - prior_a) / prior_a) * 100.0

@@ -137,6 +137,29 @@ class MarketOpenLoggingAlpaca(Alpaca):
         """
 
 
+def _require_booleans(config: dict[str, Any], *keys: str) -> None:
+    invalid = [key for key in keys if not isinstance(config[key], bool)]
+    if invalid:
+        raise TypeError(f"{', '.join(invalid)} must be true or false")
+
+
+def _require_range(
+    name: str,
+    value: float,
+    minimum: float,
+    maximum: float,
+    *,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> None:
+    lower_ok = value >= minimum if minimum_inclusive else value > minimum
+    upper_ok = value <= maximum if maximum_inclusive else value < maximum
+    if not lower_ok or not upper_ok:
+        lower = "at least" if minimum_inclusive else "greater than"
+        upper = "at most" if maximum_inclusive else "less than"
+        raise ValueError(f"{name} must be {lower} {minimum:g} and {upper} {maximum:g}")
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and validate configuration before connecting to the broker."""
     try:
@@ -186,8 +209,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "ALPACA_SECRET_KEY"
     ].startswith("REPLACE_WITH_"):
         raise ValueError("Replace the Alpaca credential placeholders in config.json")
-    if not isinstance(config["IS_PAPER_TRADING"], bool):
-        raise TypeError("IS_PAPER_TRADING must be true or false")
+    _require_booleans(config, "IS_PAPER_TRADING")
 
     asset_a = str(config["ASSET_A"]).strip().upper()
     asset_b = str(config["ASSET_B"]).strip().upper()
@@ -196,10 +218,11 @@ def load_config(path: Path) -> dict[str, Any]:
 
     dip_threshold = float(config["DIP_THRESHOLD_PERCENT"])
     lookback_days = int(config["RECENT_HIGH_LOOKBACK_DAYS"])
-    if not 0.0 < dip_threshold < 100.0:
-        raise ValueError("DIP_THRESHOLD_PERCENT must be greater than 0 and less than 100")
-    if lookback_days < 2:
-        raise ValueError("RECENT_HIGH_LOOKBACK_DAYS must be at least 2")
+    _require_range(
+        "DIP_THRESHOLD_PERCENT", dip_threshold, 0.0, 100.0,
+        minimum_inclusive=False, maximum_inclusive=False,
+    )
+    _require_range("RECENT_HIGH_LOOKBACK_DAYS", lookback_days, 2, float("inf"))
 
     # Autonomous discovery, when enabled, expands the configured seed
     # watchlist through a bounded scan.
@@ -247,14 +270,12 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_take_profit_percent = float(config["PORTFOLIO_TAKE_PROFIT_PERCENT"])
     portfolio_stop_loss_percent = float(config["PORTFOLIO_STOP_LOSS_PERCENT"])
     portfolio_holding_horizon_max_days = int(config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"])
-    if not isinstance(config["PORTFOLIO_AUTONOMOUS_DISCOVERY"], bool):
-        raise TypeError("PORTFOLIO_AUTONOMOUS_DISCOVERY must be true or false")
+    _require_booleans(config, "PORTFOLIO_AUTONOMOUS_DISCOVERY")
     discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
     discovery_refresh_days = int(config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"])
     discovery_min_price = float(config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"])
     discovery_min_avg_volume = float(config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"])
-    if not isinstance(config["PORTFOLIO_FRACTIONAL_SHARES"], bool):
-        raise TypeError("PORTFOLIO_FRACTIONAL_SHARES must be true or false")
+    _require_booleans(config, "PORTFOLIO_FRACTIONAL_SHARES")
     portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
     portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
     opportunity_min_probability = float(config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"])
@@ -266,48 +287,31 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_max_positions_ceiling = (
         30 if config["PORTFOLIO_AUTONOMOUS_DISCOVERY"] else len(portfolio_symbols)
     )
-    if not 1 <= portfolio_max_positions <= portfolio_max_positions_ceiling:
-        raise ValueError(
-            "PORTFOLIO_MAX_POSITIONS must be between 1 and "
-            f"{portfolio_max_positions_ceiling}"
-        )
-    if not 30 <= portfolio_analysis_days <= 2000:
-        raise ValueError("PORTFOLIO_ANALYSIS_DAYS must be between 30 and 2000")
-    if not 5 <= portfolio_min_observations <= 500:
-        raise ValueError("PORTFOLIO_MIN_SIGNAL_OBSERVATIONS must be between 5 and 500")
-    if not 0.0 <= portfolio_min_profit <= 100.0:
-        raise ValueError("PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT must be between 0 and 100")
-    if not 5 <= portfolio_oos_min_observations <= 500:
-        raise ValueError("PORTFOLIO_OOS_MIN_OBSERVATIONS must be between 5 and 500")
-    if not 0.0 <= portfolio_oos_min_profit <= 100.0:
-        raise ValueError("PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT must be between 0 and 100")
-    if not 0.0 <= portfolio_round_trip_cost <= 10.0:
-        raise ValueError("PORTFOLIO_ROUND_TRIP_COST_PERCENT must be between 0 and 10")
-    if not 0.05 <= portfolio_take_profit_percent <= 100.0:
-        raise ValueError("PORTFOLIO_TAKE_PROFIT_PERCENT must be between 0.05 and 100")
-    if not 0.05 <= portfolio_stop_loss_percent <= 100.0:
-        raise ValueError("PORTFOLIO_STOP_LOSS_PERCENT must be between 0.05 and 100")
-    if not 1 <= portfolio_holding_horizon_max_days <= 60:
-        raise ValueError("PORTFOLIO_HOLDING_HORIZON_MAX_DAYS must be between 1 and 60")
-    if not 1 <= discovery_batch_size <= 30:
-        raise ValueError("PORTFOLIO_DISCOVERY_BATCH_SIZE must be between 1 and 30")
-    if not 1 <= discovery_refresh_days <= 90:
-        raise ValueError("PORTFOLIO_DISCOVERY_REFRESH_DAYS must be between 1 and 90")
-    if not 0.0 <= discovery_min_price <= 1000.0:
-        raise ValueError("PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS must be between 0 and 1000")
-    if not 0.0 <= discovery_min_avg_volume <= 100_000_000:
-        raise ValueError("PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME must be between 0 and 100000000")
-    if not 0.0 <= portfolio_cash_reserve <= 1000.0:
-        raise ValueError("PORTFOLIO_CASH_RESERVE_DOLLARS must be between 0 and 1000")
-    if not 1.0 <= portfolio_min_order <= 1000.0:
-        raise ValueError("PORTFOLIO_MIN_ORDER_DOLLARS must be between 1 and 1000")
-    if not 0.5 <= opportunity_min_probability <= 0.95:
-        raise ValueError("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY must be between 0.5 and 0.95")
+    range_checks = (
+        ("PORTFOLIO_MAX_POSITIONS", portfolio_max_positions, 1, portfolio_max_positions_ceiling),
+        ("PORTFOLIO_ANALYSIS_DAYS", portfolio_analysis_days, 30, 2000),
+        ("PORTFOLIO_MIN_SIGNAL_OBSERVATIONS", portfolio_min_observations, 5, 500),
+        ("PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT", portfolio_min_profit, 0, 100),
+        ("PORTFOLIO_OOS_MIN_OBSERVATIONS", portfolio_oos_min_observations, 5, 500),
+        ("PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT", portfolio_oos_min_profit, 0, 100),
+        ("PORTFOLIO_ROUND_TRIP_COST_PERCENT", portfolio_round_trip_cost, 0, 10),
+        ("PORTFOLIO_TAKE_PROFIT_PERCENT", portfolio_take_profit_percent, 0.05, 100),
+        ("PORTFOLIO_STOP_LOSS_PERCENT", portfolio_stop_loss_percent, 0.05, 100),
+        ("PORTFOLIO_HOLDING_HORIZON_MAX_DAYS", portfolio_holding_horizon_max_days, 1, 60),
+        ("PORTFOLIO_DISCOVERY_BATCH_SIZE", discovery_batch_size, 1, 30),
+        ("PORTFOLIO_DISCOVERY_REFRESH_DAYS", discovery_refresh_days, 1, 90),
+        ("PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS", discovery_min_price, 0, 1000),
+        ("PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME", discovery_min_avg_volume, 0, 100_000_000),
+        ("PORTFOLIO_CASH_RESERVE_DOLLARS", portfolio_cash_reserve, 0, 1000),
+        ("PORTFOLIO_MIN_ORDER_DOLLARS", portfolio_min_order, 1, 1000),
+        ("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY", opportunity_min_probability, 0.5, 0.95),
+    )
+    for name, value, minimum, maximum in range_checks:
+        _require_range(name, value, minimum, maximum)
     risk_posture = str(config["PORTFOLIO_RISK_POSTURE"]).strip().lower()
     if risk_posture not in ("conservative", "risky"):
         raise ValueError("PORTFOLIO_RISK_POSTURE must be conservative or risky")
-    if not isinstance(config["PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED"], bool):
-        raise TypeError("PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED must be true or false")
+    _require_booleans(config, "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED")
     config["PORTFOLIO_RISK_POSTURE"] = risk_posture
     config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
     config["PORTFOLIO_MAX_POSITIONS"] = portfolio_max_positions
@@ -328,13 +332,9 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
     config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
 
-    if not isinstance(config["EMAIL_REPORT_ENABLED"], bool):
-        raise TypeError("EMAIL_REPORT_ENABLED must be true or false")
-    if not isinstance(config["EMAIL_USE_TLS"], bool):
-        raise TypeError("EMAIL_USE_TLS must be true or false")
+    _require_booleans(config, "EMAIL_REPORT_ENABLED", "EMAIL_USE_TLS")
     email_port = int(config["EMAIL_SMTP_PORT"])
-    if not 1 <= email_port <= 65535:
-        raise ValueError("EMAIL_SMTP_PORT must be between 1 and 65535")
+    _require_range("EMAIL_SMTP_PORT", email_port, 1, 65535)
     if config["EMAIL_REPORT_ENABLED"]:
         email_fields = (
             "EMAIL_SMTP_HOST",
@@ -355,45 +355,34 @@ def load_config(path: Path) -> dict[str, Any]:
                 + ", ".join(invalid_email_fields)
             )
 
-    if not isinstance(config["NEWS_CONTEXT_ENABLED"], bool):
-        raise TypeError("NEWS_CONTEXT_ENABLED must be true or false")
-    if not isinstance(config["NEWS_BLOCK_ON_HIGH_RISK"], bool):
-        raise TypeError("NEWS_BLOCK_ON_HIGH_RISK must be true or false")
+    _require_booleans(config, "NEWS_CONTEXT_ENABLED", "NEWS_BLOCK_ON_HIGH_RISK")
     news_lookback = int(config["NEWS_LOOKBACK_HOURS"])
     news_limit = int(config["NEWS_MAX_ARTICLES"])
     news_block_score = int(config["NEWS_HIGH_RISK_SCORE"])
-    if not 1 <= news_lookback <= 168:
-        raise ValueError("NEWS_LOOKBACK_HOURS must be between 1 and 168")
-    if not 1 <= news_limit <= 50:
-        raise ValueError("NEWS_MAX_ARTICLES must be between 1 and 50")
+    _require_range("NEWS_LOOKBACK_HOURS", news_lookback, 1, 168)
+    _require_range("NEWS_MAX_ARTICLES", news_limit, 1, 50)
     if news_block_score >= 0:
         raise ValueError("NEWS_HIGH_RISK_SCORE must be a negative integer")
-    if not isinstance(config["NEWS_LEARNING_ENABLED"], bool):
-        raise TypeError("NEWS_LEARNING_ENABLED must be true or false")
-    if not isinstance(config["NEWS_LEARNING_BLOCK_ENABLED"], bool):
-        raise TypeError("NEWS_LEARNING_BLOCK_ENABLED must be true or false")
+    _require_booleans(
+        config, "NEWS_LEARNING_ENABLED", "NEWS_LEARNING_BLOCK_ENABLED"
+    )
     learning_minimum = int(config["NEWS_LEARNING_MIN_OBSERVATIONS"])
     learning_maximum = int(config["NEWS_LEARNING_MAX_OBSERVATIONS"])
     predicted_return_block = float(config["NEWS_PREDICTED_RETURN_BLOCK_PERCENT"])
     minimum_correlation = float(config["NEWS_LEARNING_MIN_CORRELATION"])
-    if not 10 <= learning_minimum <= 500:
-        raise ValueError("NEWS_LEARNING_MIN_OBSERVATIONS must be between 10 and 500")
-    if not learning_minimum <= learning_maximum <= 1000:
-        raise ValueError(
-            "NEWS_LEARNING_MAX_OBSERVATIONS must be at least the minimum and at most 1000"
-        )
-    if not -25.0 <= predicted_return_block < 0.0:
-        raise ValueError("NEWS_PREDICTED_RETURN_BLOCK_PERCENT must be from -25 to below 0")
-    if not 0.0 <= minimum_correlation <= 1.0:
-        raise ValueError("NEWS_LEARNING_MIN_CORRELATION must be between 0 and 1")
+    _require_range("NEWS_LEARNING_MIN_OBSERVATIONS", learning_minimum, 10, 500)
+    _require_range(
+        "NEWS_LEARNING_MAX_OBSERVATIONS", learning_maximum, learning_minimum, 1000
+    )
+    _require_range(
+        "NEWS_PREDICTED_RETURN_BLOCK_PERCENT", predicted_return_block, -25, 0,
+        maximum_inclusive=False,
+    )
+    _require_range("NEWS_LEARNING_MIN_CORRELATION", minimum_correlation, 0, 1)
 
-    if not isinstance(config["LLM_NEWS_ENABLED"], bool):
-        raise TypeError("LLM_NEWS_ENABLED must be true or false")
-    if not isinstance(config["LLM_NEWS_BLOCK_ON_HIGH_RISK"], bool):
-        raise TypeError("LLM_NEWS_BLOCK_ON_HIGH_RISK must be true or false")
+    _require_booleans(config, "LLM_NEWS_ENABLED", "LLM_NEWS_BLOCK_ON_HIGH_RISK")
     llm_block_score = int(config["LLM_NEWS_BLOCK_SCORE"])
-    if not -10 <= llm_block_score <= -1:
-        raise ValueError("LLM_NEWS_BLOCK_SCORE must be from -10 through -1")
+    _require_range("LLM_NEWS_BLOCK_SCORE", llm_block_score, -10, -1)
     llm_model = str(config["LLM_NEWS_MODEL"]).strip()
     if not llm_model:
         raise ValueError("LLM_NEWS_MODEL must be a non-empty model id")
@@ -427,19 +416,24 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in decision_defaults.items():
         config.setdefault(key, default)
-    if not isinstance(config["DECISION_MEMORY_ENABLED"], bool) or not isinstance(config["DECISION_MEMORY_BLOCK_ENABLED"], bool):
-        raise TypeError("DECISION_MEMORY_ENABLED and DECISION_MEMORY_BLOCK_ENABLED must be true or false")
+    _require_booleans(
+        config, "DECISION_MEMORY_ENABLED", "DECISION_MEMORY_BLOCK_ENABLED"
+    )
     decision_minimum = int(config["DECISION_MEMORY_MIN_OBSERVATIONS"])
     decision_maximum = int(config["DECISION_MEMORY_MAX_OBSERVATIONS"])
     decision_correlation = float(config["DECISION_MEMORY_MIN_CORRELATION"])
     decision_edge = float(config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"])
     decision_backfill_days = int(config["DECISION_MEMORY_BACKFILL_DAYS"])
-    if not 20 <= decision_minimum <= 500 or not decision_minimum <= decision_maximum <= 1000:
-        raise ValueError("DECISION_MEMORY observation limits must be from 20 to 1000")
-    if not 0.0 <= decision_correlation <= 1.0 or not -25.0 <= decision_edge < 0.0:
-        raise ValueError("DECISION_MEMORY correlation must be 0..1 and edge block must be -25..<0")
-    if not 0 <= decision_backfill_days <= 5000:
-        raise ValueError("DECISION_MEMORY_BACKFILL_DAYS must be between 0 and 5000")
+    _require_range("DECISION_MEMORY_MIN_OBSERVATIONS", decision_minimum, 20, 500)
+    _require_range(
+        "DECISION_MEMORY_MAX_OBSERVATIONS", decision_maximum, decision_minimum, 1000
+    )
+    _require_range("DECISION_MEMORY_MIN_CORRELATION", decision_correlation, 0, 1)
+    _require_range(
+        "DECISION_MEMORY_EDGE_BLOCK_PERCENT", decision_edge, -25, 0,
+        maximum_inclusive=False,
+    )
+    _require_range("DECISION_MEMORY_BACKFILL_DAYS", decision_backfill_days, 0, 5000)
     config["DECISION_MEMORY_MIN_OBSERVATIONS"] = decision_minimum
     config["DECISION_MEMORY_MAX_OBSERVATIONS"] = decision_maximum
     config["DECISION_MEMORY_MIN_CORRELATION"] = decision_correlation
@@ -456,12 +450,16 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in portfolio_memory_defaults.items():
         config.setdefault(key, default)
-    if not isinstance(config["PORTFOLIO_MEMORY_ENABLED"], bool):
-        raise TypeError("PORTFOLIO_MEMORY_ENABLED must be true or false")
+    _require_booleans(config, "PORTFOLIO_MEMORY_ENABLED")
     portfolio_memory_minimum = int(config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"])
     portfolio_memory_maximum = int(config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"])
-    if not 20 <= portfolio_memory_minimum <= 500 or not portfolio_memory_minimum <= portfolio_memory_maximum <= 5000:
-        raise ValueError("PORTFOLIO_MEMORY observation limits must be from 20 to 5000")
+    _require_range("PORTFOLIO_MEMORY_MIN_OBSERVATIONS", portfolio_memory_minimum, 20, 500)
+    _require_range(
+        "PORTFOLIO_MEMORY_MAX_OBSERVATIONS",
+        portfolio_memory_maximum,
+        portfolio_memory_minimum,
+        5000,
+    )
     config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"] = portfolio_memory_minimum
     config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"] = portfolio_memory_maximum
 
@@ -472,13 +470,11 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in symbol_reference_defaults.items():
         config.setdefault(key, default)
-    if not isinstance(config["SYMBOL_REFERENCE_ENABLED"], bool):
-        raise TypeError("SYMBOL_REFERENCE_ENABLED must be true or false")
-    if not isinstance(config["NEWS_SCORE_REFINEMENT_ENABLED"], bool):
-        raise TypeError("NEWS_SCORE_REFINEMENT_ENABLED must be true or false")
+    _require_booleans(
+        config, "SYMBOL_REFERENCE_ENABLED", "NEWS_SCORE_REFINEMENT_ENABLED"
+    )
     symbol_reference_refresh_days = int(config["SYMBOL_REFERENCE_REFRESH_DAYS"])
-    if not 1 <= symbol_reference_refresh_days <= 30:
-        raise ValueError("SYMBOL_REFERENCE_REFRESH_DAYS must be between 1 and 30")
+    _require_range("SYMBOL_REFERENCE_REFRESH_DAYS", symbol_reference_refresh_days, 1, 30)
     config["SYMBOL_REFERENCE_REFRESH_DAYS"] = symbol_reference_refresh_days
 
     return config

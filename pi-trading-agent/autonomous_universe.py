@@ -141,7 +141,7 @@ class AutonomousUniverse:
             conn.commit()
 
     def managed_symbols(self) -> list[str]:
-        """Return the persisted discovery symbols the strategy is allowed to own.
+        """Return discovery symbols confirmed by a strategy buy fill.
 
         This is deliberately separate from the full Alpaca asset directory.
         The directory is only a source of candidates; a holding becomes managed
@@ -152,13 +152,50 @@ class AutonomousUniverse:
             with self._connect() as conn:
                 self._create_schema(conn)
                 self._migrate_legacy_json(conn)
-                rows = conn.execute(
-                    "SELECT symbol FROM learned_symbols ORDER BY last_seen_rank ASC"
-                ).fetchall()
+                rows = conn.execute("SELECT symbol FROM owned_symbols ORDER BY symbol").fetchall()
                 conn.commit()
             return list(dict.fromkeys(row[0] for row in rows))
         except Exception:
             return []
+
+    def remember_owned(self, symbols: list[str]) -> None:
+        """Persist broker-confirmed strategy ownership separately from candidates."""
+        valid = sorted(
+            {
+                str(symbol).upper()
+                for symbol in symbols
+                if self._SYMBOL.fullmatch(str(symbol).upper())
+            }
+        )
+        if not valid:
+            return
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            conn.executemany(
+                "INSERT INTO owned_symbols (symbol) VALUES (?) ON CONFLICT DO NOTHING",
+                [(symbol,) for symbol in valid],
+            )
+            conn.commit()
+
+    def forget_owned(self, symbols: list[str]) -> None:
+        """Revoke management permission after a strategy-owned position is sold."""
+        valid = sorted(
+            {
+                str(symbol).upper()
+                for symbol in symbols
+                if self._SYMBOL.fullmatch(str(symbol).upper())
+            }
+        )
+        if not valid:
+            return
+        with self._connect() as conn:
+            self._create_schema(conn)
+            placeholders = ", ".join("?" for _ in valid)
+            conn.execute(
+                f"DELETE FROM owned_symbols WHERE symbol IN ({placeholders})", valid
+            )
+            conn.commit()
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path))
@@ -186,6 +223,13 @@ class AutonomousUniverse:
             CREATE TABLE IF NOT EXISTS learned_symbols (
                 symbol TEXT PRIMARY KEY,
                 last_seen_rank BIGINT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS owned_symbols (
+                symbol TEXT PRIMARY KEY
             )
             """
         )

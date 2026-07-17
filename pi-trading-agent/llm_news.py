@@ -215,7 +215,7 @@ class LLMNewsAnalyzer:
             line = f"{headline} - {summary}" if summary else headline
             tokens = cls._estimate_tokens(line)
             if used + tokens > budget_tokens:
-                break
+                continue
             keep.add(index)
             used += tokens
         return [articles[index] for index in sorted(keep)]

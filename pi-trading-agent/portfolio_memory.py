@@ -9,14 +9,12 @@ qualifying symbol's daily observation contribute to the same model.
 """
 
 import math
-from datetime import date as date_type, timedelta
 from pathlib import Path
 
 import duckdb
 
 from trade_memory import RotationForecast
-
-MAX_SETTLEMENT_GAP_DAYS = 4
+from market_sessions import is_next_trading_session
 
 
 class PortfolioMemory:
@@ -174,19 +172,18 @@ class PortfolioMemory:
     def _settle_prior_observations(
         conn: duckdb.DuckDBPyConnection, symbol: str, date: str, price: float
     ) -> None:
-        try:
-            cutoff = (date_type.fromisoformat(date) - timedelta(days=MAX_SETTLEMENT_GAP_DAYS)).isoformat()
-        except ValueError:
-            return
         rows = conn.execute(
             """
             SELECT evaluation_date, price FROM observations
-            WHERE symbol = ? AND evaluation_date < ? AND evaluation_date >= ?
+            WHERE symbol = ? AND evaluation_date < ?
               AND next_session_return_percent IS NULL AND price IS NOT NULL
+            ORDER BY evaluation_date DESC LIMIT 1
             """,
-            (symbol, date, cutoff),
+            (symbol, date),
         ).fetchall()
         for prior_date, prior_price in rows:
+            if not is_next_trading_session(str(prior_date), date):
+                continue
             if prior_price is None or prior_price <= 0:
                 continue
             next_return = ((price - prior_price) / prior_price) * 100.0

@@ -127,18 +127,22 @@ class SymbolReference:
         # Do all network work without holding a DuckDB connection. The strategy
         # runs this method in a background thread; readers can continue using
         # the last complete snapshot while these bounded requests are pending.
+        sec_source_succeeded = False
         try:
             sec_by_ticker = self._load_sec_mapping()
+            sec_source_succeeded = True
         except Exception:
             sec_by_ticker = {}
 
         headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
         today = date.today().isoformat()
         records: list[tuple[str, Any, Any, bool, str]] = []
+        alpaca_source_succeeded = False
         for symbol in refresh_symbols:
             alpaca_name = None
             try:
                 asset = self._alpaca_fetcher(f"{self.assets_url}/{symbol}", headers)
+                alpaca_source_succeeded = True
                 if isinstance(asset, dict):
                     alpaca_name = asset.get("name")
             except Exception:
@@ -154,6 +158,10 @@ class SymbolReference:
                 and self._names_match(alpaca_name, sec_name)
             )
             records.append((symbol, alpaca_name, sec_name, verified, today))
+
+        source_succeeded = sec_source_succeeded or alpaca_source_succeeded
+        if not source_succeeded:
+            return False
 
         with self._connect() as conn:
             self._create_schema(conn)
@@ -220,6 +228,37 @@ class SymbolReference:
         except Exception:
             return set()
 
+    def aliases_for_symbols(self, candidates: list[str] | set[str]) -> dict[str, tuple[str, ...]]:
+        """Load normalized company-name aliases for all candidates in one query."""
+        normalized = sorted(
+            {str(symbol).strip().upper() for symbol in candidates if str(symbol).strip()}
+        )
+        if not normalized:
+            return {}
+        try:
+            with self._connect() as conn:
+                self._create_schema(conn)
+                placeholders = ", ".join("?" for _ in normalized)
+                rows = conn.execute(
+                    f"SELECT ticker, alpaca_name, sec_name FROM symbols "
+                    f"WHERE ticker IN ({placeholders})",
+                    normalized,
+                ).fetchall()
+        except Exception:
+            return {}
+        aliases: dict[str, tuple[str, ...]] = {}
+        for ticker, alpaca_name, sec_name in rows:
+            names = tuple(
+                dict.fromkeys(
+                    normalized_name
+                    for name in (alpaca_name, sec_name)
+                    if name and (normalized_name := self._normalize_name(name))
+                )
+            )
+            if names:
+                aliases[ticker] = names
+        return aliases
+
     def scan_text_for_symbols(self, text: str, candidates: list[str] | set[str]) -> set[str]:
         """Find company-name mentions of `candidates` in `text`.
 
@@ -229,23 +268,18 @@ class SymbolReference:
         """
         if not text.strip() or not candidates:
             return set()
-        try:
-            with self._connect() as conn:
-                self._create_schema(conn)
-                placeholders = ", ".join("?" for _ in candidates)
-                rows = conn.execute(
-                    f"SELECT ticker, alpaca_name, sec_name FROM symbols WHERE ticker IN ({placeholders})",
-                    tuple(str(symbol).strip().upper() for symbol in candidates),
-                ).fetchall()
-        except Exception:
-            return set()
+        return self.scan_text_for_aliases(text, self.aliases_for_symbols(candidates))
+
+    def scan_text_for_aliases(
+        self, text: str, aliases: dict[str, tuple[str, ...]]
+    ) -> set[str]:
+        """Find alias mentions using a caller-preloaded mapping."""
         normalized_text = self._normalize_name(text)
         if not normalized_text:
             return set()
         found: set[str] = set()
-        for ticker, alpaca_name, sec_name in rows:
-            for name in (alpaca_name, sec_name):
-                normalized_name = self._normalize_name(name) if name else ""
+        for ticker, names in aliases.items():
+            for normalized_name in names:
                 if normalized_name and normalized_name in normalized_text:
                     found.add(ticker)
                     break

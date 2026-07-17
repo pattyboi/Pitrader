@@ -1120,6 +1120,10 @@ This automated message is not financial advice.
                     f"Could not read managed discovery symbols: {type(exc).__name__}: {exc}",
                     color="yellow",
                 )
+        symbols.update(
+            str(symbol).upper()
+            for symbol in getattr(self.vars, "portfolio_holding_dates", {})
+        )
         for source, entry in self.vars.portfolio_pending_rotation.items():
             symbols.update((str(source).upper(), str(entry["to"]).upper()))
         return symbols
@@ -1527,13 +1531,19 @@ This automated message is not financial advice.
             verified = reference.verified_symbols()
             if verified:
                 scores = {symbol: value for symbol, value in scores.items() if symbol in verified}
+            aliases = reference.aliases_for_symbols(candidates)
             for article in news_context.per_article:
                 tagged = {str(symbol) for symbol in article.get("symbols", [])}
                 untagged_candidates = candidates - tagged
                 if not untagged_candidates:
                     continue
                 text = f"{article.get('headline', '')} {article.get('summary', '')}"
-                for symbol in reference.scan_text_for_symbols(text, untagged_candidates):
+                eligible_aliases = {
+                    symbol: aliases[symbol]
+                    for symbol in untagged_candidates
+                    if symbol in aliases
+                }
+                for symbol in reference.scan_text_for_aliases(text, eligible_aliases):
                     scores[symbol] = scores.get(symbol, 0) + int(article.get("score", 0))
             return scores
         except Exception as exc:
@@ -1919,6 +1929,158 @@ This automated message is not financial advice.
         except Exception as exc:
             self.log_message(f"Could not persist learned symbols: {type(exc).__name__}: {exc}", color="yellow")
 
+    def _remember_confirmed_portfolio_symbol(self, symbol: str) -> None:
+        """Grant management permission only after a broker-confirmed buy fill."""
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            return
+        try:
+            self._autonomous_universe().remember_owned([str(symbol).upper()])
+        except Exception as exc:
+            self.log_message(
+                f"Could not persist strategy ownership: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+
+    def _forget_confirmed_portfolio_symbol(self, symbol: str) -> None:
+        """Revoke discovery management permission after the position is sold."""
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            return
+        try:
+            self._autonomous_universe().forget_owned([str(symbol).upper()])
+        except Exception as exc:
+            self.log_message(
+                f"Could not revoke strategy ownership: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+
+    def _submit_portfolio_builds(
+        self,
+        desired: list[dict[str, Any]],
+        held_working: dict[str, Decimal],
+        claimed_symbols: set[str],
+        effective_max_positions: int,
+        actions: list[str],
+    ) -> int:
+        """Submit empty-slot buys without reusing cash reserved earlier in the pass."""
+        submitted = 0
+        remaining_cash = max(0.0, float(self.get_cash()))
+        for candidate in desired:
+            symbol = str(candidate["symbol"])
+            if symbol in held_working or symbol in claimed_symbols:
+                continue
+            if len(held_working) + submitted >= effective_max_positions:
+                break
+            slots_remaining = max(
+                1, effective_max_positions - (len(held_working) + submitted)
+            )
+            budget = remaining_cash / slots_remaining
+            outcome = self._buy_portfolio_symbol(
+                symbol, float(candidate["price"]), budget
+            )
+            if outcome == "insufficient":
+                break
+            if outcome == "rejected":
+                actions.append(
+                    f"Portfolio build rejected: {symbol} purchase was not accepted"
+                )
+                continue
+            remaining_cash = max(0.0, remaining_cash - budget)
+            claimed_symbols.add(symbol)
+            submitted += 1
+            actions.append(f"Portfolio build: {symbol} purchase {outcome}")
+        return submitted
+
+    def _submit_portfolio_replacements(
+        self,
+        remaining_candidates: list[dict[str, Any]],
+        signals: list[dict[str, Any]],
+        held_working: dict[str, Decimal],
+        claimed_symbols: set[str],
+        minimum_profit: float,
+        actions: list[str],
+    ) -> int:
+        """Replace weak unclaimed holdings with materially stronger candidates."""
+        held_signals = {
+            str(signal["symbol"]): signal
+            for signal in signals
+            if signal["symbol"] in held_working and bool(signal.get("qualifies"))
+        }
+        submitted = 0
+        for candidate in remaining_candidates:
+            target_symbol = str(candidate["symbol"])
+            if target_symbol in held_working or target_symbol in claimed_symbols:
+                continue
+            unclaimed_held = [
+                symbol for symbol in held_working if symbol not in claimed_symbols
+            ]
+            if not unclaimed_held:
+                break
+            source = min(
+                unclaimed_held,
+                key=lambda symbol: float(
+                    held_signals.get(
+                        symbol, {"posture_adjusted_edge": 0.0}
+                    )["posture_adjusted_edge"]
+                ),
+            )
+            source_score = float(
+                held_signals.get(source, {"posture_adjusted_edge": 0.0})[
+                    "posture_adjusted_edge"
+                ]
+            )
+            advantage = float(candidate["posture_adjusted_edge"]) - source_score
+            if advantage < minimum_profit:
+                continue
+            source_price = self.get_last_price(source)
+            if (
+                source_price is None
+                or float(source_price) <= 0
+                or self._has_active_order(source, "sell")
+            ):
+                continue
+            budget = float(source_price) * float(held_working[source])
+            if self._submit_portfolio_rotation_sell(
+                source,
+                target_symbol,
+                held_working[source],
+                budget,
+                kind="replacement",
+            ):
+                held_working.pop(source, None)
+                claimed_symbols.update({source, target_symbol})
+                submitted += 1
+                actions.append(
+                    f"Portfolio rotation submitted: {source} to {target_symbol} "
+                    f"(expected advantage {advantage:+.2f}%)"
+                )
+        return submitted
+
+    def _maybe_top_up_portfolio(
+        self,
+        desired: list[dict[str, Any]],
+        held_working: dict[str, Decimal],
+        actions: list[str],
+    ) -> None:
+        """Put a usable residual deposit into the best already-held candidate."""
+        top_up_candidate = next(
+            (
+                signal
+                for signal in desired
+                if str(signal["symbol"]) in held_working
+            ),
+            None,
+        )
+        cash = float(self.get_cash())
+        minimum_cash = float(
+            self.parameters.get("portfolio_cash_reserve_dollars", 0.0)
+        ) + float(self.parameters.get("portfolio_min_order_dollars", 1.0))
+        if top_up_candidate is not None and cash >= minimum_cash:
+            symbol = str(top_up_candidate["symbol"])
+            outcome = self._buy_portfolio_symbol(
+                symbol, float(top_up_candidate["price"]), cash
+            )
+            actions.append(f"Portfolio top-up: {symbol} purchase {outcome}")
+
     def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
         """Build or rotate a bounded portfolio from the explicit symbol list."""
         minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
@@ -2216,11 +2378,10 @@ This automated message is not financial advice.
             and opportunity_edge is not None
             and float(opportunity_edge) >= minimum_profit
         )
-        # Remember holdings alongside today's qualifiers so a held symbol is
-        # never trimmed out of the learned universe while it is still owned.
-        self._remember_discovered_symbols(
-            list(dict.fromkeys([str(signal["symbol"]) for signal in eligible] + sorted(held)))
-        )
+        # Persist only positions the strategy actually owns. Merely qualifying
+        # a discovered ticker must not grant permission to manage a manual
+        # account position in that symbol. New buys are remembered on fill.
+        self._remember_discovered_symbols(sorted(held))
         report["portfolio_candidates"] = ", ".join(
             f"{s['symbol']} net {s['expected_profit']:+.2f}%/{s['observations']} "
             f"(posture {s['posture_adjusted_edge']:+.2f}%); "
@@ -2296,26 +2457,13 @@ This automated message is not financial advice.
             report["portfolio_effective_max_positions"] = effective_max_positions
             desired = remaining_candidates[:effective_max_positions]
 
-            builds_submitted = 0
-            for candidate in desired:
-                symbol = str(candidate["symbol"])
-                if symbol in held_working or symbol in claimed_symbols:
-                    continue
-                if len(held_working) + builds_submitted >= effective_max_positions:
-                    break
-                slots_remaining = max(1, effective_max_positions - (len(held_working) + builds_submitted))
-                budget = float(self.get_cash()) / slots_remaining
-                outcome = self._buy_portfolio_symbol(symbol, float(candidate["price"]), budget)
-                if outcome == "insufficient":
-                    # Cash is exhausted for new positions this pass; a
-                    # self-funded replacement below is unaffected.
-                    break
-                if outcome == "rejected":
-                    actions.append(f"Portfolio build rejected: {symbol} purchase was not accepted")
-                    continue
-                claimed_symbols.add(symbol)
-                builds_submitted += 1
-                actions.append(f"Portfolio build: {symbol} purchase {outcome}")
+            builds_submitted = self._submit_portfolio_builds(
+                desired,
+                held_working,
+                claimed_symbols,
+                effective_max_positions,
+                actions,
+            )
 
             replacements_submitted = 0
             if len(held_working) + builds_submitted >= effective_max_positions:
@@ -2327,64 +2475,20 @@ This automated message is not financial advice.
                 # churning the portfolio. The posture lens only changes which
                 # holding looks weakest and by how much; the
                 # PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT floor is unchanged.
-                held_signals = {
-                    str(signal["symbol"]): signal
-                    for signal in signals
-                    if signal["symbol"] in held_working and bool(signal.get("qualifies"))
-                }
-                for candidate in remaining_candidates:
-                    target_symbol = str(candidate["symbol"])
-                    if target_symbol in held_working or target_symbol in claimed_symbols:
-                        continue
-                    unclaimed_held = [symbol for symbol in held_working if symbol not in claimed_symbols]
-                    if not unclaimed_held:
-                        break
-                    source = min(
-                        unclaimed_held,
-                        key=lambda symbol: float(
-                            held_signals.get(symbol, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
-                        ),
-                    )
-                    source_score = float(
-                        held_signals.get(source, {"posture_adjusted_edge": 0.0})["posture_adjusted_edge"]
-                    )
-                    advantage = float(candidate["posture_adjusted_edge"]) - source_score
-                    if advantage < minimum_profit:
-                        continue
-                    source_price = self.get_last_price(source)
-                    if source_price is None or float(source_price) <= 0 or self._has_active_order(source, "sell"):
-                        continue
-                    budget = float(source_price) * float(held_working[source])
-                    if self._submit_portfolio_rotation_sell(
-                        source,
-                        target_symbol,
-                        held_working[source],
-                        budget,
-                        kind="replacement",
-                    ):
-                        held_working.pop(source, None)
-                        claimed_symbols.update({source, target_symbol})
-                        replacements_submitted += 1
-                        actions.append(
-                            f"Portfolio rotation submitted: {source} to {target_symbol} "
-                            f"(expected advantage {advantage:+.2f}%)"
-                        )
+                replacements_submitted = self._submit_portfolio_replacements(
+                    remaining_candidates,
+                    signals,
+                    held_working,
+                    claimed_symbols,
+                    minimum_profit,
+                    actions,
+                )
 
             if builds_submitted == 0 and replacements_submitted == 0:
                 # A recurring small deposit should grow the highest-ranked
                 # current holding instead of remaining idle once the portfolio
                 # is full and every top candidate is already held.
-                top_up_candidate = next(
-                    (signal for signal in desired if str(signal["symbol"]) in held_working), None
-                )
-                cash = float(self.get_cash())
-                minimum_cash = float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0)) + float(
-                    self.parameters.get("portfolio_min_order_dollars", 1.0)
-                )
-                if top_up_candidate is not None and cash >= minimum_cash:
-                    symbol = str(top_up_candidate["symbol"])
-                    outcome = self._buy_portfolio_symbol(symbol, float(top_up_candidate["price"]), cash)
-                    actions.append(f"Portfolio top-up: {symbol} purchase {outcome}")
+                self._maybe_top_up_portfolio(desired, held_working, actions)
 
         report["portfolio_actions"] = actions
         report["status"] = self._summarize_portfolio_actions(actions, signal_present, veto_reason)
@@ -2484,8 +2588,10 @@ This automated message is not financial advice.
         portfolio_pending = self.vars.portfolio_pending_rotation
         if side_text == "buy":
             self._record_portfolio_entry(str(symbol))
+            self._remember_confirmed_portfolio_symbol(str(symbol))
         elif side_text == "sell":
             self._remove_portfolio_entry(str(symbol))
+            self._forget_confirmed_portfolio_symbol(str(symbol))
         if portfolio_pending:
             if side_text == "buy":
                 # Buy-fills are matched by scanning targets: N is bounded by

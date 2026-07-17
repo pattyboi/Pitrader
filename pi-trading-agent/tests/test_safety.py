@@ -16,6 +16,7 @@ import autonomous_universe
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer
+from market_sessions import is_next_trading_session
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
@@ -27,6 +28,11 @@ from main import _DropOptionalLumiwealthWarning, format_market_open_time
 def test_market_open_time_is_logged_in_eastern_time() -> None:
     assert format_market_open_time(datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
     assert format_market_open_time(datetime(2026, 1, 14, 14, 30, tzinfo=timezone.utc)) == "9:30 AM ET"
+
+
+def test_next_trading_session_uses_the_exchange_holiday_calendar() -> None:
+    assert is_next_trading_session("2026-07-02", "2026-07-06")
+    assert not is_next_trading_session("2026-07-13", "2026-07-16")
 
 
 def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) -> None:
@@ -164,7 +170,31 @@ def test_autonomous_universe_remember_refreshes_recency_of_a_re_mentioned_symbol
     universe.remember(["AAA"], limit=2)  # re-mention refreshes AAA's recency
     universe.remember(["CCC"], limit=2)  # trims BBB, the one never re-mentioned
 
-    assert universe.managed_symbols() == ["AAA", "CCC"]
+    with duckdb.connect(str(tmp_path / "universe.duckdb")) as conn:
+        learned = [
+            row[0]
+            for row in conn.execute(
+                "SELECT symbol FROM learned_symbols ORDER BY last_seen_rank"
+            ).fetchall()
+        ]
+    assert learned == ["AAA", "CCC"]
+
+
+def test_autonomous_candidates_are_not_managed_until_a_buy_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=7, batch_size=5)
+    universe.remember(["AAPL"])
+
+    assert universe.managed_symbols() == []
+
+    universe.remember_owned(["AAPL"])
+
+    assert universe.managed_symbols() == ["AAPL"]
+
+    universe.forget_owned(["AAPL"])
+
+    assert universe.managed_symbols() == []
 
 
 def test_autonomous_universe_migrates_legacy_json_once(tmp_path: Path) -> None:
@@ -175,16 +205,18 @@ def test_autonomous_universe_migrates_legacy_json_once(tmp_path: Path) -> None:
     database_path = tmp_path / "universe.duckdb"
 
     universe = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
-    assert universe.managed_symbols() == ["AAPL"]
+    assert universe.managed_symbols() == []
     with duckdb.connect(str(database_path)) as conn:
         cursor = conn.execute("SELECT value FROM universe_state WHERE name = 'cursor'").fetchone()[0]
+        learned = conn.execute("SELECT symbol FROM learned_symbols").fetchone()[0]
     assert cursor == "1"
+    assert learned == "AAPL"
 
     # Migration only ever runs once: changing the legacy file afterward must
     # not re-import or overwrite already-migrated state.
     legacy.write_text(json.dumps({"symbols": [], "cursor": 0, "refreshed": "2026-07-02", "learned": ["ZZZZ"]}))
     universe_again = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
-    assert universe_again.managed_symbols() == ["AAPL"]
+    assert universe_again.managed_symbols() == []
 
 
 def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
@@ -872,7 +904,10 @@ def test_symbol_news_scores_filters_unverified_tags_and_falls_back_when_empty() 
         def verified_symbols(self) -> set[str]:
             return {"TSLA"}  # SPURIOUS was never recognized by either source
 
-        def scan_text_for_symbols(self, text: str, candidates) -> set[str]:
+        def aliases_for_symbols(self, candidates) -> dict:
+            return {}
+
+        def scan_text_for_aliases(self, text: str, aliases) -> set[str]:
             return set()
 
     strategy._symbol_reference = lambda: FakeReference()
@@ -897,7 +932,10 @@ def test_symbol_news_scores_extends_coverage_via_text_scan() -> None:
         def verified_symbols(self) -> set[str]:
             return set()  # nothing cached yet: fail open, no filtering
 
-        def scan_text_for_symbols(self, text: str, candidates) -> set[str]:
+        def aliases_for_symbols(self, candidates) -> dict:
+            return {"AAPL": ("apple",)}
+
+        def scan_text_for_aliases(self, text: str, aliases) -> set[str]:
             return {"AAPL"} if "Apple" in text else set()
 
     strategy._symbol_reference = lambda: FakeReference()
@@ -1007,7 +1045,7 @@ def test_extract_financial_context_returns_cached_value_without_fetching(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cache_path = tmp_path / "cache.json"
-    cache_key = f"https://example.com/a_{date.today()}"
+    cache_key = article_filter._cache_key("https://example.com/a", ["AAPL"])
     cached = {"sentiment": "bullish", "confidence": 0.9, "affected_tickers": ["AAPL"],
               "key_risks": [], "catalyst_type": "earnings"}
     cache_path.write_text(json.dumps({cache_key: cached}), encoding="utf-8")
@@ -1059,7 +1097,7 @@ def test_extract_financial_context_parses_a_valid_model_response(
     result = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
 
     assert result == expected
-    cache_key = f"https://example.com/a_{date.today()}"
+    cache_key = article_filter._cache_key("https://example.com/a", ["AAPL"])
     assert json.loads(cache_path.read_text(encoding="utf-8"))[cache_key] == expected
 
 
@@ -1132,3 +1170,129 @@ def test_discovery_article_context_skips_symbols_without_negative_coverage_or_a_
     )
 
     assert "discovery_article_context" not in report
+
+
+def test_portfolio_builds_reserve_cash_across_same_pass_orders() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_cash = lambda: 100.0
+    budgets: list[float] = []
+    strategy._buy_portfolio_symbol = lambda symbol, price, budget: (
+        budgets.append(budget) or "submitted"
+    )
+    desired = [
+        {"symbol": "AAPL", "price": 10.0},
+        {"symbol": "MSFT", "price": 20.0},
+    ]
+    claimed: set[str] = set()
+    actions: list[str] = []
+
+    submitted = strategy._submit_portfolio_builds(
+        desired, {}, claimed, effective_max_positions=2, actions=actions
+    )
+
+    assert submitted == 2
+    assert budgets == pytest.approx([50.0, 50.0])
+    assert sum(budgets) <= 100.0
+
+
+def test_portfolio_memory_does_not_label_a_multisession_gap_as_next_session(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+    memory.update_and_forecast("2026-07-13", "AAPL", 100.0, 5.0, 0)  # Monday
+    memory.update_and_forecast("2026-07-16", "AAPL", 110.0, 5.0, 0)  # Thursday
+
+    with duckdb.connect(str(db_path)) as conn:
+        settled = conn.execute(
+            "SELECT next_session_return_percent FROM observations "
+            "WHERE evaluation_date = '2026-07-13' AND symbol = 'AAPL'"
+        ).fetchone()[0]
+    assert settled is None
+
+
+def test_trade_memory_does_not_label_a_multisession_gap_as_next_session(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "trade_memory.duckdb"
+    memory = TradeMemory(db_path, 1, 50)
+    memory.update_and_forecast("2026-07-13", 100.0, 100.0, 5.0, 0, True)
+    memory.update_and_forecast("2026-07-16", 100.0, 110.0, 5.0, 0, True)
+
+    with duckdb.connect(str(db_path)) as conn:
+        settled = conn.execute(
+            "SELECT relative_return_percent FROM observations "
+            "WHERE evaluation_date = '2026-07-13'"
+        ).fetchone()[0]
+    assert settled is None
+
+
+def test_adaptive_news_model_does_not_learn_from_a_multisession_gap(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "news.json"
+    model = AdaptiveNewsModel(state_path, minimum_observations=1, maximum_observations=50)
+    model.update("2026-07-13", 100.0, -1)
+    model.update("2026-07-16", 110.0, -1)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["observations"] == []
+
+
+def test_article_context_cache_is_scoped_to_the_watchlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(article_filter, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "raw")
+    monkeypatch.setattr(
+        article_filter.trafilatura,
+        "extract",
+        lambda *args, **kwargs: " ".join(
+            ["Company earnings revenue profit guidance market shares growth quarter results outlook."]
+            * 20
+        ),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        article_filter,
+        "_query_model",
+        lambda text, watchlist: calls.append(list(watchlist)) or {"watchlist": list(watchlist)},
+    )
+
+    first = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
+    second = article_filter.extract_financial_context("https://example.com/a", ["MSFT"])
+
+    assert first != second
+    assert calls == [["AAPL"], ["MSFT"]]
+
+
+def test_symbol_reference_does_not_defer_retry_when_all_sources_fail(
+    tmp_path: Path,
+) -> None:
+    def fail(*args, **kwargs):
+        raise OSError("offline")
+
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=fail,
+        sec_fetcher=fail,
+    )
+
+    assert reference.refresh(["AAPL"], "key", "secret") is False
+    assert reference.refresh(["AAPL"], "key", "secret") is False
+    with duckdb.connect(str(tmp_path / "symbols.duckdb")) as conn:
+        assert conn.execute(
+            "SELECT value FROM refresh_state WHERE name = 'last_refreshed'"
+        ).fetchone() is None
+
+
+def test_prioritize_articles_skips_an_oversize_article_and_keeps_shorter_ones() -> None:
+    articles = [
+        {"headline": "high", "summary": "x" * 400, "score": 10},
+        {"headline": "short", "summary": "", "score": 9},
+    ]
+
+    kept = LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=2)
+
+    assert kept == [articles[1]]
