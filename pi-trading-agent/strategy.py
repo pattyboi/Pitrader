@@ -673,8 +673,23 @@ This automated message is not financial advice.
                 explanation=f"News retrieval failed: {type(exc).__name__}: {exc}",
             )
 
-    def _get_llm_news_assessment(self, news_context: NewsContext) -> LLMNewsAssessment:
-        """Ask Claude to assess today's headlines, failing open on problems."""
+    def _get_llm_news_assessment(
+        self,
+        news_context: NewsContext,
+        symbols: list[str],
+        held_symbols: set[str],
+        symbol_news_scores: dict[str, int],
+    ) -> LLMNewsAssessment:
+        """Ask the local Ollama model to assess today's headlines, failing open on problems.
+
+        `symbols`/`held_symbols`/`symbol_news_scores` give the model today's
+        actual evaluation universe and per-symbol coverage (the same
+        cross-checked scores ranking uses -- see `_symbol_news_scores`) so it
+        can reason about risk to the symbols this agent might actually trade
+        today, not just generic market headlines. The score it returns is
+        still aggregate market risk (the only thing `_market_veto_reason`
+        consumes); this only makes that judgment better-informed.
+        """
         if not bool(self.parameters.get("llm_news_enabled", False)):
             return LLMNewsAssessment(
                 available=False,
@@ -691,11 +706,15 @@ This automated message is not financial advice.
             )
         try:
             analyzer = LLMNewsAnalyzer(
-                provider=str(self.parameters["llm_news_provider"]),
                 model=str(self.parameters["llm_news_model"]),
                 base_url=str(self.parameters.get("llm_news_base_url", "")),
             )
-            assessment = analyzer.assess(news_context.articles)
+            assessment = analyzer.assess(
+                news_context.articles,
+                symbols=symbols,
+                held_symbols=held_symbols,
+                symbol_scores=symbol_news_scores,
+            )
             self.log_message(
                 f"LLM news assessment: risk={assessment.risk_level}, "
                 f"score={assessment.score:+d}. {assessment.reasoning}",
@@ -1730,7 +1749,15 @@ This automated message is not financial advice.
             news_explanation=news_context.explanation,
             news_headlines=news_context.headlines,
         )
-        llm_assessment = self._get_llm_news_assessment(news_context)
+        # Computed once here and reused by the ranking step below (symbol_news_scores
+        # at its original call site) so the LLM sees exactly the same cross-checked,
+        # deduped per-symbol coverage that ranking trusts, not the rawer
+        # NewsContext.per_symbol_scores, and so the pipeline doesn't scan for
+        # untagged symbol mentions twice in one iteration.
+        symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
+        llm_assessment = self._get_llm_news_assessment(
+            news_context, symbols, set(held), symbol_news_scores
+        )
         report.update(
             llm_risk_level=llm_assessment.risk_level,
             llm_score=llm_assessment.score if llm_assessment.available else "unavailable",
@@ -1892,7 +1919,6 @@ This automated message is not financial advice.
         # gates on the raw historical expected_profit, unaffected by posture.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
         market_wide_news_score = news_context.score if news_context.available else None
-        symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
         for signal in signals:
             symbol = str(signal["symbol"])
             # A symbol with dedicated coverage today (even a genuinely

@@ -5,34 +5,32 @@ a language model for one structured risk assessment per trading day. It is
 advisory by default, fails open like the rest of the news stack, and never
 creates a buy signal on its own.
 
-Supported providers:
-
-- "gemini" (default): Google's Gemini API via its OpenAI-compatible
-  endpoint. Has a genuinely free, rate-limited tier.
-- "openai_compatible": any other OpenAI-compatible endpoint (Groq,
-  OpenRouter, a local server, ...) via LLM_NEWS_BASE_URL.
-- "anthropic": the Claude API via the official anthropic SDK.
+The only supported backend is a local Ollama server (its OpenAI-compatible
+`/v1/chat/completions` endpoint) so this assessment never depends on an
+outside service or leaves the box. `ollama.service` binds to loopback only;
+`ollama-warmup.timer` loads the model ahead of market open so this call
+isn't paying a cold-start cost during the trading iteration.
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass
 
-PROVIDERS = ("gemini", "openai_compatible", "anthropic")
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 
 MAX_SUMMARY_CHARS = 400
+# Defensive cap on how many symbols get listed in the prompt; the day's
+# evaluation universe (watchlist + held + discovery candidates) is already
+# bounded well under this in practice.
+MAX_SYMBOLS_LISTED = 60
 MIN_SCORE = -10
 MAX_SCORE = 10
 RISK_LEVELS = ("high", "elevated", "normal", "constructive")
-# This assessment is optional and fails open. Keep its wall-clock budget well
-# below the daily trading iteration so a provider outage cannot hold orders for
-# a full minute.
-REQUEST_TIMEOUT_SECONDS = 20
-# The reply is one short JSON object, but reasoning models (e.g. Gemini 2.5)
-# spend hidden "thinking" tokens from this same cap; too small a cap yields an
-# empty reply, which this layer treats as a failed (skipped) assessment.
+# This assessment is optional and fails open. A local, CPU-bound small model
+# is slower than a hosted API, so the budget is generous -- but still well
+# below the daily trading iteration's own patience, and the warm-up timer
+# means this is almost never paying for a cold model load.
+REQUEST_TIMEOUT_SECONDS = 90
 MAX_RESPONSE_TOKENS = 4096
 
 
@@ -62,11 +60,17 @@ SYSTEM_PROMPT = (
     "failure, market crash in progress). Ordinary negative news such as a "
     "single weak earnings report, routine rate speculation, or sector-level "
     "problems should stay above -4. When the news is mixed or unremarkable, "
-    "score near 0."
+    "score near 0.\n\n"
+    "You may also be given the specific stocks/ETFs the agent is actually "
+    "evaluating today (marking which are currently held) plus any "
+    "symbol-specific news coverage separate from the general headlines. "
+    "Your score still measures aggregate market risk, not any one symbol - "
+    "but weigh concentrated bad news across several of today's symbols, or "
+    "bad news specifically hitting a held position, more heavily than the "
+    "same story would count in isolation, and mention the affected symbols "
+    "by name in your reasoning when they drove the score."
 )
 
-# Used for providers without strict schema enforcement; the reply is still
-# validated, clamped, and repaired in _parse_assessment below.
 JSON_FORMAT_INSTRUCTIONS = (
     "\n\nRespond with only a JSON object and no other text, using exactly "
     "these keys:\n"
@@ -76,54 +80,13 @@ JSON_FORMAT_INSTRUCTIONS = (
     'headlines that drove the score>"}'
 )
 
-# Structured-outputs schema for the Anthropic provider. Numerical range
-# limits are not supported by the API schema validator, so the score is
-# clamped in code after parsing.
-ANTHROPIC_ASSESSMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "score": {
-            "type": "integer",
-            "description": (
-                "Aggregate near-term risk score for broad US equity markets, "
-                "from -10 (severe, market-wide danger) through 0 (neutral) "
-                "to +10 (strongly constructive)."
-            ),
-        },
-        "risk_level": {"type": "string", "enum": list(RISK_LEVELS)},
-        "reasoning": {
-            "type": "string",
-            "description": (
-                "Two or three plain sentences citing the specific headlines "
-                "that drove the score."
-            ),
-        },
-    },
-    "required": ["score", "risk_level", "reasoning"],
-    "additionalProperties": False,
-}
-
 
 class LLMNewsAnalyzer:
-    """Score the day's headlines with one LLM API call."""
+    """Score the day's headlines with one call to a local Ollama model."""
 
-    def __init__(self, provider: str, model: str, base_url: str = ""):
-        provider = str(provider).strip().lower()
-        if provider not in PROVIDERS:
-            raise ValueError(f"Unknown LLM provider: {provider}")
-        self.provider = provider
+    def __init__(self, model: str, base_url: str = ""):
         self.model = str(model).strip()
-        self.base_url = str(base_url).strip()
-
-    @staticmethod
-    def _api_key() -> str:
-        api_key = os.environ.get("LLM_NEWS_API_KEY", "")
-        if not api_key:
-            raise RuntimeError(
-                "LLM_NEWS_API_KEY is not available in the environment; "
-                "the LLM news assessment requires it."
-            )
-        return api_key
+        self.base_url = str(base_url).strip() or OLLAMA_DEFAULT_BASE_URL
 
     @staticmethod
     def _format_articles(articles: list[dict]) -> str:
@@ -137,6 +100,37 @@ class LLMNewsAnalyzer:
                 lines.append(f"{index}. {headline} - {summary}")
             else:
                 lines.append(f"{index}. {headline}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_symbol_context(
+        symbols: list[str], held_symbols: set[str], symbol_scores: dict[str, int]
+    ) -> str:
+        """Describe today's evaluation universe so the model can reason about
+        risk to the symbols this agent might actually trade, not just the
+        market in the abstract."""
+        unique_symbols = sorted(
+            {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+        )
+        if not unique_symbols:
+            return ""
+        held_upper = {str(symbol).strip().upper() for symbol in held_symbols}
+        listed = ", ".join(
+            f"{symbol}*" if symbol in held_upper else symbol
+            for symbol in unique_symbols[:MAX_SYMBOLS_LISTED]
+        )
+        lines = [f"Symbols under evaluation today (* = currently held): {listed}"]
+        # Only nonzero scores are worth spending prompt tokens on; a zero
+        # entry means "covered today, genuinely neutral" (see
+        # NewsContext.per_symbol_scores), which isn't actionable here.
+        covered = {
+            symbol: score
+            for symbol, score in symbol_scores.items()
+            if symbol in unique_symbols and score != 0
+        }
+        if covered:
+            coverage = ", ".join(f"{symbol}: {score:+d}" for symbol, score in sorted(covered.items()))
+            lines.append(f"Symbol-specific news coverage: {coverage}")
         return "\n".join(lines)
 
     @staticmethod
@@ -171,8 +165,21 @@ class LLMNewsAnalyzer:
             ),
         )
 
-    def assess(self, articles: list[dict]) -> LLMNewsAssessment:
-        """Return one structured assessment; raise on any API problem."""
+    def assess(
+        self,
+        articles: list[dict],
+        symbols: list[str] | None = None,
+        held_symbols: set[str] | None = None,
+        symbol_scores: dict[str, int] | None = None,
+    ) -> LLMNewsAssessment:
+        """Return one structured assessment; raise on any problem.
+
+        `symbols`/`held_symbols`/`symbol_scores` are optional context about
+        today's actual evaluation universe; omitting them reproduces the
+        original market-headlines-only prompt exactly.
+        """
+        import requests
+
         article_text = self._format_articles(articles)
         if not article_text:
             return LLMNewsAssessment(
@@ -183,23 +190,14 @@ class LLMNewsAnalyzer:
             "Assess today's market news. Articles from the last 24 hours:\n\n"
             + article_text
         )
-        if self.provider == "anthropic":
-            return self._assess_with_anthropic(user_text, len(articles))
-        return self._assess_with_openai_compatible(user_text, len(articles))
-
-    def _assess_with_openai_compatible(
-        self, user_text: str, article_count: int
-    ) -> LLMNewsAssessment:
-        """Call Gemini or any other OpenAI-compatible chat endpoint."""
-        import requests
-
-        base_url = self.base_url or GEMINI_BASE_URL
+        symbol_context = self._format_symbol_context(
+            symbols or [], held_symbols or set(), symbol_scores or {}
+        )
+        if symbol_context:
+            user_text += "\n\n" + symbol_context
         response = requests.post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key()}",
-                "Content-Type": "application/json",
-            },
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            headers={"Content-Type": "application/json"},
             json={
                 "model": self.model,
                 "max_tokens": MAX_RESPONSE_TOKENS,
@@ -219,36 +217,4 @@ class LLMNewsAnalyzer:
         text = payload["choices"][0]["message"]["content"]
         if not text:
             raise RuntimeError("The model returned an empty assessment")
-        return self._parse_assessment(text, article_count, self.model)
-
-    def _assess_with_anthropic(
-        self, user_text: str, article_count: int
-    ) -> LLMNewsAssessment:
-        """Call the Claude API with a strict structured-outputs schema."""
-        import anthropic
-
-        # Fail fast on network problems; the price strategy must not wait
-        # long on a news call. The SDK retries transient errors itself.
-        client = anthropic.Anthropic(
-            api_key=self._api_key(),
-            timeout=float(REQUEST_TIMEOUT_SECONDS),
-            max_retries=0,
-        )
-        response = client.messages.create(
-            model=self.model,
-            max_tokens=MAX_RESPONSE_TOKENS,
-            system=SYSTEM_PROMPT,
-            output_config={
-                "format": {"type": "json_schema", "schema": ANTHROPIC_ASSESSMENT_SCHEMA}
-            },
-            messages=[{"role": "user", "content": user_text}],
-        )
-        if response.stop_reason == "refusal":
-            raise RuntimeError("The model declined to assess this content")
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError("The assessment response was truncated")
-        text = next(
-            (block.text for block in response.content if block.type == "text"),
-            "",
-        )
-        return self._parse_assessment(text, article_count, self.model)
+        return self._parse_assessment(text, len(articles), self.model)

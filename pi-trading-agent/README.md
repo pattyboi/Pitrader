@@ -201,7 +201,7 @@ pi-trading-agent/
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
-├── llm_news.py         Optional LLM daily news assessment (Gemini/Claude)
+├── llm_news.py         Optional LLM daily news assessment (local Ollama only)
 ├── strategy.py         Daily dip and rotation logic
 └── setup_service.sh    Virtual environment and systemd installer
 ```
@@ -329,10 +329,8 @@ The initial file is:
   "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
   "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
   "LLM_NEWS_ENABLED": false,
-  "LLM_NEWS_PROVIDER": "gemini",
-  "LLM_NEWS_API_KEY": "REPLACE_WITH_YOUR_LLM_API_KEY",
-  "LLM_NEWS_MODEL": "gemini-2.5-flash",
-  "LLM_NEWS_BASE_URL": "",
+  "LLM_NEWS_MODEL": "llama3.2:3b",
+  "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
   "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
   "LLM_NEWS_BLOCK_SCORE": -6
 }
@@ -420,11 +418,9 @@ chmod 600 config.json
 | `PORTFOLIO_MEMORY_ENABLED` | Records every evaluated symbol's dip signal and pools them into one learned-edge forecast used in ranking | `true` |
 | `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` | Pooled settled dip signals (across every symbol) needed before the forecast is used | `20` |
 | `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
-| `LLM_NEWS_ENABLED` | Sends the day's headlines to an LLM for one risk assessment | `false` |
-| `LLM_NEWS_PROVIDER` | `gemini`, `openai_compatible`, or `anthropic` | `"gemini"` |
-| `LLM_NEWS_API_KEY` | API key for the chosen provider | Your API key |
-| `LLM_NEWS_MODEL` | Model used for the assessment | `"gemini-2.5-flash"` |
-| `LLM_NEWS_BASE_URL` | Endpoint for `openai_compatible` providers only | `""` |
+| `LLM_NEWS_ENABLED` | Sends the day's headlines to the local Ollama model for one risk assessment | `false` |
+| `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"llama3.2:3b"` |
+| `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
 | `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
 
@@ -445,9 +441,7 @@ JSON is strict:
 - Minimum learned correlation must be from `0.0` through `1.0`.
 - The learned-return blocking threshold must be negative and at least `-25`.
 - The LLM block score must be an integer from `-10` through `-1`.
-- The LLM provider must be `gemini`, `openai_compatible`, or `anthropic`.
-- When the provider is `openai_compatible`, `LLM_NEWS_BASE_URL` is required.
-- When `LLM_NEWS_ENABLED` is `true`, a real `LLM_NEWS_API_KEY` is required.
+- `LLM_NEWS_BASE_URL`, if set, must be an `http(s)` URL.
 
 The lookback is a number of market-data bars, not necessarily calendar days.
 Weekends and exchange holidays do not produce normal stock-market daily bars.
@@ -744,33 +738,47 @@ never creates a buy signal, and if the API is unreachable the price strategy
 continues without it (the same fail-open behavior as the rest of the news
 stack).
 
-#### Getting a free API key (Gemini, the default)
+#### Local only — no outside service
 
-The default provider is Google's Gemini API, which has a genuinely free,
-rate-limited tier that comfortably covers this agent's one request per
-trading day. Chat subscriptions such as Claude Pro or ChatGPT Plus **cannot**
-be used here; those products do not include API access.
+This assessment runs entirely on the Pi through [Ollama](https://ollama.com),
+a local model server. Headlines never leave the device and there is no API
+key, no rate limit, and no dependency on an outside provider staying up.
+`llm_news.py` only speaks to Ollama's OpenAI-compatible endpoint; no other
+provider is supported.
 
-1. Sign in at `aistudio.google.com` with a Google account.
-2. Create an API key (no credit card is required for the free tier).
-3. Paste it into `LLM_NEWS_API_KEY` in `config.json`.
+`setup_service.sh` installs and enables two extra systemd units alongside
+`trading-agent.service`:
 
-One caveat of the free tier: Google may use free-tier prompts to improve its
-products. This agent only ever sends **public news headlines and summaries**
-to the model — never your credentials, positions, balances, or account data —
-so there is nothing sensitive in those prompts.
+- `ollama.service` — runs `ollama serve` bound to `127.0.0.1:11434` only
+  (never reachable off the device), with `OLLAMA_KEEP_ALIVE=1h`. The strategy
+  makes exactly one LLM call per day (`sleeptime = "1D"`), so there is no
+  reason to keep the model resident around the clock; the daemon itself stays
+  up all the time (idle cost is negligible with no model loaded), but the
+  ~3GB of loaded model weights unload again about an hour after last use
+  instead of sitting in RAM for the other 23 hours.
+- `ollama-warmup.timer` — fires at 09:00 ET (the Pi's system timezone is
+  already `America/New_York`), 30 minutes before the 9:30 ET market open, and
+  sends the configured model one trivial prompt to force a cold load to
+  finish well ahead of the actual trading iteration. The 1-hour keep-alive
+  window comfortably covers the gap from this warm-up through the 9:30 call.
 
-Treat the API key like every other secret in `config.json`: never commit it,
-keep the file at mode `600`, and rotate the key if exposure is suspected.
+Pull the model once after installing:
+
+```bash
+ollama pull llama3.2:3b
+```
+
+A 3B model is small enough to run on the Pi's CPU in well under the request
+timeout, especially once pre-warmed. It also does noticeably weaker risk
+judgment than a large hosted model — treat it as a plausible advisory signal,
+not an authority.
 
 #### Enabling it
 
 ```json
 "LLM_NEWS_ENABLED": true,
-"LLM_NEWS_PROVIDER": "gemini",
-"LLM_NEWS_API_KEY": "YOUR_GEMINI_API_KEY",
-"LLM_NEWS_MODEL": "gemini-2.5-flash",
-"LLM_NEWS_BASE_URL": "",
+"LLM_NEWS_MODEL": "llama3.2:3b",
+"LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
 "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
 "LLM_NEWS_BLOCK_SCORE": -6
 ```
@@ -782,17 +790,10 @@ recommended starting mode. Review several weeks of paper-trading logs and
 compare the model's assessments with what actually happened before setting it
 to `true`.
 
-#### Other providers
-
-| Provider setting | What it is | Key settings |
-|---|---|---|
-| `"gemini"` | Google Gemini API (free tier available) | Model such as `"gemini-2.5-flash"`; leave `LLM_NEWS_BASE_URL` empty |
-| `"anthropic"` | Claude API (paid, a few cents per month here) | Key from `platform.claude.com`; model such as `"claude-opus-4-8"` or the cheaper `"claude-haiku-4-5"` |
-| `"openai_compatible"` | Any OpenAI-compatible endpoint (Groq, OpenRouter, a local server, ...) | Set `LLM_NEWS_BASE_URL`, e.g. `"https://api.groq.com/openai/v1"`, plus that provider's key and model name |
-
-Free tiers are rate-limited and their terms can change; if a provider starts
-failing, the agent logs the error and continues on price logic and the
-keyword guard alone.
+`LLM_NEWS_MODEL` can be swapped for any other Ollama-pulled model tag, and
+`LLM_NEWS_BASE_URL` can point at a different host running Ollama on the local
+network — but never at a third-party API; that support was intentionally
+removed.
 
 #### How it works
 
@@ -818,9 +819,10 @@ LLM news assessment: risk=elevated, score=-3. Several articles describe ...
 
 - The model sees only headlines and short summaries, not full articles.
 - A language model can misjudge significance in either direction; its
-  reasoning is plausible-sounding even when wrong.
-- The assessment depends on an external API: an outage means no LLM
-  protection that day (trading continues on price logic and the keyword
+  reasoning is plausible-sounding even when wrong — a small local model more
+  so than a large hosted one.
+- If `ollama.service` is down or the model fails to load, that day runs
+  without LLM protection (trading continues on price logic and the keyword
   guard).
 - Scores are not comparable to the keyword score; the two guards use separate
   thresholds and either can veto independently once enabled.
