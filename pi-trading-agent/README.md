@@ -197,7 +197,7 @@ pi-trading-agent/
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
-├── portfolio_memory.py  DuckDB journal and pooled learning from every symbol's dip signals
+├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
@@ -215,14 +215,16 @@ Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of marke
 snapshots, decisions, and fills (never credentials or balances).
 On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
 requiring a DuckDB extension download. Portfolio memory keeps its own DuckDB
-database, `.portfolio_memory.duckdb`, of every evaluated symbol's dip signals
-and settled next-session returns (see "Portfolio memory: learning across the
-whole watchlist" below). The local symbol cross-reference keeps
+database, `.portfolio_memory.duckdb`, of every evaluated symbol's daily
+context and settled next-session returns (see "Portfolio memory: learning
+across the whole watchlist" below). The local symbol cross-reference keeps
 its own small DuckDB database, `.symbol_reference.duckdb`.
 `.portfolio_rotation_state.json` remembers a staged replacement (sold one
 symbol, not yet bought its replacement) so restarts cannot strand the cash,
-and `.autonomous_universe.json` tracks the discovery cursor and learned
-watchlist.
+and autonomous discovery keeps its own small DuckDB database,
+`.autonomous_universe.duckdb`, tracking the discovery cursor and learned
+watchlist. On upgrade, an existing `.autonomous_universe.json` is imported
+into it once, the same way the legacy `.trade_memory.sqlite3` journal is.
 
 ## Quick start
 
@@ -971,14 +973,23 @@ discovery has surfaced — which ones have historically kept resolving well
 after a dip, once today's dip size and that symbol's own news score are
 accounted for?
 
-Every symbol showing a dip signal on a given day adds one observation to a
-single local DuckDB database, `.portfolio_memory.duckdb`, keyed by date and
-symbol. Because many symbols can each contribute an observation on the same
-day, this learns much faster than decision memory's one-pair-per-day pace.
-Each observation is settled using that same symbol's own next-session price,
-never another symbol's — one pooled, ridge-stabilized model is fit across
-every symbol's settled history rather than a separate model per symbol, since
-any single symbol's dips are too infrequent to train its own model reliably.
+Every symbol the strategy evaluates on a given day — not just one showing a
+qualifying dip signal — adds one observation to a single local DuckDB
+database, `.portfolio_memory.duckdb`, keyed by date and symbol. Each
+observation carries at least five learned facts: today's dip percentage, that
+symbol's own news score, its live bid/ask spread, its recent average trading
+volume, and its historical backtest edge (expected profit, win probability,
+and return spread from prior comparable dips) — so a watched or held symbol
+that does not dip today still contributes durable context, not just the
+narrow subset that traded. Because many symbols can each contribute an
+observation on the same day, this learns much faster than decision memory's
+one-pair-per-day pace. Each observation is settled using that same symbol's
+own next-session price, never another symbol's — one pooled, ridge-stabilized
+model is fit across every symbol's settled *dip-signal* history rather than a
+separate model per symbol (a `signal_present` flag keeps ordinary non-dip
+days out of that fit, exactly like decision memory's own Asset A/B model),
+since any single symbol's dips are too infrequent to train its own model
+reliably.
 
 Once at least `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` pooled signals are settled
 (default 20), the forecast is blended into that day's ranking: it can shift

@@ -610,6 +610,7 @@ def main() -> int:
                 "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
                 "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
                 "portfolio_universe_state_file": str(BASE_DIR / ".autonomous_universe.json"),
+                "portfolio_universe_database_file": str(BASE_DIR / ".autonomous_universe.duckdb"),
                 "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
                 "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
                 "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],

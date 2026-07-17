@@ -34,12 +34,24 @@ class PortfolioMemory:
         price: float,
         dip_percent: float,
         news_score: int | None,
+        signal_present: bool = True,
+        live_spread_percent: float | None = None,
+        recent_avg_volume: float | None = None,
+        historical_expected_profit: float | None = None,
+        historical_win_probability: float | None = None,
+        historical_return_stdev: float | None = None,
     ) -> RotationForecast:
         """Settle this symbol's prior observation, record today's, and forecast.
 
         Settlement is scoped to this symbol only: a next-session return can
         only be measured from the same symbol's own later price. The fit
-        that follows pools every symbol's settled history together.
+        that follows pools every *signal-present* symbol's settled history
+        together -- `signal_present` marks whether today's dip actually
+        cleared the live threshold, exactly like trade_memory.py's own
+        column of the same name, so recording every evaluated symbol's daily
+        context (not just qualifying ones) never dilutes the pooled forecast
+        with ordinary non-dip market days. The extra fact columns are
+        durable context for the day, not model inputs.
         """
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -48,18 +60,32 @@ class PortfolioMemory:
             conn.execute(
                 """
                 INSERT INTO observations
-                    (evaluation_date, symbol, price, dip_percent, news_score)
-                VALUES (?, ?, ?, ?, ?)
+                    (evaluation_date, symbol, price, dip_percent, news_score, signal_present,
+                     live_spread_percent, recent_avg_volume, historical_expected_profit,
+                     historical_win_probability, historical_return_stdev)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(evaluation_date, symbol) DO NOTHING
                 """,
-                (evaluation_date, symbol, price, dip_percent, news_score),
+                (
+                    evaluation_date,
+                    symbol,
+                    price,
+                    dip_percent,
+                    news_score,
+                    int(signal_present),
+                    live_spread_percent,
+                    recent_avg_volume,
+                    historical_expected_profit,
+                    historical_win_probability,
+                    historical_return_stdev,
+                ),
             )
             conn.commit()
             rows = conn.execute(
                 """
                 SELECT dip_percent, news_score, next_session_return_percent
                 FROM observations
-                WHERE next_session_return_percent IS NOT NULL
+                WHERE next_session_return_percent IS NOT NULL AND signal_present = 1
                 ORDER BY evaluation_date DESC LIMIT ?
                 """,
                 (self.maximum_observations,),
@@ -106,10 +132,43 @@ class PortfolioMemory:
                 dip_percent REAL NOT NULL,
                 news_score INTEGER,
                 next_session_return_percent REAL,
+                signal_present INTEGER NOT NULL DEFAULT 1,
+                live_spread_percent REAL,
+                recent_avg_volume REAL,
+                historical_expected_profit REAL,
+                historical_win_probability REAL,
+                historical_return_stdev REAL,
                 PRIMARY KEY (evaluation_date, symbol)
             )
             """
         )
+        # An install created before these columns existed already has an
+        # observations table without them. DuckDB's ADD COLUMN can't carry a
+        # NOT NULL/DEFAULT constraint, so add each missing column plain, then
+        # backfill signal_present (every pre-existing row predates broadened
+        # coverage, so it was always a qualifying dip signal) and set its
+        # default for future inserts that omit it -- exactly once, guarded by
+        # column presence rather than re-scanning the table on every call.
+        existing_columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'observations'"
+            ).fetchall()
+        }
+        new_columns = {
+            "signal_present": "INTEGER",
+            "live_spread_percent": "REAL",
+            "recent_avg_volume": "REAL",
+            "historical_expected_profit": "REAL",
+            "historical_win_probability": "REAL",
+            "historical_return_stdev": "REAL",
+        }
+        for column, column_type in new_columns.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE observations ADD COLUMN {column} {column_type}")
+        if "signal_present" not in existing_columns:
+            conn.execute("UPDATE observations SET signal_present = 1 WHERE signal_present IS NULL")
+            conn.execute("ALTER TABLE observations ALTER COLUMN signal_present SET DEFAULT 1")
 
     @staticmethod
     def _settle_prior_observations(

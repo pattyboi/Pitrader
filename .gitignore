@@ -16,6 +16,8 @@ pi-trading-agent/config.json
 .portfolio_holding_state.json.*
 .autonomous_universe.json
 .autonomous_universe.json.*
+.autonomous_universe.duckdb
+.autonomous_universe.duckdb.*
 .wsb_context_snapshot.json
 .wsb_context_snapshot.json.*
 .trade_memory.sqlite3

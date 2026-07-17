@@ -931,14 +931,28 @@ This automated message is not financial advice.
         )
 
     def _update_portfolio_memory(
-        self, symbol: str, price: float, dip_percent: float, news_score: int | None
+        self,
+        symbol: str,
+        price: float,
+        dip_percent: float,
+        news_score: int | None,
+        signal_present: bool,
+        live_spread_percent: float | None = None,
+        recent_avg_volume: float | None = None,
+        historical_expected_profit: float | None = None,
+        historical_win_probability: float | None = None,
+        historical_return_stdev: float | None = None,
     ) -> RotationForecast:
-        """Record today's dip signal for one symbol and forecast its next-session return.
+        """Record today's context for one symbol and forecast its next-session return.
 
-        Called once per qualifying symbol per day, pooling every symbol's
-        history into one model -- see PortfolioMemory for why a pooled fit
-        (rather than one model per symbol) is what lets many symbols a day
-        actually accelerate warm-up.
+        Called once per *evaluated* symbol per day -- not just one clearing
+        today's dip threshold -- pooling every symbol's history into one
+        model; see PortfolioMemory for why a pooled fit (rather than one
+        model per symbol) is what lets many symbols a day actually accelerate
+        warm-up. `signal_present` keeps the forecast itself trained only on
+        decision-specific dip days, exactly like trade_memory.py's own
+        signal_present column, even though every symbol's daily context is
+        now durably recorded regardless.
         """
         if not bool(self.parameters.get("portfolio_memory_enabled", True)):
             return RotationForecast(
@@ -951,6 +965,12 @@ This automated message is not financial advice.
                 price=price,
                 dip_percent=dip_percent,
                 news_score=news_score,
+                signal_present=signal_present,
+                live_spread_percent=live_spread_percent,
+                recent_avg_volume=recent_avg_volume,
+                historical_expected_profit=historical_expected_profit,
+                historical_win_probability=historical_win_probability,
+                historical_return_stdev=historical_return_stdev,
             )
             return result
         except Exception as exc:
@@ -1296,12 +1316,20 @@ This automated message is not financial advice.
 
     def _portfolio_signal(
         self, symbol: str
-    ) -> dict[str, float | int | str | None] | None:
-        """Estimate next-session return from this symbol's prior comparable dips.
+    ) -> dict[str, float | int | str | bool | None] | None:
+        """Compute today's per-symbol trade context, whether or not it qualifies.
 
-        This is a historical average, not a prediction or a promised profit.
-        Requiring prior observations prevents a freshly listed symbol from being
-        selected purely because it happened to dip today.
+        Returns ``None`` only when there isn't enough data to say anything
+        useful about `symbol` at all: no bars, no price, or it fails the
+        discovery liquidity floor -- a real trade-blocking guard applied to
+        the whole evaluated universe, unchanged here. Otherwise this always
+        returns a context dict so every watched/held symbol contributes daily
+        learning facts to `portfolio_memory.py`, regardless of whether
+        today's dip clears `dip_threshold_percent`. The `qualifies` field is
+        the sole gate `_run_portfolio_iteration` uses for trading eligibility
+        (its `eligible` filter and `held_signals` construction both re-check
+        it) -- everything else here is learning context, not a trading signal
+        by itself.
         """
         bars = self.get_historical_prices(
             symbol, int(self.parameters["portfolio_analysis_days"]), "day"
@@ -1330,11 +1358,15 @@ This automated message is not financial advice.
         min_price = float(self.parameters.get("portfolio_discovery_min_price_dollars", 0.0))
         if min_price > 0 and float(price) < min_price:
             return None
-        min_avg_volume = float(self.parameters.get("portfolio_discovery_min_avg_volume", 0.0))
-        if min_avg_volume > 0 and "volume" in bars.df.columns:
+        recent_avg_volume: float | None = None
+        volume_available = "volume" in bars.df.columns
+        if volume_available:
             recent_volume = bars.df["volume"].dropna().tail(lookback)
-            if recent_volume.empty or float(recent_volume.mean()) < min_avg_volume:
-                return None
+            if not recent_volume.empty:
+                recent_avg_volume = float(recent_volume.mean())
+        min_avg_volume = float(self.parameters.get("portfolio_discovery_min_avg_volume", 0.0))
+        if min_avg_volume > 0 and volume_available and (recent_avg_volume is None or recent_avg_volume < min_avg_volume):
+            return None
         threshold = float(self.parameters["dip_threshold_percent"])
         returns: list[float] = []
         # Historical dips are measured against the *previous* lookback bars,
@@ -1347,8 +1379,6 @@ This automated message is not financial advice.
                 returns.append(((rows[index + 1][1] - rows[index][1]) / rows[index][1]) * 100.0)
         recent_high = max(high for high, _ in rows[-lookback:])
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
-        if current_dip < threshold or not returns:
-            return None
         configured_round_trip_cost = float(
             self.parameters.get("portfolio_round_trip_cost_percent", 0.20)
         )
@@ -1358,47 +1388,68 @@ This automated message is not financial advice.
         # quote feed is IEX-only -- so a thinly traded discovered symbol
         # can't look cheaper to trade than it actually is on a sub-$100
         # order where the spread is a much larger share of the target edge.
+        # Fetched for every symbol reaching this point, not just a qualifying
+        # dip, so it becomes one of the daily learning facts too.
         live_spread = self._live_spread_percent(symbol)
         round_trip_cost = (
             max(configured_round_trip_cost, live_spread)
             if live_spread is not None
             else configured_round_trip_cost
         )
-        net_returns = [value - round_trip_cost for value in returns]
-        walk_forward_returns = self._walk_forward_net_returns(
-            returns,
-            round_trip_cost,
-            int(self.parameters.get("portfolio_oos_min_observations", 10)),
-            float(self.parameters["portfolio_min_expected_profit_percent"]),
-        )
-        mean_net_return = sum(net_returns) / len(net_returns)
-        variance = sum((value - mean_net_return) ** 2 for value in net_returns) / len(net_returns)
-        wins = sum(1 for value in net_returns if value > 0)
+        expected_profit: float | None = None
+        observations = 0
+        oos_expected_profit: float | None = None
+        oos_observations = 0
+        return_stdev: float | None = None
+        win_probability: float | None = None
+        if returns:
+            net_returns = [value - round_trip_cost for value in returns]
+            walk_forward_returns = self._walk_forward_net_returns(
+                returns,
+                round_trip_cost,
+                int(self.parameters.get("portfolio_oos_min_observations", 10)),
+                float(self.parameters["portfolio_min_expected_profit_percent"]),
+            )
+            mean_net_return = sum(net_returns) / len(net_returns)
+            variance = sum((value - mean_net_return) ** 2 for value in net_returns) / len(net_returns)
+            wins = sum(1 for value in net_returns if value > 0)
+            expected_profit = mean_net_return
+            observations = len(returns)
+            oos_expected_profit = (
+                sum(walk_forward_returns) / len(walk_forward_returns) if walk_forward_returns else None
+            )
+            oos_observations = len(walk_forward_returns)
+            return_stdev = math.sqrt(variance)
+            win_probability = (wins + 1) / (len(net_returns) + 2)
         return {
             "symbol": symbol,
             "price": float(price),
             "dip": current_dip,
+            # Today's dip must clear the threshold *and* there must be at
+            # least one historical comparable dip to estimate an edge from.
+            "qualifies": current_dip >= threshold and bool(returns),
             # This net historical mean is a coarse current estimate. It is
             # never enough by itself: _run_portfolio_iteration also requires
-            # the chronological walk-forward result below.
-            "expected_profit": mean_net_return,
-            "observations": len(returns),
-            "oos_expected_profit": (
-                sum(walk_forward_returns) / len(walk_forward_returns)
-                if walk_forward_returns
-                else None
-            ),
-            "oos_observations": len(walk_forward_returns),
+            # the chronological walk-forward result below. None when there is
+            # no historical comparable dip yet.
+            "expected_profit": expected_profit,
+            "observations": observations,
+            "oos_expected_profit": oos_expected_profit,
+            "oos_observations": oos_observations,
             # Feed the risky/conservative reasoning pattern in
             # _posture_adjusted_edge: how spread out this symbol's past
             # dip-signal outcomes were, and a Laplace-smoothed win rate
             # (matches TradeMemory.opportunity_probability's convention).
-            "return_stdev": math.sqrt(variance),
-            "win_probability": (wins + 1) / (len(net_returns) + 2),
+            "return_stdev": return_stdev,
+            "win_probability": win_probability,
             # Exposed so callers (PortfolioMemory blending) can net a learned
             # edge against the same per-symbol cost basis expected_profit
             # already used, instead of the one flat configured guess.
             "round_trip_cost": round_trip_cost,
+            # Daily learning facts beyond dip/news: liquidity/cost context
+            # that PortfolioMemory now records for every evaluated symbol.
+            "live_spread_percent": live_spread,
+            "recent_avg_volume": recent_avg_volume,
         }
 
     def _portfolio_signals(
@@ -1536,10 +1587,11 @@ This automated message is not financial advice.
 
     def _autonomous_universe(self) -> AutonomousUniverse:
         return AutonomousUniverse(
-            Path(str(self.parameters["portfolio_universe_state_file"])),
+            Path(str(self.parameters["portfolio_universe_database_file"])),
             int(self.parameters["portfolio_discovery_refresh_days"]),
             int(self.parameters["portfolio_discovery_batch_size"]),
             paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
+            legacy_json_path=Path(str(self.parameters["portfolio_universe_state_file"])),
         )
 
     def _symbol_reference(self) -> SymbolReference:
@@ -1847,16 +1899,41 @@ This automated message is not financial advice.
             # neutral 0) is trusted over the market-wide score; only a
             # symbol with no coverage at all falls back to it.
             news_score = symbol_news_scores.get(symbol, market_wide_news_score)
-            # Every signal here already implies a dip >= threshold today
-            # (_portfolio_signal's own filter), so every symbol contributes
-            # an observation -- this is what makes "multiple symbols a day"
-            # warm PortfolioMemory up far faster than the A/B pair's one
-            # observation/day. Sequential, not parallelized, to avoid
-            # concurrent DuckDB writes from multiple threads.
+            qualifies = bool(signal.get("qualifies"))
+            # Every symbol reaching this point has usable bars/price/liquidity
+            # (see _portfolio_signal), so every one of them -- not just those
+            # with a qualifying dip today -- contributes a daily learning
+            # observation; this is what "learn from every watched/held
+            # symbol" means. signal_present keeps the pooled regression
+            # trained on decision-specific dip days only, exactly like
+            # trade_memory.py's own signal_present column, so broader daily
+            # coverage doesn't dilute the forecast. Sequential, not
+            # parallelized, to avoid concurrent DuckDB writes from multiple
+            # threads.
             self._backfill_portfolio_memory(symbol)
             forecast = self._update_portfolio_memory(
-                symbol, float(signal["price"]), float(signal["dip"]), news_score
+                symbol,
+                float(signal["price"]),
+                float(signal["dip"]),
+                news_score,
+                signal_present=qualifies,
+                live_spread_percent=signal.get("live_spread_percent"),
+                recent_avg_volume=signal.get("recent_avg_volume"),
+                historical_expected_profit=signal.get("expected_profit"),
+                historical_win_probability=signal.get("win_probability"),
+                historical_return_stdev=signal.get("return_stdev"),
             )
+            # Ranking/eligibility fields are only meaningful -- and only ever
+            # read downstream -- for a symbol that qualifies today; leaving
+            # them absent/None for the rest reproduces exactly how these
+            # symbols behaved before they started appearing in `signals` at
+            # all (the eligible filter and held_signals below both re-check
+            # `qualifies` for the same reason).
+            if not qualifies:
+                signal["learned_edge_ready"] = False
+                signal["learned_edge"] = None
+                signal["posture_adjusted_edge"] = None
+                continue
             signal["learned_edge_ready"] = forecast.ready
             signal["learned_edge"] = (
                 forecast.predicted_edge_percent - float(signal["round_trip_cost"])
@@ -1870,7 +1947,8 @@ This automated message is not financial advice.
         eligible = [
             signal
             for signal in signals
-            if int(signal["observations"]) >= minimum_observations
+            if bool(signal.get("qualifies"))
+            and int(signal["observations"]) >= minimum_observations
             and float(signal["expected_profit"]) >= minimum_profit
             and int(signal["oos_observations"]) >= oos_minimum_observations
             and signal["oos_expected_profit"] is not None
@@ -2003,7 +2081,9 @@ This automated message is not financial advice.
                 # holding looks weakest and by how much; the
                 # PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT floor is unchanged.
                 held_signals = {
-                    str(signal["symbol"]): signal for signal in signals if signal["symbol"] in held_working
+                    str(signal["symbol"]): signal
+                    for signal in signals
+                    if signal["symbol"] in held_working and bool(signal.get("qualifies"))
                 }
                 for candidate in remaining_candidates:
                     target_symbol = str(candidate["symbol"])

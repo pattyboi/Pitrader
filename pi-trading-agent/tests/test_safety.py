@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 import logging
 import sqlite3
 import threading
@@ -10,7 +11,9 @@ import duckdb
 import pandas as pd
 import pytest
 
+import autonomous_universe
 from adaptive_news_model import AdaptiveNewsModel
+from autonomous_universe import AutonomousUniverse
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
@@ -81,6 +84,105 @@ def test_portfolio_memory_settlement_is_scoped_to_the_same_symbol(tmp_path: Path
             "SELECT next_session_return_percent FROM observations WHERE symbol = 'AAPL'"
         ).fetchone()[0]
     assert aapl_return is None
+
+
+def test_portfolio_memory_regression_ignores_non_signal_observations(tmp_path: Path) -> None:
+    # Broadening daily coverage to every evaluated symbol (not just today's
+    # dip-signal ones) must never dilute the pooled fit with ordinary
+    # non-dip market days -- signal_present is what keeps them out.
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=2, maximum_observations=50)
+    memory.backfill_history("SPY", [("2026-01-02", 5.0, 1.0), ("2026-01-05", 6.0, 2.0)])
+    with duckdb.connect(str(db_path)) as conn:
+        memory._create_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO observations
+                (evaluation_date, symbol, price, dip_percent, news_score,
+                 next_session_return_percent, signal_present)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("2026-01-06", "AAPL", 100.0, 1.0, 0, 9.0, 0),
+        )
+        conn.commit()
+
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+
+    assert forecast.observations == 2
+
+
+def test_portfolio_memory_records_daily_facts_for_a_non_qualifying_symbol(tmp_path: Path) -> None:
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+
+    memory.update_and_forecast(
+        "2026-01-02",
+        "AAPL",
+        price=150.0,
+        dip_percent=1.0,
+        news_score=2,
+        signal_present=False,
+        live_spread_percent=0.3,
+        recent_avg_volume=1_000_000.0,
+        historical_expected_profit=0.8,
+        historical_win_probability=0.6,
+        historical_return_stdev=1.2,
+    )
+
+    with duckdb.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT signal_present, live_spread_percent, recent_avg_volume, "
+            "historical_expected_profit, historical_win_probability, historical_return_stdev "
+            "FROM observations WHERE symbol = 'AAPL'"
+        ).fetchone()
+
+    assert row == pytest.approx((0, 0.3, 1_000_000.0, 0.8, 0.6, 1.2))
+
+
+def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=7, batch_size=2)
+    payload = [{"symbol": s, "tradable": True, "fractionable": True} for s in ["AAPL", "MSFT", "NVDA", "TSLA"]]
+    monkeypatch.setattr(
+        autonomous_universe.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload),
+    )
+
+    first = universe.next_batch("key", "secret")
+    second = universe.next_batch("key", "secret")
+
+    assert first == ["AAPL", "MSFT"]
+    assert second == ["NVDA", "TSLA"]
+
+
+def test_autonomous_universe_remember_refreshes_recency_of_a_re_mentioned_symbol(tmp_path: Path) -> None:
+    universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=7, batch_size=5)
+    universe.remember(["AAA"], limit=2)
+    universe.remember(["BBB"], limit=2)
+    universe.remember(["AAA"], limit=2)  # re-mention refreshes AAA's recency
+    universe.remember(["CCC"], limit=2)  # trims BBB, the one never re-mentioned
+
+    assert universe.managed_symbols() == ["AAA", "CCC"]
+
+
+def test_autonomous_universe_migrates_legacy_json_once(tmp_path: Path) -> None:
+    legacy = tmp_path / "universe.json"
+    legacy.write_text(
+        json.dumps({"symbols": ["AAPL", "MSFT"], "cursor": 1, "refreshed": "2026-07-01", "learned": ["AAPL"]})
+    )
+    database_path = tmp_path / "universe.duckdb"
+
+    universe = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
+    assert universe.managed_symbols() == ["AAPL"]
+    with duckdb.connect(str(database_path)) as conn:
+        cursor = conn.execute("SELECT value FROM universe_state WHERE name = 'cursor'").fetchone()[0]
+    assert cursor == "1"
+
+    # Migration only ever runs once: changing the legacy file afterward must
+    # not re-import or overwrite already-migrated state.
+    legacy.write_text(json.dumps({"symbols": [], "cursor": 0, "refreshed": "2026-07-02", "learned": ["ZZZZ"]}))
+    universe_again = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
+    assert universe_again.managed_symbols() == ["AAPL"]
 
 
 def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
@@ -694,6 +796,54 @@ def test_portfolio_signal_exposes_round_trip_cost_for_memory_blending() -> None:
     result = strategy._portfolio_signal("OK")
 
     assert result["round_trip_cost"] == pytest.approx(0.20)
+
+
+def test_portfolio_signal_qualifies_true_when_dip_and_history_both_present() -> None:
+    strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
+
+    result = strategy._portfolio_signal("OK")
+
+    assert result["qualifies"] is True
+
+
+def test_portfolio_signal_still_recorded_when_todays_dip_is_below_threshold() -> None:
+    # Below-threshold symbols used to be discarded entirely (None); they now
+    # still carry daily learning context (historical backtest ran), just
+    # with qualifies=False so they can never leak into trading eligibility.
+    strategy = _signal_test_strategy(last_price=98.0, volume=[200000] * 5)
+
+    result = strategy._portfolio_signal("OK")
+
+    assert result is not None
+    assert result["qualifies"] is False
+    assert result["expected_profit"] is not None
+
+
+def test_portfolio_signal_still_context_only_without_any_historical_dip() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "portfolio_analysis_days": 252,
+        "recent_high_lookback_days": 3,
+        "dip_threshold_percent": 5.0,
+        "portfolio_round_trip_cost_percent": 0.20,
+        "portfolio_oos_min_observations": 10,
+        "portfolio_min_expected_profit_percent": 1.0,
+        "portfolio_discovery_min_price_dollars": 5.0,
+        "portfolio_discovery_min_avg_volume": 100000,
+    }
+    bars = SimpleNamespace(
+        df=pd.DataFrame({"high": [100.0] * 5, "close": [100.0] * 5, "volume": [200000] * 5})
+    )
+    strategy.get_historical_prices = lambda *_args, **_kwargs: bars
+    strategy.get_last_price = lambda _symbol: 90.0  # today's dip alone clears the threshold
+    strategy._get_bid_ask = lambda _symbol: None
+
+    result = strategy._portfolio_signal("NEW")
+
+    assert result is not None
+    assert result["qualifies"] is False  # no historical comparable dip to estimate an edge from
+    assert result["expected_profit"] is None
+    assert result["observations"] == 0
 
 
 def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:
