@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(**/pi-trading-agent/config.json)",
+      "Read(**/.venv/**)",
+      "Read(**/__pycache__/**)",
+      "Read(**/.pytest_cache/**)",
+      "Read(**/*.duckdb)",
+      "Read(**/logs/**)"
+    ]
+  }
+}
