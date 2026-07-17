@@ -160,7 +160,9 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
             return None
-        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+        text = trafilatura.extract(
+            downloaded, include_comments=False, include_tables=False, fast=True
+        )
         if not text or not text.strip():
             return None
 
