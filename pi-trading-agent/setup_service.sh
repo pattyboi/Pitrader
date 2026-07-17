@@ -59,6 +59,11 @@ Restart=always
 RestartSec=30
 TimeoutStopSec=15
 KillSignal=SIGINT
+# control-group (the default) signals every thread in the cgroup individually, which
+# this multi-threaded Lumibot process never cleanly recovers from -- every stop needed
+# a SIGKILL after the full TimeoutStopSec. Signaling only the main PID lets Python's
+# normal SIGINT handling run and the process exits gracefully in under a second.
+KillMode=process
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true
 PrivateTmp=true
