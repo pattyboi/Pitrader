@@ -18,7 +18,7 @@ from lumibot.strategies import Strategy
 
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
-from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
+from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
@@ -417,6 +417,11 @@ class AssetRotationStrategy(Strategy):
                 f"Date: {report_date}",
                 f"Evaluation time: {self.get_datetime().isoformat()}",
                 "Mode: portfolio",
+                *(
+                    [f"Summary: {report['daily_narrative']}", ""]
+                    if report.get("daily_narrative")
+                    else []
+                ),
                 f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
                 f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
                 f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
@@ -425,6 +430,7 @@ class AssetRotationStrategy(Strategy):
                 f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
                 f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
                 f"Discovery status: {report.get('discovery_status', 'ok')}",
+                f"Discovery red flags: {report.get('discovery_red_flags', 'none')}",
                 f"Dip threshold: {report['threshold']:.2f}%",
                 f"News risk level: {report.get('news_risk_level', 'unavailable')}",
                 f"News score: {report.get('news_score', 'unavailable')}",
@@ -563,6 +569,7 @@ class AssetRotationStrategy(Strategy):
             ),
             ("Discovered symbols", report.get("discovered_symbols", "none")),
             ("Discovery status", report.get("discovery_status", "ok")),
+            ("Discovery red flags", report.get("discovery_red_flags", "none")),
             ("Dip threshold", f"{report['threshold']:.2f}%"),
         ]
 
@@ -606,6 +613,14 @@ class AssetRotationStrategy(Strategy):
             ]
         )
 
+        narrative = str(report.get("daily_narrative") or "").strip()
+        narrative_block = (
+            '<tr><td style="padding:14px 24px 0;color:#333333;font-size:13px;'
+            f'line-height:1.6;font-style:italic;">{html.escape(narrative)}</td></tr>'
+            if narrative
+            else ""
+        )
+
         return f"""\
 <!doctype html>
 <html>
@@ -622,6 +637,7 @@ class AssetRotationStrategy(Strategy):
 <tr><td style="padding:14px 16px;color:{badge_fg};font-size:14px;font-weight:600;">{html.escape(status)}</td></tr>
 </table>
 </td></tr>
+{narrative_block}
 <tr><td style="padding:0 24px 8px;">
 {sections}
 </td></tr>
@@ -1525,6 +1541,137 @@ This automated message is not financial advice.
             return dict(news_context.per_symbol_scores)
 
     @staticmethod
+    def _articles_for_symbol(news_context: NewsContext, symbol: str) -> list[dict]:
+        """Articles Alpaca itself tagged with this symbol -- a conservative
+        subset of _symbol_news_scores' coverage (which also credits untagged
+        text-scan matches), but enough to ground an LLM explanation without
+        re-running that bounded scan here."""
+        if not news_context.available:
+            return []
+        return [
+            {"headline": article.get("headline", ""), "summary": article.get("summary", "")}
+            for article in news_context.per_article
+            if symbol in article.get("symbols", [])
+        ]
+
+    def _generate_daily_narrative(self, report: dict[str, Any]) -> str:
+        """A short plain-English recap of this iteration for the daily email,
+        from the local model. Purely descriptive summarization of decisions
+        already made elsewhere in this method -- never a new decision itself,
+        and never consumed by any trading logic. Fails open to an empty
+        string, in which case the email simply omits the section."""
+        if not bool(self.parameters.get("llm_news_enabled", False)):
+            return ""
+        try:
+            actions = report.get("portfolio_actions") or ["none"]
+            context_lines = [
+                f"Result: {report.get('status', 'unavailable')}",
+                f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
+                f"News risk: {report.get('news_risk_level', 'unavailable')} "
+                f"(score {report.get('news_score', 'unavailable')})",
+                f"LLM risk assessment: {report.get('llm_risk_level', 'unavailable')} "
+                f"- {report.get('llm_reasoning', '')}",
+                f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
+                f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
+                "Actions taken this iteration:",
+                *[f"- {action}" for action in actions],
+            ]
+            analyzer = LLMNewsAnalyzer(
+                model=str(self.parameters["llm_news_model"]),
+                base_url=str(self.parameters.get("llm_news_base_url", "")),
+            )
+            return analyzer.summarize_day("\n".join(context_lines))
+        except Exception as exc:
+            self.log_message(
+                f"Daily narrative failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return ""
+
+    def _generate_exit_narrative(
+        self, symbol: str, price_reason: str, news_context: NewsContext
+    ) -> str:
+        """One human-readable line connecting a just-submitted exit to that
+        symbol's own headlines, when it has dedicated coverage today. Purely
+        descriptive -- the exit already fired on price alone; this cannot
+        change or delay it. Fails open to an empty string."""
+        if not bool(self.parameters.get("llm_news_enabled", False)) or not news_context.available:
+            return ""
+        articles = self._articles_for_symbol(news_context, symbol)
+        if not articles:
+            return ""
+        try:
+            analyzer = LLMNewsAnalyzer(
+                model=str(self.parameters["llm_news_model"]),
+                base_url=str(self.parameters.get("llm_news_base_url", "")),
+            )
+            return analyzer.explain_exit(symbol, price_reason, articles)
+        except Exception as exc:
+            self.log_message(
+                f"Exit narrative failed safely for {symbol}: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return ""
+
+    def _check_discovery_red_flags(
+        self,
+        discovered_only: list[str],
+        news_context: NewsContext,
+        symbol_news_scores: dict[str, int],
+        report: dict[str, Any],
+    ) -> set[str]:
+        """Screen newly-discovered candidates (never a held position) whose
+        dedicated coverage leans negative for a severe, company-specific risk
+        the quantitative liquidity/price floor can't see. Advisory by default
+        -- flags are logged and reported but the symbol stays eligible --
+        exactly like LLM_NEWS_BLOCK_ON_HIGH_RISK's advisory-by-default
+        pattern; only excludes the symbol from today's evaluation when
+        PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED is true. Skips any symbol
+        without dedicated negative coverage rather than spending a call on
+        nothing to screen. Fails open per-symbol: a failed check leaves that
+        symbol eligible, exactly as before this feature existed.
+        """
+        if not bool(self.parameters.get("llm_news_enabled", False)) or not news_context.available:
+            return set()
+        block_enabled = bool(self.parameters.get("portfolio_discovery_llm_block_enabled", False))
+        flags: dict[str, str] = {}
+        excluded: set[str] = set()
+        for symbol in discovered_only:
+            score = symbol_news_scores.get(symbol)
+            if score is None or score >= 0:
+                continue
+            articles = self._articles_for_symbol(news_context, symbol)
+            if not articles:
+                continue
+            try:
+                analyzer = LLMNewsAnalyzer(
+                    model=str(self.parameters["llm_news_model"]),
+                    base_url=str(self.parameters.get("llm_news_base_url", "")),
+                )
+                result: RedFlagCheck = analyzer.check_red_flag(symbol, articles)
+            except Exception as exc:
+                self.log_message(
+                    f"Discovery red-flag check failed safely for {symbol}: "
+                    f"{type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+                continue
+            if result.available and result.flagged:
+                flags[symbol] = result.reason
+                self.log_message(
+                    f"Discovery red flag: {symbol} - {result.reason}"
+                    + (" (excluded today)" if block_enabled else " (advisory only)"),
+                    color="yellow",
+                )
+                if block_enabled:
+                    excluded.add(symbol)
+        if flags:
+            report["discovery_red_flags"] = "; ".join(
+                f"{symbol}: {reason}" for symbol, reason in flags.items()
+            )
+        return excluded
+
+    @staticmethod
     def _posture_adjusted_edge(
         signal: dict[str, float | int | str | None],
         posture: str,
@@ -1768,6 +1915,17 @@ This automated message is not financial advice.
             ),
         )
 
+        # Screen only symbols discovery itself just surfaced -- never a held
+        # or statically-configured symbol -- for a severe, company-specific
+        # red flag the liquidity/price floor can't see. Advisory by default;
+        # see _check_discovery_red_flags.
+        discovered_only = sorted(set(symbols) - managed_symbols - set(held))
+        excluded_symbols = self._check_discovery_red_flags(
+            discovered_only, news_context, symbol_news_scores, report
+        )
+        if excluded_symbols:
+            symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
+
         # The adaptive model keeps learning from the configured market proxy
         # (Asset B) so its forecast can veto portfolio trades exactly as it
         # vetoes A/B rotations. A missing proxy price fails open.
@@ -1906,6 +2064,9 @@ This automated message is not financial advice.
                 actions.append(f"Portfolio exit rejected: {source} sale was not accepted")
                 continue
             actions.append(f"Portfolio exit submitted: {source} {exit_reasons[source]}")
+            exit_narrative = self._generate_exit_narrative(source, exit_reasons[source], news_context)
+            if exit_narrative:
+                actions.append(f"Exit note: {source} - {exit_narrative}")
             held_working.pop(source, None)
             claimed_symbols.add(source)
 
@@ -2207,6 +2368,7 @@ This automated message is not financial advice.
             )
         finally:
             self._record_memory_decision(report)
+            report["daily_narrative"] = self._generate_daily_narrative(report)
             self._send_daily_email(report)
 
     def on_filled_order(

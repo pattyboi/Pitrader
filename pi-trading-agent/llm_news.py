@@ -32,6 +32,10 @@ RISK_LEVELS = ("high", "elevated", "normal", "constructive")
 # means this is almost never paying for a cold model load.
 REQUEST_TIMEOUT_SECONDS = 90
 MAX_RESPONSE_TOKENS = 4096
+# The narrative/exit/red-flag replies are meant to be short; a smaller cap
+# keeps them fast and terse without needing the assessment's full budget.
+NARRATIVE_MAX_TOKENS = 300
+MAX_NARRATIVE_CHARS = 600
 
 
 @dataclass
@@ -43,6 +47,17 @@ class LLMNewsAssessment:
     risk_level: str = "unknown"
     reasoning: str = ""
     explanation: str = "LLM news assessment was not evaluated."
+
+
+@dataclass
+class RedFlagCheck:
+    """Whether a discovery candidate's own coverage suggests a severe,
+    company-specific risk (fraud, delisting, imminent bankruptcy, major
+    legal action) that the quantitative liquidity/price floor can't see."""
+
+    available: bool
+    flagged: bool = False
+    reason: str = ""
 
 
 SYSTEM_PROMPT = (
@@ -78,6 +93,42 @@ JSON_FORMAT_INSTRUCTIONS = (
     '"risk_level": "high" | "elevated" | "normal" | "constructive", '
     '"reasoning": "<two or three plain sentences citing the specific '
     'headlines that drove the score>"}'
+)
+
+DAY_SUMMARY_SYSTEM_PROMPT = (
+    "You are writing a two-to-three sentence plain-English recap of one "
+    "day's activity for a small automated trading agent, for a "
+    "non-technical operator reading a daily email. You will be given the "
+    "day's outcome, risk signals, and the actions actually taken. Summarize "
+    "only what is given -- do not invent numbers, symbols, or reasoning not "
+    "present in the input. Do not give investment advice or predictions. "
+    "Plain text only, no markdown, no JSON."
+)
+
+EXIT_NARRATIVE_SYSTEM_PROMPT = (
+    "A small automated trading agent just sold a position for a stated "
+    "price-based reason (a take-profit, stop-loss, or holding-horizon "
+    "rule) -- that decision is already final and this note cannot change "
+    "it. In one plain sentence, note anything in the provided headlines "
+    "about this specific company that plausibly relates to today's price "
+    "move. If nothing in the coverage seems relevant, say so briefly. Base "
+    "this only on the provided headlines. Plain text only, no markdown, no "
+    "JSON."
+)
+
+RED_FLAG_SYSTEM_PROMPT = (
+    "You are screening one company's recent headlines before a small "
+    "automated trading agent is allowed to consider buying it today. Flag "
+    'red_flag=true only for a severe, company-specific risk clearly stated '
+    "in the headlines: fraud or accounting restatement, imminent "
+    "bankruptcy, stock delisting, or a major regulatory/legal action "
+    "directly threatening the company. Do NOT flag routine bad news such "
+    "as a single earnings miss, an analyst downgrade, or sector-wide "
+    "weakness -- those are normal and already handled elsewhere. Base this "
+    "only on the provided headlines; do not assume anything not stated."
+    "\n\nRespond with only a JSON object and no other text, using exactly "
+    "these keys:\n"
+    '{"red_flag": true | false, "reason": "<one short plain sentence>"}'
 )
 
 
@@ -134,6 +185,108 @@ class LLMNewsAnalyzer:
         return "\n".join(lines)
 
     @staticmethod
+    def _clean_narrative(text: str) -> str:
+        """Strip code fences/quoting a model might add and bound the length;
+        these replies are read by a human, not parsed, so this is tolerant
+        rather than strict like `_parse_assessment`/`_parse_red_flag`."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = cleaned.strip("\"'").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned[:MAX_NARRATIVE_CHARS]
+
+    @staticmethod
+    def _parse_red_flag(text: str) -> RedFlagCheck:
+        """Validate and repair a model reply into a usable red-flag check."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        data = json.loads(cleaned)
+        flagged = bool(data.get("red_flag", False))
+        reason = str(data.get("reason", "")).strip()
+        return RedFlagCheck(available=True, flagged=flagged, reason=reason)
+
+    def _chat(
+        self,
+        system_prompt: str,
+        user_text: str,
+        *,
+        json_mode: bool,
+        max_tokens: int = MAX_RESPONSE_TOKENS,
+    ) -> str:
+        """Shared request/response plumbing for every call this class makes."""
+        import requests
+
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        response = requests.post(
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        text = response.json()["choices"][0]["message"]["content"]
+        if not text:
+            raise RuntimeError("The model returned an empty reply")
+        return text
+
+    def summarize_day(self, context_text: str) -> str:
+        """A short plain-English recap of one iteration's report, for the
+        daily email. Purely descriptive summarization of decisions already
+        made -- never a new decision itself. Raises on any problem; callers
+        should fail open to an empty string (the email just omits it)."""
+        if not context_text.strip():
+            return ""
+        text = self._chat(
+            DAY_SUMMARY_SYSTEM_PROMPT, context_text, json_mode=False, max_tokens=NARRATIVE_MAX_TOKENS
+        )
+        return self._clean_narrative(text)
+
+    def explain_exit(self, symbol: str, price_reason: str, articles: list[dict]) -> str:
+        """One plain sentence connecting a just-submitted exit to that
+        symbol's own headlines, if it has dedicated coverage today. Purely
+        descriptive -- the exit already fired on price alone before this is
+        ever called. Raises on any problem; callers should fail open."""
+        article_text = self._format_articles(articles)
+        if not article_text:
+            return ""
+        user_text = (
+            f"{symbol} was just sold by an automated trading agent. Reason "
+            f"given: {price_reason}.\n\n"
+            f"Today's news coverage specifically about {symbol}:\n\n{article_text}"
+        )
+        text = self._chat(
+            EXIT_NARRATIVE_SYSTEM_PROMPT, user_text, json_mode=False, max_tokens=NARRATIVE_MAX_TOKENS
+        )
+        return self._clean_narrative(text)
+
+    def check_red_flag(self, symbol: str, articles: list[dict]) -> RedFlagCheck:
+        """Screen one discovery candidate's dedicated coverage for a severe,
+        company-specific risk before it's allowed into today's tradeable
+        universe. Raises on any problem; callers should fail open (treat as
+        not flagged, exactly as before this feature)."""
+        article_text = self._format_articles(articles)
+        if not article_text:
+            return RedFlagCheck(available=False)
+        user_text = f"Recent headlines specifically about {symbol}:\n\n{article_text}"
+        text = self._chat(
+            RED_FLAG_SYSTEM_PROMPT, user_text, json_mode=True, max_tokens=NARRATIVE_MAX_TOKENS
+        )
+        return self._parse_red_flag(text)
+
+    @staticmethod
     def _parse_assessment(text: str, article_count: int, model: str) -> LLMNewsAssessment:
         """Validate and repair a model reply into a usable assessment."""
         cleaned = text.strip()
@@ -178,8 +331,6 @@ class LLMNewsAnalyzer:
         today's actual evaluation universe; omitting them reproduces the
         original market-headlines-only prompt exactly.
         """
-        import requests
-
         article_text = self._format_articles(articles)
         if not article_text:
             return LLMNewsAssessment(
@@ -195,26 +346,5 @@ class LLMNewsAnalyzer:
         )
         if symbol_context:
             user_text += "\n\n" + symbol_context
-        response = requests.post(
-            f"{self.base_url.rstrip('/')}/chat/completions",
-            headers={"Content-Type": "application/json"},
-            json={
-                "model": self.model,
-                "max_tokens": MAX_RESPONSE_TOKENS,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS,
-                    },
-                    {"role": "user", "content": user_text},
-                ],
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        text = payload["choices"][0]["message"]["content"]
-        if not text:
-            raise RuntimeError("The model returned an empty assessment")
+        text = self._chat(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS, user_text, json_mode=True)
         return self._parse_assessment(text, len(articles), self.model)

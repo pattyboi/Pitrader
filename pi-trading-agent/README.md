@@ -386,6 +386,7 @@ chmod 600 config.json
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
 | `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news harder); `risky` favors raw historical edge. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
+| `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` | Lets a discovery red-flag check (see below) actually exclude a flagged symbol for the day instead of only logging it | `false` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -814,6 +815,37 @@ The log line looks like:
 ```text
 LLM news assessment: risk=elevated, score=-3. Several articles describe ...
 ```
+
+#### Other uses of the local model
+
+Once the model is running locally for free with no rate limit, three more
+places reuse it. All three are purely descriptive or, in the discovery
+case, advisory by default — none can create a trade, and none run unless
+`LLM_NEWS_ENABLED` is `true`.
+
+- **Daily email summary.** After the iteration finishes, a short 2-3
+  sentence plain-English recap of the day's outcome and actions is
+  generated from the same report data the rest of the email already shows,
+  and appears at the top of the email (`report["daily_narrative"]`). This
+  never feeds back into any decision — it's read-only, for the operator.
+- **Exit notes.** When a take-profit/stop-loss/holding-horizon exit fires
+  on a symbol that has its own dedicated news coverage today, one plain
+  sentence connecting the price move to that coverage is added to the
+  portfolio actions log and email (`"Exit note: SYMBOL - ..."`). The sale
+  itself already happened on price alone before this runs; it cannot delay
+  or change the exit.
+- **Discovery red-flag screening.** Before a symbol autonomous discovery
+  just surfaced (never a held or statically-configured symbol) enters
+  today's evaluation, if it has negative dedicated news coverage, the model
+  is asked whether that coverage describes a severe, company-specific risk
+  (fraud, delisting, imminent bankruptcy, major legal action) that the
+  price/volume liquidity floor can't see. By default this is advisory only
+  — a flag is logged and shown in the email (`Discovery red flags: ...`)
+  but the symbol stays eligible. Set `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED`
+  to `true` to actually exclude a flagged symbol from that day's evaluation
+  (it's simply reconsidered again on a later discovery cycle, never
+  permanently blacklisted). Symbols with no negative coverage aren't
+  checked at all, so most days this makes zero extra calls.
 
 #### LLM limitations
 
