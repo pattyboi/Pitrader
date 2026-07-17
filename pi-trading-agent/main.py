@@ -566,6 +566,7 @@ def main() -> int:
                 "email_to_address": config["EMAIL_TO_ADDRESS"],
                 "email_use_tls": config["EMAIL_USE_TLS"],
                 "email_state_file": str(BASE_DIR / ".last_email_report"),
+                "shutdown_diagnostic_file": str(BASE_DIR / ".shutdown_diagnostic.log"),
                 "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
                 "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
                 "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],

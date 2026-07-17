@@ -12,13 +12,15 @@ STATE_FILE="${PROJECT_DIR}/.cpu_watchdog_state"
 LOG_FILE="${PROJECT_DIR}/.cpu_watchdog.log"
 MAX_LOG_LINES=2000
 WARN_THRESHOLD_PCT=10
+# Overridable so tests can point at a fake cgroup tree instead of the host's.
+CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
 
 cgroup_path="$(systemctl show -p ControlGroup --value "${SERVICE_NAME}" 2>/dev/null || true)"
 if [[ -z "${cgroup_path}" ]]; then
     exit 0
 fi
 
-cpu_stat_file="/sys/fs/cgroup${cgroup_path}/cpu.stat"
+cpu_stat_file="${CGROUP_ROOT}${cgroup_path}/cpu.stat"
 if [[ ! -r "${cpu_stat_file}" ]]; then
     # Service isn't running (or cgroup v1 host) -- nothing to sample.
     exit 0
@@ -40,6 +42,14 @@ echo "${usage_usec} ${now_usec}" > "${STATE_FILE}"
 
 if [[ -z "${prev_usage_usec}" || -z "${prev_now_usec}" ]]; then
     # First sample since the watchdog started (or a restart) -- no interval yet.
+    exit 0
+fi
+
+if [[ "${usage_usec}" -lt "${prev_usage_usec}" ]]; then
+    # The service restarted since the last sample -- its cgroup's cpu.stat
+    # counter reset to near zero, so a naive delta would go negative. Treat
+    # this exactly like the no-previous-sample case above: re-baseline
+    # (already done via the state-file write) without logging a bogus %.
     exit 0
 fi
 

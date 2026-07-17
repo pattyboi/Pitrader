@@ -4,7 +4,10 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import logging
+import os
 import sqlite3
+import stat
+import subprocess
 import threading
 
 import duckdb
@@ -33,6 +36,46 @@ def test_market_open_time_is_logged_in_eastern_time() -> None:
 def test_next_trading_session_uses_the_exchange_holiday_calendar() -> None:
     assert is_next_trading_session("2026-07-02", "2026-07-06")
     assert not is_next_trading_session("2026-07-13", "2026-07-16")
+
+
+def test_cpu_watchdog_skips_a_negative_percentage_after_a_service_restart(tmp_path: Path) -> None:
+    """A restart resets the cgroup's cpu.stat counter; the script must not log a negative %."""
+    project_dir = tmp_path / "project"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    script_source = Path(__file__).resolve().parent.parent / "scripts" / "cpu_watchdog.sh"
+    script_path = scripts_dir / "cpu_watchdog.sh"
+    script_path.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_dir = cgroup_root / "system.slice" / "trading-agent.service"
+    cgroup_dir.mkdir(parents=True)
+    cpu_stat_file = cgroup_dir / "cpu.stat"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/usr/bin/env bash\necho '/system.slice/trading-agent.service'\n", encoding="utf-8"
+    )
+    fake_systemctl.chmod(fake_systemctl.stat().st_mode | stat.S_IEXEC)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CGROUP_ROOT"] = str(cgroup_root)
+
+    def run_sample(usage_usec: int) -> None:
+        cpu_stat_file.write_text(f"usage_usec {usage_usec}\n", encoding="utf-8")
+        subprocess.run([str(script_path)], check=True, env=env, cwd=str(project_dir))
+
+    run_sample(1_000_000)  # first sample: no prior state, nothing logged
+    run_sample(2_000_000)  # normal delta: logs one (large but non-negative) sample
+    run_sample(500_000)  # counter reset by a restart: must be skipped, not logged negative
+
+    log_lines = (project_dir / ".cpu_watchdog.log").read_text(encoding="utf-8").splitlines()
+    assert len(log_lines) == 1
+    assert not log_lines[0].split(",")[1].startswith("-")
 
 
 def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) -> None:
@@ -160,6 +203,31 @@ def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monke
     second = universe.next_batch("key", "secret")
 
     assert first == ["AAPL", "MSFT"]
+    assert second == ["NVDA", "TSLA"]
+
+
+def test_autonomous_universe_excludes_unpriceable_symbols_from_future_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=7, batch_size=2)
+    payload = [{"symbol": s, "tradable": True, "fractionable": True} for s in ["AAPL", "MSFT", "NVDA", "TSLA"]]
+    monkeypatch.setattr(
+        autonomous_universe.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload),
+    )
+    universe.remember(["MSFT"])
+
+    universe.exclude_unpriceable(["MSFT"])
+
+    first = universe.next_batch("key", "secret")
+    second = universe.next_batch("key", "secret")
+
+    # MSFT is dropped both from the remembered set and every future rotated
+    # batch, so it never resurfaces once it's confirmed to have no price data.
+    assert "MSFT" not in first
+    assert "MSFT" not in second
+    assert first == ["AAPL"]
     assert second == ["NVDA", "TSLA"]
 
 
@@ -309,6 +377,23 @@ def test_realizable_sale_price_is_none_when_nothing_is_available() -> None:
     strategy.get_last_price = lambda symbol: None
 
     assert strategy._realizable_sale_price("DARK") is None
+
+
+def test_on_abrupt_closing_dumps_every_thread_stack_to_the_diagnostic_file(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    diagnostic_path = tmp_path / "shutdown.log"
+    strategy.parameters = {"shutdown_diagnostic_file": str(diagnostic_path)}
+
+    strategy.on_abrupt_closing()
+
+    assert "Current thread" in diagnostic_path.read_text(encoding="utf-8")
+
+
+def test_on_abrupt_closing_is_a_no_op_without_a_configured_path() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {}
+
+    strategy.on_abrupt_closing()  # must not raise
 
 
 def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:

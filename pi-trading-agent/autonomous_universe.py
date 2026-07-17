@@ -98,8 +98,9 @@ class AutonomousUniverse:
                     "SELECT symbol FROM learned_symbols ORDER BY last_seen_rank ASC"
                 ).fetchall()
             ]
+            unpriceable = {row[0] for row in conn.execute("SELECT symbol FROM unpriceable_symbols").fetchall()}
             conn.commit()
-        return list(dict.fromkeys(learned + batch))
+        return [symbol for symbol in dict.fromkeys(learned + batch) if symbol not in unpriceable]
 
     def remember(self, symbols: list[str], limit: int = 30) -> None:
         """Keep historically qualifying symbols in future daily evaluations.
@@ -178,6 +179,37 @@ class AutonomousUniverse:
             )
             conn.commit()
 
+    def exclude_unpriceable(self, symbols: list[str]) -> None:
+        """Persist symbols confirmed to have no Alpaca price history at all.
+
+        Such a symbol (e.g. a thinly traded OTC ADR that passes the
+        tradable/fractionable asset filter in `next_batch` but has no
+        historical bars) can never clear the dip-signal check, so this stops
+        it from being handed back out -- and the same Alpaca round trip and
+        warning repeated -- the next time the rotation cursor, or a
+        `remember()`'d entry, would otherwise resurface it.
+        """
+        valid = sorted(
+            {
+                str(symbol).upper()
+                for symbol in symbols
+                if self._SYMBOL.fullmatch(str(symbol).upper())
+            }
+        )
+        if not valid:
+            return
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            conn.executemany(
+                "INSERT INTO unpriceable_symbols (symbol) VALUES (?) ON CONFLICT DO NOTHING",
+                [(symbol,) for symbol in valid],
+            )
+            conn.execute(
+                "DELETE FROM learned_symbols WHERE symbol IN (SELECT symbol FROM unpriceable_symbols)"
+            )
+            conn.commit()
+
     def forget_owned(self, symbols: list[str]) -> None:
         """Revoke management permission after a strategy-owned position is sold."""
         valid = sorted(
@@ -229,6 +261,13 @@ class AutonomousUniverse:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS owned_symbols (
+                symbol TEXT PRIMARY KEY
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS unpriceable_symbols (
                 symbol TEXT PRIMARY KEY
             )
             """

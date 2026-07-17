@@ -1,5 +1,6 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
+import faulthandler
 import html
 import json
 import math
@@ -100,6 +101,8 @@ class AssetRotationStrategy(Strategy):
         self._symbol_reference_refresh_lock = threading.Lock()
         self._symbol_reference_pending_symbols: set[str] = set()
         self._symbol_reference_refresh_running = False
+        self._unpriceable_symbols_lock = threading.Lock()
+        self._unpriceable_symbols_this_iteration: set[str] = set()
         # Historical bars are fetched during the first evaluation, after the
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
@@ -124,6 +127,28 @@ class AssetRotationStrategy(Strategy):
             [str(symbol).strip().upper() for symbol in self.parameters.get("portfolio_symbols", [])]
         )
 
+    def on_abrupt_closing(self) -> None:
+        """Snapshot every thread's stack the instant a stop signal arrives.
+
+        Lumibot's StrategyExecutor.stop() sets stop_event and calls this hook
+        synchronously in the main thread before any join or systemd
+        TimeoutStopSec countdown. main.py's MarketOpenLoggingAlpaca already
+        makes the market-open/market-close waits interruptible on that same
+        stop_event, so a stop should exit within a second either way -- but
+        some mid-day stops still needed systemd's SIGKILL, and nothing so far
+        has captured what every thread was actually doing at that moment.
+        Overwritten (not appended) each time, so it stays a single snapshot
+        rather than a growing log.
+        """
+        raw_path = self.parameters.get("shutdown_diagnostic_file")
+        if not raw_path:
+            return
+        try:
+            with open(str(raw_path), "w", encoding="utf-8") as handle:
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+        except OSError:
+            pass
+
     def _portfolio_rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_rotation_state_file")
         return Path(str(raw)) if raw else None
@@ -134,6 +159,14 @@ class AssetRotationStrategy(Strategy):
         if lock is None:
             lock = threading.RLock()
             self._portfolio_state_lock = lock
+        return lock
+
+    def _unpriceable_symbols_guard(self) -> threading.Lock:
+        """Return the lock protecting the current iteration's no-bars symbol set."""
+        lock = getattr(self, "_unpriceable_symbols_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._unpriceable_symbols_lock = lock
         return lock
 
     def _load_portfolio_rotation(self) -> dict[str, dict[str, Any]]:
@@ -1377,6 +1410,16 @@ This automated message is not financial advice.
             symbol, int(self.parameters["portfolio_analysis_days"]), "day"
         )
         if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
+            # Distinct from the liquidity-floor Nones below: no bars at all
+            # means Alpaca has no price history for this symbol, ever -- a
+            # discovery-sourced candidate like this can never qualify, so
+            # _run_portfolio_iteration persists it as permanently unpriceable
+            # instead of re-fetching and re-warning about it every time the
+            # discovery rotation cursor comes back around.
+            with self._unpriceable_symbols_guard():
+                if not hasattr(self, "_unpriceable_symbols_this_iteration"):
+                    self._unpriceable_symbols_this_iteration = set()
+                self._unpriceable_symbols_this_iteration.add(symbol)
             return None
         rows = [
             (float(row["high"]), float(row["close"]))
@@ -1500,6 +1543,8 @@ This automated message is not financial advice.
         """Fetch independent symbol histories through a small bounded pool."""
         if not symbols:
             return []
+        with self._unpriceable_symbols_guard():
+            self._unpriceable_symbols_this_iteration = set()
         with ThreadPoolExecutor(
             max_workers=min(self._PORTFOLIO_HISTORY_WORKERS, len(symbols)),
             thread_name_prefix="portfolio-history",
@@ -1929,6 +1974,17 @@ This automated message is not financial advice.
         except Exception as exc:
             self.log_message(f"Could not persist learned symbols: {type(exc).__name__}: {exc}", color="yellow")
 
+    def _exclude_unpriceable_discovered_symbols(self, symbols: list[str]) -> None:
+        """Stop a discovery-only symbol with no Alpaca price history from resurfacing."""
+        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
+            return
+        try:
+            self._autonomous_universe().exclude_unpriceable(symbols)
+        except Exception as exc:
+            self.log_message(
+                f"Could not persist unpriceable symbols: {type(exc).__name__}: {exc}", color="yellow"
+            )
+
     def _remember_confirmed_portfolio_symbol(self, symbol: str) -> None:
         """Grant management permission only after a broker-confirmed buy fill."""
         if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
@@ -2296,6 +2352,14 @@ This automated message is not financial advice.
         # pool removes the observed serial latency without creating an
         # unbounded burst against the broker API.
         signals = self._portfolio_signals(symbols)
+        # Only a discovery-sourced candidate is safe to permanently exclude --
+        # a config-listed watchlist symbol (SPY/QQQ) hitting a transient data
+        # outage must stay eligible for re-evaluation, not be blacklisted.
+        discovery_only_symbols = set(symbols) - managed_symbols - set(held)
+        unpriceable_this_iteration = getattr(self, "_unpriceable_symbols_this_iteration", set())
+        unpriceable_discovered = sorted(unpriceable_this_iteration & discovery_only_symbols)
+        if unpriceable_discovered:
+            self._exclude_unpriceable_discovered_symbols(unpriceable_discovered)
         signals = [signal for signal in signals if signal is not None]
         # The risky/conservative reasoning pattern only reshapes ranking and
         # tie-breaking below; the eligibility floor two lines down still
