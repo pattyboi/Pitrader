@@ -23,6 +23,14 @@ MAX_SUMMARY_CHARS = 400
 # evaluation universe (watchlist + held + discovery candidates) is already
 # bounded well under this in practice.
 MAX_SYMBOLS_LISTED = 60
+# Approximate input-token budget for one prompt's assembled text (articles +
+# symbol context). The local model's context window is only a few thousand
+# tokens total (input + output combined), so this keeps input well within
+# that instead of dumping every headline in unbounded. No tokenizer
+# dependency here (Pi-constrained installs) -- ~4 chars/token is a documented
+# approximation, not an exact count. When the budget would be exceeded,
+# articles are prioritized by |score| rather than hard-truncated in place.
+MAX_PROMPT_TOKENS_ESTIMATE = 1500
 MIN_SCORE = -10
 MAX_SCORE = 10
 RISK_LEVELS = ("high", "elevated", "normal", "constructive")
@@ -31,7 +39,11 @@ RISK_LEVELS = ("high", "elevated", "normal", "constructive")
 # below the daily trading iteration's own patience, and the warm-up timer
 # means this is almost never paying for a cold model load.
 REQUEST_TIMEOUT_SECONDS = 90
-MAX_RESPONSE_TOKENS = 4096
+# The model's context window is only ~4096 tokens total (input + output
+# combined), so this has to leave room for the system prompt and the
+# ~MAX_PROMPT_TOKENS_ESTIMATE of input -- assess()'s reply is just a score
+# plus "two or three plain sentences," so it doesn't need a large budget.
+MAX_RESPONSE_TOKENS = 500
 # The narrative/exit/red-flag replies are meant to be short; a smaller cap
 # keeps them fast and terse without needing the assessment's full budget.
 NARRATIVE_MAX_TOKENS = 300
@@ -154,6 +166,43 @@ class LLMNewsAnalyzer:
         return "\n".join(lines)
 
     @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough chars/4 token estimate; approximate by design, see
+        MAX_PROMPT_TOKENS_ESTIMATE."""
+        return len(text) // 4 if text else 0
+
+    @classmethod
+    def _prioritize_articles(cls, articles: list[dict], budget_tokens: int) -> list[dict]:
+        """Select the highest-signal prefix of `articles` (by |score|
+        descending, ties keep original order) that fits an approximate token
+        budget, then restore original order so the model still reads
+        coverage chronologically. Missing "score" (e.g. explain_exit/
+        check_red_flag callers) is treated as 0 -- no priority signal, falls
+        back to original order. Never truncates an individual article's text
+        (that's MAX_SUMMARY_CHARS's job, applied first here); this only
+        decides which whole articles are included."""
+        if budget_tokens <= 0 or not articles:
+            return []
+        ranked = sorted(
+            enumerate(articles),
+            key=lambda pair: (-abs(int(pair[1].get("score", 0) or 0)), pair[0]),
+        )
+        keep: set[int] = set()
+        used = 0
+        for index, article in ranked:
+            headline = str(article.get("headline", "")).strip()
+            if not headline:
+                continue
+            summary = str(article.get("summary", "")).strip()[:MAX_SUMMARY_CHARS]
+            line = f"{headline} - {summary}" if summary else headline
+            tokens = cls._estimate_tokens(line)
+            if used + tokens > budget_tokens:
+                break
+            keep.add(index)
+            used += tokens
+        return [articles[index] for index in sorted(keep)]
+
+    @staticmethod
     def _format_symbol_context(
         symbols: list[str], held_symbols: set[str], symbol_scores: dict[str, int]
     ) -> str:
@@ -166,10 +215,19 @@ class LLMNewsAnalyzer:
         if not unique_symbols:
             return ""
         held_upper = {str(symbol).strip().upper() for symbol in held_symbols}
-        listed = ", ".join(
-            f"{symbol}*" if symbol in held_upper else symbol
-            for symbol in unique_symbols[:MAX_SYMBOLS_LISTED]
-        )
+        # When the universe exceeds MAX_SYMBOLS_LISTED, prioritize held
+        # positions and symbols with dedicated news coverage over a plain
+        # alphabetical cutoff, so the ones that matter most survive the cap.
+        priority = [symbol for symbol in unique_symbols if symbol in held_upper]
+        priority += [
+            symbol
+            for symbol in unique_symbols
+            if symbol not in held_upper and symbol_scores.get(symbol, 0) != 0
+        ]
+        seen = set(priority)
+        priority += [symbol for symbol in unique_symbols if symbol not in seen]
+        selected = sorted(priority[:MAX_SYMBOLS_LISTED])
+        listed = ", ".join(f"{symbol}*" if symbol in held_upper else symbol for symbol in selected)
         lines = [f"Symbols under evaluation today (* = currently held): {listed}"]
         # Only nonzero scores are worth spending prompt tokens on; a zero
         # entry means "covered today, genuinely neutral" (see
@@ -259,7 +317,9 @@ class LLMNewsAnalyzer:
         symbol's own headlines, if it has dedicated coverage today. Purely
         descriptive -- the exit already fired on price alone before this is
         ever called. Raises on any problem; callers should fail open."""
-        article_text = self._format_articles(articles)
+        article_text = self._format_articles(
+            self._prioritize_articles(articles, MAX_PROMPT_TOKENS_ESTIMATE)
+        )
         if not article_text:
             return ""
         user_text = (
@@ -277,7 +337,9 @@ class LLMNewsAnalyzer:
         company-specific risk before it's allowed into today's tradeable
         universe. Raises on any problem; callers should fail open (treat as
         not flagged, exactly as before this feature)."""
-        article_text = self._format_articles(articles)
+        article_text = self._format_articles(
+            self._prioritize_articles(articles, MAX_PROMPT_TOKENS_ESTIMATE)
+        )
         if not article_text:
             return RedFlagCheck(available=False)
         user_text = f"Recent headlines specifically about {symbol}:\n\n{article_text}"
@@ -331,20 +393,29 @@ class LLMNewsAnalyzer:
         today's actual evaluation universe; omitting them reproduces the
         original market-headlines-only prompt exactly.
         """
-        article_text = self._format_articles(articles)
+        wrapper = "Assess today's market news. Articles from the last 24 hours:\n\n"
+        symbol_context = self._format_symbol_context(
+            symbols or [], held_symbols or set(), symbol_scores or {}
+        )
+        # Reserve room for the fixed wrapper text and the (already bounded)
+        # symbol context, then give whatever's left of the budget to the
+        # highest-signal articles rather than dumping every headline in --
+        # fails open to the unfiltered list on any problem, since this
+        # feature must never break an assessment that worked before.
+        reserved = self._estimate_tokens(wrapper) + self._estimate_tokens(symbol_context)
+        article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
+        try:
+            selected_articles = self._prioritize_articles(articles, article_budget)
+        except Exception:
+            selected_articles = articles
+        article_text = self._format_articles(selected_articles)
         if not article_text:
             return LLMNewsAssessment(
                 available=False,
                 explanation="No usable headlines were available to assess.",
             )
-        user_text = (
-            "Assess today's market news. Articles from the last 24 hours:\n\n"
-            + article_text
-        )
-        symbol_context = self._format_symbol_context(
-            symbols or [], held_symbols or set(), symbol_scores or {}
-        )
+        user_text = wrapper + article_text
         if symbol_context:
             user_text += "\n\n" + symbol_context
         text = self._chat(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS, user_text, json_mode=True)
-        return self._parse_assessment(text, len(articles), self.model)
+        return self._parse_assessment(text, len(selected_articles), self.model)

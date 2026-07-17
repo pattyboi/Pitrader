@@ -14,6 +14,7 @@ import pytest
 import autonomous_universe
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
+from llm_news import LLMNewsAnalyzer
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
@@ -909,3 +910,74 @@ def test_symbol_news_scores_extends_coverage_via_text_scan() -> None:
     scores = strategy._symbol_news_scores(news_context, {"AAPL"})
 
     assert scores == {"AAPL": 1}
+
+
+def test_estimate_tokens_uses_four_chars_per_token() -> None:
+    assert LLMNewsAnalyzer._estimate_tokens("") == 0
+    assert LLMNewsAnalyzer._estimate_tokens("x" * 40) == 10
+
+
+def test_prioritize_articles_keeps_the_highest_signal_article_within_budget() -> None:
+    articles = [
+        {"headline": "l" * 8, "summary": "", "score": 1},
+        {"headline": "h" * 8, "summary": "", "score": 9},
+        {"headline": "m" * 8, "summary": "", "score": 4},
+    ]
+
+    kept = LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=2)
+
+    assert kept == [articles[1]]  # only the highest |score| article fits
+
+
+def test_prioritize_articles_restores_original_order_for_the_kept_subset() -> None:
+    articles = [
+        {"headline": "a" * 8, "summary": "", "score": 1},
+        {"headline": "b" * 8, "summary": "", "score": 9},
+    ]
+
+    kept = LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=4)
+
+    assert kept == [articles[0], articles[1]]  # both fit; original order kept, not rank order
+
+
+def test_prioritize_articles_returns_empty_for_non_positive_budget_or_no_articles() -> None:
+    articles = [{"headline": "A", "summary": "", "score": 5}]
+
+    assert LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=0) == []
+    assert LLMNewsAnalyzer._prioritize_articles([], budget_tokens=1000) == []
+
+
+def test_prioritize_articles_treats_a_missing_score_as_zero() -> None:
+    # explain_exit/check_red_flag callers pass articles without a "score" key.
+    articles = [{"headline": "First"}, {"headline": "Second"}]
+
+    kept = LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=100)
+
+    assert kept == articles
+
+
+def test_assess_includes_all_articles_when_well_within_budget() -> None:
+    analyzer = LLMNewsAnalyzer(model="test-model")
+    analyzer._chat = lambda *args, **kwargs: json.dumps(
+        {"score": 2, "risk_level": "constructive", "reasoning": "fine"}
+    )
+
+    assessment = analyzer.assess([{"headline": "Only headline", "summary": "short"}])
+
+    assert assessment.explanation == "test-model assessed 1 articles; score +2 (constructive)."
+
+
+def test_assess_bounds_article_count_to_the_prompt_token_budget() -> None:
+    analyzer = LLMNewsAnalyzer(model="test-model")
+    analyzer._chat = lambda *args, **kwargs: json.dumps(
+        {"score": 0, "risk_level": "normal", "reasoning": "fine"}
+    )
+    articles = [
+        {"headline": f"Headline number {i}", "summary": "word " * 100, "score": i}
+        for i in range(20)
+    ]
+
+    assessment = analyzer.assess(articles)
+
+    assert assessment.available
+    assert f"assessed {len(articles)} articles" not in assessment.explanation

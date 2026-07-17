@@ -329,7 +329,7 @@ The initial file is:
   "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
   "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
   "LLM_NEWS_ENABLED": false,
-  "LLM_NEWS_MODEL": "llama3.2:3b",
+  "LLM_NEWS_MODEL": "phi3:mini",
   "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
   "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
   "LLM_NEWS_BLOCK_SCORE": -6
@@ -420,7 +420,7 @@ chmod 600 config.json
 | `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` | Pooled settled dip signals (across every symbol) needed before the forecast is used | `20` |
 | `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
 | `LLM_NEWS_ENABLED` | Sends the day's headlines to the local Ollama model for one risk assessment | `false` |
-| `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"llama3.2:3b"` |
+| `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"phi3:mini"` |
 | `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
 | `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
@@ -766,19 +766,19 @@ provider is supported.
 Pull the model once after installing:
 
 ```bash
-ollama pull llama3.2:3b
+ollama pull phi3:mini
 ```
 
-A 3B model is small enough to run on the Pi's CPU in well under the request
-timeout, especially once pre-warmed. It also does noticeably weaker risk
-judgment than a large hosted model — treat it as a plausible advisory signal,
-not an authority.
+A model this size is small enough to run on the Pi's CPU in well under the
+request timeout, especially once pre-warmed. It also does noticeably weaker
+risk judgment than a large hosted model — treat it as a plausible advisory
+signal, not an authority.
 
 #### Enabling it
 
 ```json
 "LLM_NEWS_ENABLED": true,
-"LLM_NEWS_MODEL": "llama3.2:3b",
+"LLM_NEWS_MODEL": "phi3:mini",
 "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
 "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
 "LLM_NEWS_BLOCK_SCORE": -6

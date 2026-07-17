@@ -726,7 +726,7 @@ This automated message is not financial advice.
                 base_url=str(self.parameters.get("llm_news_base_url", "")),
             )
             assessment = analyzer.assess(
-                news_context.articles,
+                news_context.per_article,
                 symbols=symbols,
                 held_symbols=held_symbols,
                 symbol_scores=symbol_news_scores,
