@@ -23,27 +23,45 @@ MAX_SUMMARY_CHARS = 400
 # evaluation universe (watchlist + held + discovery candidates) is already
 # bounded well under this in practice.
 MAX_SYMBOLS_LISTED = 60
+# Ollama silently defaults an API request to a ~4096-token context regardless
+# of what the underlying model actually supports (confirmed via its own
+# "vram-based default context" log line) unless a request explicitly asks
+# for more. granite-4.0-micro trains at 131072 tokens natively, so this
+# reclaims real headroom over that implicit default -- it is not, by itself,
+# a green light to fill the budgets below anywhere close to this number: see
+# MAX_PROMPT_TOKENS_ESTIMATE/REQUEST_TIMEOUT_SECONDS for why this Pi's raw
+# CPU throughput, not context capacity, is what actually bounds them.
+OLLAMA_NUM_CTX = 8192
 # Approximate input-token budget for one prompt's assembled text (articles +
-# symbol context). The local model's context window is only a few thousand
-# tokens total (input + output combined), so this keeps input well within
-# that instead of dumping every headline in unbounded. No tokenizer
-# dependency here (Pi-constrained installs) -- ~4 chars/token is a documented
-# approximation, not an exact count. When the budget would be exceeded,
-# articles are prioritized by |score| rather than hard-truncated in place.
-MAX_PROMPT_TOKENS_ESTIMATE = 1500
+# symbol context; the fixed system prompt is reserved separately, see
+# assess()/explain_exit()/check_red_flag()). No tokenizer dependency here
+# (Pi-constrained installs) -- ~4 chars/token is a documented approximation,
+# not an exact count, and it is NOT reliable across models: measured against
+# this Pi's actual Ollama server, it undercounted llama3.2:3b's real tokens
+# by ~1.6x but overcounted granite-4.0-micro's by ~1.1x for the same
+# content (different tokenizers). This budget is sized against the worse
+# (undercounting) case so it stays safe if LLM_NEWS_MODEL is changed again.
+# When the budget would be exceeded, articles are prioritized by |score|
+# rather than hard-truncated in place.
+MAX_PROMPT_TOKENS_ESTIMATE = 1800
 MIN_SCORE = -10
 MAX_SCORE = 10
 RISK_LEVELS = ("high", "elevated", "normal", "constructive")
 # This assessment is optional and fails open. A local, CPU-bound small model
-# is slower than a hosted API, so the budget is generous -- but still well
-# below the daily trading iteration's own patience, and the warm-up timer
-# means this is almost never paying for a cold model load.
-REQUEST_TIMEOUT_SECONDS = 90
-# The model's context window is only ~4096 tokens total (input + output
-# combined), so this has to leave room for the system prompt and the
-# ~MAX_PROMPT_TOKENS_ESTIMATE of input -- assess()'s reply is just a score
-# plus "two or three plain sentences," so it doesn't need a large budget.
-MAX_RESPONSE_TOKENS = 500
+# is slower than a hosted API -- prompt-eval on this Pi runs ~27-31
+# tokens/sec regardless of which ~3-4B model is configured (measured
+# directly against both llama3.2:3b and granite-4.0-micro; a bigger context
+# *window* does not mean faster *throughput*), and generation is far slower
+# still at ~4 tokens/sec. Sized so MAX_PROMPT_TOKENS_ESTIMATE's worst-case
+# real token count (~1.6x, see above) plus the system prompt plus
+# MAX_RESPONSE_TOKENS' worth of generation still finishes with margin to
+# spare -- generous, but this is a once-a-day background call that should
+# get a real answer rather than fail open on a hardware-imposed clock.
+REQUEST_TIMEOUT_SECONDS = 240
+# assess()'s reply is just a score plus "two or three plain sentences," so
+# it doesn't need a large budget; sized against REQUEST_TIMEOUT_SECONDS at
+# ~4 tokens/sec generation, see REQUEST_TIMEOUT_SECONDS's comment.
+MAX_RESPONSE_TOKENS = 400
 # The narrative/exit/red-flag replies are meant to be short; a smaller cap
 # keeps them fast and terse without needing the assessment's full budget.
 NARRATIVE_MAX_TOKENS = 300
@@ -281,6 +299,7 @@ class LLMNewsAnalyzer:
         payload: dict = {
             "model": self.model,
             "max_tokens": max_tokens,
+            "options": {"num_ctx": OLLAMA_NUM_CTX},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
@@ -317,8 +336,10 @@ class LLMNewsAnalyzer:
         symbol's own headlines, if it has dedicated coverage today. Purely
         descriptive -- the exit already fired on price alone before this is
         ever called. Raises on any problem; callers should fail open."""
+        reserved = self._estimate_tokens(EXIT_NARRATIVE_SYSTEM_PROMPT)
+        article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         article_text = self._format_articles(
-            self._prioritize_articles(articles, MAX_PROMPT_TOKENS_ESTIMATE)
+            self._prioritize_articles(articles, article_budget)
         )
         if not article_text:
             return ""
@@ -337,8 +358,10 @@ class LLMNewsAnalyzer:
         company-specific risk before it's allowed into today's tradeable
         universe. Raises on any problem; callers should fail open (treat as
         not flagged, exactly as before this feature)."""
+        reserved = self._estimate_tokens(RED_FLAG_SYSTEM_PROMPT)
+        article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         article_text = self._format_articles(
-            self._prioritize_articles(articles, MAX_PROMPT_TOKENS_ESTIMATE)
+            self._prioritize_articles(articles, article_budget)
         )
         if not article_text:
             return RedFlagCheck(available=False)
@@ -397,12 +420,19 @@ class LLMNewsAnalyzer:
         symbol_context = self._format_symbol_context(
             symbols or [], held_symbols or set(), symbol_scores or {}
         )
-        # Reserve room for the fixed wrapper text and the (already bounded)
-        # symbol context, then give whatever's left of the budget to the
-        # highest-signal articles rather than dumping every headline in --
-        # fails open to the unfiltered list on any problem, since this
-        # feature must never break an assessment that worked before.
-        reserved = self._estimate_tokens(wrapper) + self._estimate_tokens(symbol_context)
+        # Reserve room for the fixed system prompt, the fixed wrapper text,
+        # and the (already bounded) symbol context, then give whatever's
+        # left of the budget to the highest-signal articles rather than
+        # dumping every headline in -- fails open to the unfiltered list on
+        # any problem, since this feature must never break an assessment
+        # that worked before. The system prompt rides on every call and was
+        # previously left out of this reservation entirely, which is why a
+        # 50-article day still overflowed the intended budget in practice.
+        reserved = (
+            self._estimate_tokens(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS)
+            + self._estimate_tokens(wrapper)
+            + self._estimate_tokens(symbol_context)
+        )
         article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         try:
             selected_articles = self._prioritize_articles(articles, article_budget)

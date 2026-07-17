@@ -183,5 +183,5 @@ echo "View status with: sudo systemctl status ${SERVICE_NAME}"
 echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
-    echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull phi3:mini"
+    echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"
 fi
