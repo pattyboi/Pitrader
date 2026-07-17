@@ -37,7 +37,7 @@ The service restarts on crash after 30s (`Restart=always`), so a config error sh
 
 ## Architecture
 
-Seven supporting modules plus the one strategy class (portfolio mode is the only mode — the legacy Asset-A/B rotation pipeline, WallStreetBets context, and congressional-trading context have all been removed). Full per-module breakdown: `.claude/docs/architecture.md`.
+Eight supporting modules plus the one strategy class (portfolio mode is the only mode — the legacy Asset-A/B rotation pipeline, WallStreetBets context, and congressional-trading context have all been removed). Full per-module breakdown: `.claude/docs/architecture.md`.
 
 ### Decision pipeline
 

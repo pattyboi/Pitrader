@@ -6,11 +6,13 @@ import logging
 import sqlite3
 import threading
 
+import duckdb
 import pandas as pd
 import pytest
 
 from adaptive_news_model import AdaptiveNewsModel
 from news_context import NewsContext, WorldEventAnalyzer
+from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
 from strategy import AssetRotationStrategy
 from trade_memory import TradeMemory
@@ -37,6 +39,48 @@ def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) 
     assert probability.observations == 2
     assert probability.wins == 1
     assert probability.probability == 0.5
+
+
+def test_portfolio_memory_pools_observations_across_symbols(tmp_path: Path) -> None:
+    # Unlike TradeMemory (one A/B observation/day), every symbol's settled
+    # history feeds the same pooled model -- this is what lets "multiple
+    # symbols a day" warm up far faster than a single pair ever could.
+    memory = PortfolioMemory(tmp_path / "portfolio_memory.duckdb", minimum_observations=2, maximum_observations=50)
+    memory.backfill_history("SPY", [("2026-01-02", 5.0, 1.0), ("2026-01-05", 6.0, 2.0)])
+    memory.backfill_history("AAPL", [("2026-01-03", 5.5, 1.5)])
+
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+
+    assert forecast.observations == 3
+    assert forecast.ready is True
+
+
+def test_portfolio_memory_warms_up_before_forecasting(tmp_path: Path) -> None:
+    memory = PortfolioMemory(tmp_path / "portfolio_memory.duckdb", minimum_observations=5, maximum_observations=50)
+    memory.backfill_history("SPY", [("2026-01-02", 5.0, 1.0)])
+
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+
+    assert forecast.ready is False
+    assert forecast.predicted_edge_percent is None
+
+
+def test_portfolio_memory_settlement_is_scoped_to_the_same_symbol(tmp_path: Path) -> None:
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+    memory.update_and_forecast("2026-01-02", "SPY", price=100.0, dip_percent=5.0, news_score=0)
+    memory.update_and_forecast("2026-01-02", "AAPL", price=50.0, dip_percent=6.0, news_score=0)
+
+    # Settling SPY on a later day must never resolve AAPL's still-open row --
+    # a next-session return can only ever be measured from that same symbol's
+    # own later price.
+    memory.update_and_forecast("2026-01-05", "SPY", price=101.0, dip_percent=4.0, news_score=0)
+
+    with duckdb.connect(str(db_path)) as conn:
+        aapl_return = conn.execute(
+            "SELECT next_session_return_percent FROM observations WHERE symbol = 'AAPL'"
+        ).fetchone()[0]
+    assert aapl_return is None
 
 
 def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
@@ -223,6 +267,32 @@ def test_conservative_posture_discounts_bad_news_harder_than_risky() -> None:
     risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8)
 
     assert conservative < risky < 2.0
+
+
+def test_learned_edge_only_shifts_ranking_when_ready() -> None:
+    ready = {
+        "expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5,
+        "learned_edge_ready": True, "learned_edge": 4.0,
+    }
+    not_ready = {**ready, "learned_edge_ready": False}
+
+    adjusted = AssetRotationStrategy._posture_adjusted_edge(ready, "risky", None)
+    unadjusted = AssetRotationStrategy._posture_adjusted_edge(not_ready, "risky", None)
+
+    assert unadjusted == 1.0
+    assert adjusted > unadjusted
+
+
+def test_risky_posture_leans_into_the_learned_edge_more_than_conservative() -> None:
+    signal = {
+        "expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5,
+        "learned_edge_ready": True, "learned_edge": 4.0,
+    }
+
+    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None)
+    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None)
+
+    assert 1.0 < conservative < risky
 
 
 def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
@@ -613,6 +683,17 @@ def test_portfolio_signal_accepts_a_symbol_clearing_both_floors() -> None:
     strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
 
     assert strategy._portfolio_signal("OK") is not None
+
+
+def test_portfolio_signal_exposes_round_trip_cost_for_memory_blending() -> None:
+    # PortfolioMemory blending nets its learned edge against this same
+    # per-symbol cost basis, so it must be visible on the signal, not just
+    # baked into expected_profit.
+    strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
+
+    result = strategy._portfolio_signal("OK")
+
+    assert result["round_trip_cost"] == pytest.approx(0.20)
 
 
 def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:

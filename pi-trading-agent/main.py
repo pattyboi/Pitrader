@@ -464,6 +464,25 @@ def load_config(path: Path) -> dict[str, Any]:
     config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"] = decision_edge
     config["DECISION_MEMORY_BACKFILL_DAYS"] = decision_backfill_days
 
+    # Unlike DECISION_MEMORY (scoped to the single Asset-A/B pair), this pools
+    # every portfolio symbol's daily dip signal into one model, so it warms up
+    # much faster -- the max default is larger to match.
+    portfolio_memory_defaults = {
+        "PORTFOLIO_MEMORY_ENABLED": True,
+        "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
+        "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
+    }
+    for key, default in portfolio_memory_defaults.items():
+        config.setdefault(key, default)
+    if not isinstance(config["PORTFOLIO_MEMORY_ENABLED"], bool):
+        raise TypeError("PORTFOLIO_MEMORY_ENABLED must be true or false")
+    portfolio_memory_minimum = int(config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"])
+    portfolio_memory_maximum = int(config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"])
+    if not 20 <= portfolio_memory_minimum <= 500 or not portfolio_memory_minimum <= portfolio_memory_maximum <= 5000:
+        raise ValueError("PORTFOLIO_MEMORY observation limits must be from 20 to 5000")
+    config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"] = portfolio_memory_minimum
+    config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"] = portfolio_memory_maximum
+
     symbol_reference_defaults = {
         "SYMBOL_REFERENCE_ENABLED": True,
         "SYMBOL_REFERENCE_REFRESH_DAYS": 7,
@@ -630,6 +649,10 @@ def main() -> int:
                 "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
                 "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
                 "decision_memory_database_file": str(BASE_DIR / ".trade_memory.duckdb"),
+                "portfolio_memory_enabled": config["PORTFOLIO_MEMORY_ENABLED"],
+                "portfolio_memory_min_observations": config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"],
+                "portfolio_memory_max_observations": config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"],
+                "portfolio_memory_database_file": str(BASE_DIR / ".portfolio_memory.duckdb"),
                 "llm_news_enabled": config["LLM_NEWS_ENABLED"],
                 "llm_news_provider": config["LLM_NEWS_PROVIDER"],
                 "llm_news_model": config["LLM_NEWS_MODEL"],

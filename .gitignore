@@ -21,6 +21,8 @@ pi-trading-agent/config.json
 .trade_memory.sqlite3
 .trade_memory.duckdb
 .trade_memory.duckdb.*
+.portfolio_memory.duckdb
+.portfolio_memory.duckdb.*
 .symbol_reference.duckdb
 .symbol_reference.duckdb.*
 .cpu_watchdog_state

@@ -36,6 +36,7 @@ understand the risks.
   - [LLM news assessment](#llm-news-assessment)
   - [Adaptive news learning](#adaptive-news-learning)
   - [Decision memory: learning from its own rotations](#decision-memory-learning-from-its-own-rotations)
+  - [Portfolio memory: learning across the whole watchlist](#portfolio-memory-learning-across-the-whole-watchlist)
 - [Operating the service](#operating-the-service)
   - [Understanding common log messages](#understanding-common-log-messages)
   - [Service commands](#service-commands)
@@ -195,7 +196,8 @@ pi-trading-agent/
 ├── requirements.txt    Python package requirements
 ├── main.py             Configuration validation and application startup
 ├── adaptive_news_model.py  Persistent learning from news and later returns
-├── trade_memory.py      DuckDB journal and learning from past rotation signals
+├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
+├── portfolio_memory.py  DuckDB journal and pooled learning from every symbol's dip signals
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
@@ -212,7 +214,10 @@ adaptive model creates `.news_learning_state.json` to preserve its observations.
 Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances).
 On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
-requiring a DuckDB extension download. The local symbol cross-reference keeps
+requiring a DuckDB extension download. Portfolio memory keeps its own DuckDB
+database, `.portfolio_memory.duckdb`, of every evaluated symbol's dip signals
+and settled next-session returns (see "Portfolio memory: learning across the
+whole watchlist" below). The local symbol cross-reference keeps
 its own small DuckDB database, `.symbol_reference.duckdb`.
 `.portfolio_rotation_state.json` remembers a staged replacement (sold one
 symbol, not yet bought its replacement) so restarts cannot strand the cash,
@@ -318,6 +323,9 @@ The initial file is:
   "DECISION_MEMORY_MIN_CORRELATION": 0.25,
   "DECISION_MEMORY_EDGE_BLOCK_PERCENT": -0.75,
   "DECISION_MEMORY_BACKFILL_DAYS": 1000,
+  "PORTFOLIO_MEMORY_ENABLED": true,
+  "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
+  "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
   "LLM_NEWS_ENABLED": false,
   "LLM_NEWS_PROVIDER": "gemini",
   "LLM_NEWS_API_KEY": "REPLACE_WITH_YOUR_LLM_API_KEY",
@@ -407,6 +415,9 @@ chmod 600 config.json
 | `DECISION_MEMORY_MIN_CORRELATION` | Fit strength required for a decision-memory veto | `0.25` |
 | `DECISION_MEMORY_EDGE_BLOCK_PERCENT` | B-minus-A forecast at or below which rotation is blocked | `-0.75` |
 | `DECISION_MEMORY_BACKFILL_DAYS` | Daily bars imported at startup to shorten decision-memory warm-up (`0` disables) | `1000` |
+| `PORTFOLIO_MEMORY_ENABLED` | Records every evaluated symbol's dip signal and pools them into one learned-edge forecast used in ranking | `true` |
+| `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` | Pooled settled dip signals (across every symbol) needed before the forecast is used | `20` |
+| `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
 | `LLM_NEWS_ENABLED` | Sends the day's headlines to an LLM for one risk assessment | `false` |
 | `LLM_NEWS_PROVIDER` | `gemini`, `openai_compatible`, or `anthropic` | `"gemini"` |
 | `LLM_NEWS_API_KEY` | API key for the chosen provider | Your API key |
@@ -951,6 +962,39 @@ sudo systemctl start trading-agent.service
 If the state file becomes invalid JSON, the model moves it to a `.corrupt` file
 and starts clean rather than trusting damaged observations.
 
+### Portfolio memory: learning across the whole watchlist
+
+Decision memory only ever learns from the Asset A/B pair. Portfolio memory
+answers a broader question: across *every* symbol the strategy evaluates each
+day — the static watchlist, current holdings, and anything autonomous
+discovery has surfaced — which ones have historically kept resolving well
+after a dip, once today's dip size and that symbol's own news score are
+accounted for?
+
+Every symbol showing a dip signal on a given day adds one observation to a
+single local DuckDB database, `.portfolio_memory.duckdb`, keyed by date and
+symbol. Because many symbols can each contribute an observation on the same
+day, this learns much faster than decision memory's one-pair-per-day pace.
+Each observation is settled using that same symbol's own next-session price,
+never another symbol's — one pooled, ridge-stabilized model is fit across
+every symbol's settled history rather than a separate model per symbol, since
+any single symbol's dips are too infrequent to train its own model reliably.
+
+Once at least `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` pooled signals are settled
+(default 20), the forecast is blended into that day's ranking: it can shift
+which already-qualifying candidate looks best or which current holding looks
+weakest, the same way the risky/conservative posture reasoning already does.
+It never changes eligibility — `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and the
+out-of-sample floor are untouched by it, exactly like the posture and
+per-symbol-news adjustments. A risky posture leans into this learned edge
+more; a conservative posture trusts the raw historical backtest more until
+the learned edge has proven itself.
+
+On first sight of each symbol, its available price history is imported once
+(price-only, like decision memory's startup catch-up) so a newly discovered
+symbol does not start from zero. Delete `.portfolio_memory.duckdb` only if you
+intend to reset this learning history; it is otherwise safe across restarts.
+
 ## Operating the service
 
 ### Understanding common log messages
@@ -1294,7 +1338,10 @@ files in place:
 
 ```bash
 sudo systemctl disable --now trading-agent.service
+sudo systemctl disable --now trading-agent-cpu-watchdog.timer
 sudo rm /etc/systemd/system/trading-agent.service
+sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.service
+sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.timer
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 ```

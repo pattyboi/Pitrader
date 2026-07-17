@@ -20,6 +20,7 @@ from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
 from news_context import NewsContext, WorldEventAnalyzer
+from portfolio_memory import PortfolioMemory
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 from symbol_reference import SymbolReference
 
@@ -61,6 +62,13 @@ class AssetRotationStrategy(Strategy):
     _POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
     _POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
     _POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
+    # How much weight a ready PortfolioMemory forecast gets when it disagrees
+    # with a symbol's raw historical expected_profit: risky leans into the
+    # pooled, cross-symbol learned edge more; conservative trusts the
+    # unadjusted historical backtest more until the learned edge has proven
+    # itself. Same never-changes-eligibility invariant as the other posture
+    # weights above.
+    _POSTURE_LEARNED_EDGE_WEIGHT = {"conservative": 0.25, "risky": 0.6}
     _POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
 
     # Order statuses that mean an order can no longer fill. Anything else is
@@ -94,6 +102,7 @@ class AssetRotationStrategy(Strategy):
         # Historical bars are fetched during the first evaluation, after the
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
+        self.vars.portfolio_memory_backfilled_symbols = set()
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
         self.vars.portfolio_holding_dates = self._load_portfolio_holding_dates()
         if self.vars.portfolio_pending_rotation:
@@ -914,6 +923,96 @@ This automated message is not financial advice.
                 color="yellow",
             )
 
+    def _portfolio_memory(self) -> PortfolioMemory:
+        return PortfolioMemory(
+            database_path=Path(str(self.parameters["portfolio_memory_database_file"])),
+            minimum_observations=int(self.parameters["portfolio_memory_min_observations"]),
+            maximum_observations=int(self.parameters["portfolio_memory_max_observations"]),
+        )
+
+    def _update_portfolio_memory(
+        self, symbol: str, price: float, dip_percent: float, news_score: int | None
+    ) -> RotationForecast:
+        """Record today's dip signal for one symbol and forecast its next-session return.
+
+        Called once per qualifying symbol per day, pooling every symbol's
+        history into one model -- see PortfolioMemory for why a pooled fit
+        (rather than one model per symbol) is what lets many symbols a day
+        actually accelerate warm-up.
+        """
+        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
+            return RotationForecast(
+                0, False, None, None, "Portfolio memory is disabled in config.json."
+            )
+        try:
+            result = self._portfolio_memory().update_and_forecast(
+                evaluation_date=self.get_datetime().date().isoformat(),
+                symbol=symbol,
+                price=price,
+                dip_percent=dip_percent,
+                news_score=news_score,
+            )
+            return result
+        except Exception as exc:
+            self.log_message(
+                f"Portfolio memory update failed safely for {symbol}: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return RotationForecast(
+                0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
+            )
+
+    def _backfill_portfolio_memory(self, symbol: str) -> None:
+        """Seed one symbol's pooled memory from settled daily bars, once ever.
+
+        Mirrors _backfill_decision_memory's price-only, once-per-symbol
+        approach, but tracked in a set (not a single bool) since autonomous
+        discovery can introduce new symbols throughout the process lifetime.
+        """
+        backfilled = self.vars.portfolio_memory_backfilled_symbols
+        if symbol in backfilled:
+            return
+        backfilled.add(symbol)
+        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
+            return
+        try:
+            bars = self.get_historical_prices(
+                symbol, int(self.parameters["portfolio_analysis_days"]), "day"
+            )
+            if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
+                return
+            rows = [
+                (str(index.date() if hasattr(index, "date") else index), float(row["high"]), float(row["close"]))
+                for index, row in bars.df[["high", "close"]].dropna().iterrows()
+                if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
+                and float(row["high"]) > 0 and float(row["close"]) > 0
+            ]
+            lookback = int(self.parameters["recent_high_lookback_days"])
+            threshold = float(self.parameters["dip_threshold_percent"])
+            history = []
+            # Same full-windows-only, previous-lookback-high loop _portfolio_signal
+            # already uses, so backfilled dips match how the live check measures them.
+            for position in range(lookback, len(rows) - 1):
+                recent_high = max(row[1] for row in rows[position - lookback : position])
+                close = rows[position][2]
+                dip = ((recent_high - close) / recent_high) * 100.0
+                if dip < threshold:
+                    continue
+                next_close = rows[position + 1][2]
+                next_return = ((next_close - close) / close) * 100.0
+                history.append((rows[position][0], dip, next_return))
+            inserted = self._portfolio_memory().backfill_history(symbol, history)
+            if inserted:
+                self.log_message(
+                    f"Portfolio-memory historical backfill added {inserted} settled observations for {symbol}.",
+                    color="blue",
+                )
+        except Exception as exc:
+            self.log_message(
+                f"Portfolio-memory historical backfill failed safely for {symbol}: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+
     def _record_memory_decision(self, report: dict[str, Any]) -> None:
         """Persist the final decision label after an observation was recorded."""
         if not report.get("decision_memory_recorded"):
@@ -1296,6 +1395,10 @@ This automated message is not financial advice.
             # (matches TradeMemory.opportunity_probability's convention).
             "return_stdev": math.sqrt(variance),
             "win_probability": (wins + 1) / (len(net_returns) + 2),
+            # Exposed so callers (PortfolioMemory blending) can net a learned
+            # edge against the same per-symbol cost basis expected_profit
+            # already used, instead of the one flat configured guess.
+            "round_trip_cost": round_trip_cost,
         }
 
     def _portfolio_signals(
@@ -1377,6 +1480,12 @@ This automated message is not financial advice.
         if news_score is not None:
             capped_score = max(-10.0, min(10.0, float(news_score)))
             adjustment -= max(0.0, -capped_score) * AssetRotationStrategy._POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
+        if signal.get("learned_edge_ready") and signal.get("learned_edge") is not None:
+            learned_edge = float(signal["learned_edge"])
+            adjustment += (
+                (learned_edge - expected_profit)
+                * AssetRotationStrategy._POSTURE_LEARNED_EDGE_WEIGHT[posture]
+            )
         max_adjustment = AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
         adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
         return expected_profit + adjustment
@@ -1738,6 +1847,22 @@ This automated message is not financial advice.
             # neutral 0) is trusted over the market-wide score; only a
             # symbol with no coverage at all falls back to it.
             news_score = symbol_news_scores.get(symbol, market_wide_news_score)
+            # Every signal here already implies a dip >= threshold today
+            # (_portfolio_signal's own filter), so every symbol contributes
+            # an observation -- this is what makes "multiple symbols a day"
+            # warm PortfolioMemory up far faster than the A/B pair's one
+            # observation/day. Sequential, not parallelized, to avoid
+            # concurrent DuckDB writes from multiple threads.
+            self._backfill_portfolio_memory(symbol)
+            forecast = self._update_portfolio_memory(
+                symbol, float(signal["price"]), float(signal["dip"]), news_score
+            )
+            signal["learned_edge_ready"] = forecast.ready
+            signal["learned_edge"] = (
+                forecast.predicted_edge_percent - float(signal["round_trip_cost"])
+                if forecast.ready and forecast.predicted_edge_percent is not None
+                else None
+            )
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
                 signal, risk_posture, news_score
             )
