@@ -23,6 +23,9 @@ pi-trading-agent/config.json
 .trade_memory.duckdb.*
 .symbol_reference.duckdb
 .symbol_reference.duckdb.*
+.cpu_watchdog_state
+.cpu_watchdog.log
+.cpu_watchdog.log.*
 
 # Python bytecode
 __pycache__/

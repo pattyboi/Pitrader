@@ -33,7 +33,7 @@ sudo journalctl -u trading-agent.service -f          # follow logs
 sudo journalctl -u trading-agent.service -n 100 --no-pager
 ```
 
-The service restarts on crash after 30s (`Restart=always`), so a config error shows up as a restart loop — read the journal instead of rerunning the installer.
+The service restarts on crash after 30s (`Restart=always`), so a config error shows up as a restart loop — read the journal instead of rerunning the installer. `setup_service.sh` also installs `trading-agent-cpu-watchdog.timer`, which samples the service's cgroup CPU usage every 5 minutes into `.cpu_watchdog.log` and logs a warning (journal tag `trading-agent-cpu-watchdog`) above 10% — a trail for spotting a future CPU regression like the one a stale market-hours cache once caused (`main.py`'s `MarketOpenLoggingAlpaca.market_hours` caches it per day for exactly this reason).
 
 ## Architecture
 

@@ -2,9 +2,13 @@
 set -euo pipefail
 
 SERVICE_NAME="trading-agent.service"
+WATCHDOG_SERVICE_NAME="trading-agent-cpu-watchdog.service"
+WATCHDOG_TIMER_NAME="trading-agent-cpu-watchdog.timer"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_SERVICE_NAME}"
+WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_TIMER_NAME}"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP="$(id -gn "${RUN_USER}")"
 
@@ -41,6 +45,7 @@ python3 -m venv "${VENV_DIR}"
 chown -R "${RUN_USER}:${RUN_GROUP}" "${PROJECT_DIR}"
 chmod 600 "${PROJECT_DIR}/config.json"
 chmod 755 "${PROJECT_DIR}/main.py"
+chmod 755 "${PROJECT_DIR}/scripts/cpu_watchdog.sh"
 
 install -o root -g root -m 0644 /dev/null "${SERVICE_FILE}"
 tee "${SERVICE_FILE}" >/dev/null <<EOF
@@ -75,9 +80,37 @@ ReadWritePaths=${PROJECT_DIR}
 WantedBy=multi-user.target
 EOF
 
+install -o root -g root -m 0644 /dev/null "${WATCHDOG_SERVICE_FILE}"
+tee "${WATCHDOG_SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Sample trading-agent.service CPU usage for the watchdog log
+
+[Service]
+Type=oneshot
+User=${RUN_USER}
+Group=${RUN_GROUP}
+ExecStart=${PROJECT_DIR}/scripts/cpu_watchdog.sh
+EOF
+
+install -o root -g root -m 0644 /dev/null "${WATCHDOG_TIMER_FILE}"
+tee "${WATCHDOG_TIMER_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Periodically sample trading-agent.service CPU usage
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
+systemctl enable --now "${WATCHDOG_TIMER_NAME}"
 
 echo "${SERVICE_NAME} is installed and running."
 echo "View status with: sudo systemctl status ${SERVICE_NAME}"
 echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
+echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
