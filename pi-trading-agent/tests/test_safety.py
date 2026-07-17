@@ -11,6 +11,7 @@ import duckdb
 import pandas as pd
 import pytest
 
+import article_filter
 import autonomous_universe
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
@@ -981,3 +982,153 @@ def test_assess_bounds_article_count_to_the_prompt_token_budget() -> None:
 
     assert assessment.available
     assert f"assessed {len(articles)} articles" not in assessment.explanation
+
+
+def test_extract_financial_context_returns_none_for_a_low_density_article(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(article_filter, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "<html></html>")
+    monkeypatch.setattr(
+        article_filter.trafilatura,
+        "extract",
+        lambda *args, **kwargs: "Too short to bother the model with today.",
+    )
+
+    def _fail_post(*args, **kwargs):
+        raise AssertionError("a low-density article must never reach the model")
+
+    monkeypatch.setattr(article_filter.requests, "post", _fail_post)
+
+    assert article_filter.extract_financial_context("https://example.com/a", ["AAPL"]) is None
+
+
+def test_extract_financial_context_returns_cached_value_without_fetching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_path = tmp_path / "cache.json"
+    cache_key = f"https://example.com/a_{date.today()}"
+    cached = {"sentiment": "bullish", "confidence": 0.9, "affected_tickers": ["AAPL"],
+              "key_risks": [], "catalyst_type": "earnings"}
+    cache_path.write_text(json.dumps({cache_key: cached}), encoding="utf-8")
+    monkeypatch.setattr(article_filter, "CACHE_PATH", cache_path)
+
+    def _fail_fetch(url):
+        raise AssertionError("a cache hit must never fetch the article")
+
+    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", _fail_fetch)
+
+    result = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
+
+    assert result == cached
+
+
+def test_extract_financial_context_parses_a_valid_model_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(article_filter, "CACHE_PATH", cache_path)
+    article_text = (
+        "Apple AAPL reports strong quarterly earnings and raises guidance for outlook. "
+        "Analysts issued an upgrade after the surge in revenue beat estimates broadly. "
+        "The rally followed a dividend increase and a new buyback program announced today. "
+        "Some risk remains from a pending investigation into supplier tariff exposure now. "
+        "The company also discussed merger talks and a possible acquisition target overseas. "
+        "Executives said the recession fears and inflation outlook remain a modest headwind. "
+        "A weather report and a recipe roundup filled out the rest of the newsletter."
+    )
+    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "<html></html>")
+    monkeypatch.setattr(article_filter.trafilatura, "extract", lambda *args, **kwargs: article_text)
+    expected = {
+        "sentiment": "bullish",
+        "confidence": 0.8,
+        "affected_tickers": ["AAPL"],
+        "key_risks": ["supplier tariff exposure"],
+        "catalyst_type": "earnings",
+    }
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"response": json.dumps(expected)}
+
+    monkeypatch.setattr(article_filter.requests, "post", lambda *args, **kwargs: FakeResponse())
+
+    result = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
+
+    assert result == expected
+    cache_key = f"https://example.com/a_{date.today()}"
+    assert json.loads(cache_path.read_text(encoding="utf-8"))[cache_key] == expected
+
+
+def test_discovery_article_context_is_advisory_and_scoped_to_the_symbols_own_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": True}
+    logged: list[str] = []
+    strategy.log_message = lambda message, **kwargs: logged.append(message)
+
+    news_context = NewsContext(
+        available=True,
+        per_article=[
+            {
+                "headline": "Widget Co under investigation",
+                "summary": "",
+                "symbols": ["ZZZZ"],
+                "score": -3,
+                "url": "https://example.com/widget-co",
+            },
+        ],
+    )
+    captured = {}
+
+    def fake_extract(url: str, watchlist: list[str]) -> dict:
+        captured["url"] = url
+        captured["watchlist"] = watchlist
+        return {
+            "sentiment": "bearish",
+            "confidence": 0.7,
+            "affected_tickers": ["ZZZZ"],
+            "key_risks": ["regulatory investigation"],
+            "catalyst_type": "corporate",
+        }
+
+    monkeypatch.setattr(article_filter, "extract_financial_context", fake_extract)
+
+    report: dict = {}
+    strategy._check_discovery_article_context(["ZZZZ"], news_context, {"ZZZZ": -3}, report)
+
+    assert captured == {"url": "https://example.com/widget-co", "watchlist": ["ZZZZ"]}
+    assert report["discovery_article_context"] == "ZZZZ: bearish (corporate): regulatory investigation"
+    assert any("Discovery article context: ZZZZ" in message for message in logged)
+
+
+def test_discovery_article_context_skips_symbols_without_negative_coverage_or_a_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": True}
+    strategy.log_message = lambda *args, **kwargs: None
+
+    def _fail_extract(url: str, watchlist: list[str]) -> dict:
+        raise AssertionError("must not spend a call when there's nothing to screen")
+
+    monkeypatch.setattr(article_filter, "extract_financial_context", _fail_extract)
+
+    news_context = NewsContext(
+        available=True,
+        per_article=[
+            {"headline": "Neutral coverage", "summary": "", "symbols": ["AAAA"], "score": 0, "url": "https://x/a"},
+            {"headline": "No URL on file", "summary": "", "symbols": ["BBBB"], "score": -2, "url": ""},
+        ],
+    )
+    report: dict = {}
+
+    strategy._check_discovery_article_context(
+        ["AAAA", "BBBB"], news_context, {"AAAA": 0, "BBBB": -2}, report
+    )
+
+    assert "discovery_article_context" not in report

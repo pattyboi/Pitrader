@@ -211,6 +211,7 @@ class WorldEventAnalyzer:
                     "summary": summary,
                     "symbols": sorted(tagged_symbols),
                     "score": round(article_score),
+                    "url": str(article.get("url") or "").strip(),
                 }
             )
 
@@ -281,12 +282,14 @@ class WorldEventAnalyzer:
                 continue
             symbols_value = self._row_value(row, "symbols")
             created_at = self._row_value(row, "created_at")
+            url = self._row_value(row, "url")
             fetched_articles.append(
                 {
                     "headline": headline,
                     "summary": summary,
                     "symbols": list(symbols_value) if isinstance(symbols_value, (list, tuple)) else [],
                     "created_at": created_at if isinstance(created_at, datetime) else None,
+                    "url": str(url).strip() if url else "",
                 }
             )
 

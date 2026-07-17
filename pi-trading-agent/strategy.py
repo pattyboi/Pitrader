@@ -16,6 +16,7 @@ from typing import Any
 
 from lumibot.strategies import Strategy
 
+import article_filter
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
@@ -431,6 +432,7 @@ class AssetRotationStrategy(Strategy):
                 f"Discovered symbols: {report.get('discovered_symbols', 'none')}",
                 f"Discovery status: {report.get('discovery_status', 'ok')}",
                 f"Discovery red flags: {report.get('discovery_red_flags', 'none')}",
+                f"Discovery article context: {report.get('discovery_article_context', 'none')}",
                 f"Dip threshold: {report['threshold']:.2f}%",
                 f"News risk level: {report.get('news_risk_level', 'unavailable')}",
                 f"News score: {report.get('news_score', 'unavailable')}",
@@ -570,6 +572,7 @@ class AssetRotationStrategy(Strategy):
             ("Discovered symbols", report.get("discovered_symbols", "none")),
             ("Discovery status", report.get("discovery_status", "ok")),
             ("Discovery red flags", report.get("discovery_red_flags", "none")),
+            ("Discovery article context", report.get("discovery_article_context", "none")),
             ("Dip threshold", f"{report['threshold']:.2f}%"),
         ]
 
@@ -1549,7 +1552,11 @@ This automated message is not financial advice.
         if not news_context.available:
             return []
         return [
-            {"headline": article.get("headline", ""), "summary": article.get("summary", "")}
+            {
+                "headline": article.get("headline", ""),
+                "summary": article.get("summary", ""),
+                "url": article.get("url", ""),
+            }
             for article in news_context.per_article
             if symbol in article.get("symbols", [])
         ]
@@ -1670,6 +1677,56 @@ This automated message is not financial advice.
                 f"{symbol}: {reason}" for symbol, reason in flags.items()
             )
         return excluded
+
+    def _check_discovery_article_context(
+        self,
+        discovered_only: list[str],
+        news_context: NewsContext,
+        symbol_news_scores: dict[str, int],
+        report: dict[str, Any],
+    ) -> None:
+        """For the same negative-coverage discovery candidates
+        `_check_discovery_red_flags` screens, fetch that symbol's own
+        highest-signal article in full (not just Alpaca's headline/summary)
+        and ask the local model for a structured sentiment/risk verdict.
+        Purely advisory -- logged and reported only, never excludes a
+        symbol, unlike `_check_discovery_red_flags`. Skips a symbol with no
+        article URL available rather than spending a fetch+call on nothing.
+        `article_filter.extract_financial_context` never raises, so no
+        per-symbol try/except is needed here.
+        """
+        if not bool(self.parameters.get("llm_news_enabled", False)) or not news_context.available:
+            return
+        verdicts: dict[str, str] = {}
+        for symbol in discovered_only:
+            score = symbol_news_scores.get(symbol)
+            if score is None or score >= 0:
+                continue
+            url = next(
+                (
+                    str(article.get("url") or "").strip()
+                    for article in self._articles_for_symbol(news_context, symbol)
+                    if str(article.get("url") or "").strip()
+                ),
+                "",
+            )
+            if not url:
+                continue
+            context = article_filter.extract_financial_context(url, [symbol])
+            if not context:
+                continue
+            sentiment = str(context.get("sentiment", "unknown"))
+            catalyst = str(context.get("catalyst_type", "other"))
+            risks = ", ".join(context.get("key_risks") or []) or "no specific risks cited"
+            verdicts[symbol] = f"{sentiment} ({catalyst}): {risks}"
+            self.log_message(
+                f"Discovery article context: {symbol} - {verdicts[symbol]}",
+                color="yellow" if sentiment == "bearish" else "blue",
+            )
+        if verdicts:
+            report["discovery_article_context"] = "; ".join(
+                f"{symbol}: {verdict}" for symbol, verdict in verdicts.items()
+            )
 
     @staticmethod
     def _posture_adjusted_edge(
@@ -1925,6 +1982,9 @@ This automated message is not financial advice.
         )
         if excluded_symbols:
             symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
+        self._check_discovery_article_context(
+            discovered_only, news_context, symbol_news_scores, report
+        )
 
         # The adaptive model keeps learning from the configured market proxy
         # (Asset B) so its forecast can veto portfolio trades exactly as it
