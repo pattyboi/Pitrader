@@ -65,7 +65,6 @@ TOKENS_PER_WORD = 1.3
 MAX_PROMPT_TOKENS_ESTIMATE = 1800
 MIN_SCORE = -10
 MAX_SCORE = 10
-RISK_LEVELS = ("high", "elevated", "normal", "constructive")
 # This assessment is optional and fails open. A local, CPU-bound small model
 # is slower than a hosted API -- prompt-eval on this Pi runs ~27-31
 # tokens/sec regardless of which ~3-4B model is configured (measured
@@ -402,7 +401,20 @@ class LLMNewsAnalyzer:
         return self._parse_red_flag(text)
 
     @staticmethod
-    def _parse_assessment(text: str, article_count: int, model: str) -> LLMNewsAssessment:
+    def _risk_level_for_score(score: int) -> str:
+        """Derive risk_level from score using the same thresholds
+        WorldEventAnalyzer.analyze uses for its own risk_level, so the two
+        signals stay comparable in logs/reports."""
+        if score <= -6:
+            return "high"
+        if score < 0:
+            return "elevated"
+        if score > 0:
+            return "constructive"
+        return "normal"
+
+    @classmethod
+    def _parse_assessment(cls, text: str, article_count: int, model: str) -> LLMNewsAssessment:
         """Validate and repair a model reply into a usable assessment."""
         cleaned = text.strip()
         # Some models wrap JSON in a markdown code fence despite instructions.
@@ -411,16 +423,13 @@ class LLMNewsAnalyzer:
             cleaned = re.sub(r"\s*```$", "", cleaned)
         data = json.loads(cleaned)
         score = max(MIN_SCORE, min(MAX_SCORE, int(data["score"])))
-        risk_level = str(data.get("risk_level", "")).strip().lower()
-        if risk_level not in RISK_LEVELS:
-            if score <= -6:
-                risk_level = "high"
-            elif score < 0:
-                risk_level = "elevated"
-            elif score > 0:
-                risk_level = "constructive"
-            else:
-                risk_level = "normal"
+        # risk_level is always derived from score rather than trusting the
+        # model's own label: a self-reported label that doesn't match this
+        # pipeline's score thresholds (e.g. "normal" at a negative score)
+        # would otherwise pass validation silently and mislead anyone
+        # skimming the daily report/log line, even though it never affects
+        # trade-blocking (_market_veto_reason only checks score).
+        risk_level = cls._risk_level_for_score(score)
         reasoning = str(data.get("reasoning", "")).strip()
         return LLMNewsAssessment(
             available=True,
