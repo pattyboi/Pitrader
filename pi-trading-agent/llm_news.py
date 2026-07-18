@@ -16,6 +16,21 @@ import json
 import re
 from dataclasses import dataclass
 
+try:
+    import tiktoken
+
+    # cl100k_base is not this pipeline's actual tokenizer (the local GGUF
+    # models have their own vocabs, and Ollama exposes no tokenize endpoint
+    # to query them -- see MAX_PROMPT_TOKENS_ESTIMATE), but a real BPE
+    # encoder still segments dense financial text (tickers, "%", table-like
+    # runs of digits) the way a subword tokenizer actually would, which a
+    # linear words/chars heuristic cannot. Encoding is Rust-backed and fast
+    # (~0.3ms for a full article on this Pi), so this is a strictly better
+    # estimate at negligible extra cost when available.
+    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKEN_ENCODER = None
+
 OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 
 MAX_SUMMARY_CHARS = 400
@@ -35,14 +50,18 @@ OLLAMA_NUM_CTX = 8192
 # Approximate input-token budget for one prompt's assembled text (articles +
 # symbol context; the fixed system prompt is reserved separately, see
 # assess()/explain_exit()/check_red_flag()). No tokenizer dependency here
-# (Pi-constrained installs) -- ~4 chars/token is a documented approximation,
-# not an exact count, and it is NOT reliable across models: measured against
-# this Pi's actual Ollama server, it undercounted llama3.2:3b's real tokens
-# by ~1.6x but overcounted granite-4.0-micro's by ~1.1x for the same
-# content (different tokenizers). This budget is sized against the worse
-# (undercounting) case so it stays safe if LLM_NEWS_MODEL is changed again.
-# When the budget would be exceeded, articles are prioritized by |score|
-# rather than hard-truncated in place.
+# (Pi-constrained installs, and a real one -- e.g. tiktoken -- would tokenize
+# with an OpenAI vocab that has nothing to do with the local GGUF models this
+# actually calls, so it would just be a differently-wrong estimate dressed up
+# as an exact one). A words*TOKENS_PER_WORD estimate is used instead of a
+# chars/4 one (see article_filter.py's TOKENS_PER_WORD, calibrated the same
+# way): measured against this Pi's actual Ollama server, chars/4 undercounted
+# llama3.2:3b's real tokens by ~1.6x but overcounted granite-4.0-micro's by
+# ~1.1x for the same content (different tokenizers). This budget is sized
+# against the worse (undercounting) case so it stays safe if LLM_NEWS_MODEL
+# is changed again. When the budget would be exceeded, articles are
+# prioritized by |score| rather than hard-truncated in place.
+TOKENS_PER_WORD = 1.3
 MAX_PROMPT_TOKENS_ESTIMATE = 1800
 MIN_SCORE = -10
 MAX_SCORE = 10
@@ -185,9 +204,20 @@ class LLMNewsAnalyzer:
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        """Rough chars/4 token estimate; approximate by design, see
-        MAX_PROMPT_TOKENS_ESTIMATE."""
-        return len(text) // 4 if text else 0
+        """tiktoken's real BPE count when available (see _TOKEN_ENCODER for
+        why this is a better proxy than a linear heuristic despite not
+        matching the local model's actual vocab); a words*TOKENS_PER_WORD
+        estimate otherwise. Approximate either way, see
+        MAX_PROMPT_TOKENS_ESTIMATE. Never raises: arbitrary headline/summary
+        text can contain sequences tiktoken treats as special tokens."""
+        if not text:
+            return 0
+        if _TOKEN_ENCODER is not None:
+            try:
+                return len(_TOKEN_ENCODER.encode(text, disallowed_special=()))
+            except Exception:
+                pass
+        return int(len(text.split()) * TOKENS_PER_WORD)
 
     @classmethod
     def _prioritize_articles(cls, articles: list[dict], budget_tokens: int) -> list[dict]:

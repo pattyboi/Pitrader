@@ -19,6 +19,20 @@ from pathlib import Path
 import requests
 import trafilatura
 
+try:
+    import tiktoken
+
+    # cl100k_base is not this pipeline's actual tokenizer (MODEL's GGUF vocab
+    # differs, and Ollama has no tokenize endpoint to query it -- see
+    # llm_news.py's _TOKEN_ENCODER for the same reasoning), but a real BPE
+    # encoder still segments dense financial text (tickers, "%", table-like
+    # runs of digits) the way a subword tokenizer actually would, unlike a
+    # linear words/chars heuristic. Fast enough (~0.3ms/article) to cost
+    # nothing extra when available.
+    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKEN_ENCODER = None
+
 logger = logging.getLogger(__name__)
 
 CACHE_PATH = Path(__file__).resolve().parent / ".article_cache.json"
@@ -67,7 +81,18 @@ _WORD_PATTERN = re.compile(r"[A-Za-z']+")
 
 
 def _estimate_tokens(text: str) -> int:
-    return int(len(text.split()) * TOKENS_PER_WORD) if text else 0
+    """tiktoken's real BPE count when available (see _TOKEN_ENCODER); a
+    words*TOKENS_PER_WORD estimate otherwise. Never raises: arbitrary
+    third-party article text can contain sequences tiktoken treats as
+    special tokens."""
+    if not text:
+        return 0
+    if _TOKEN_ENCODER is not None:
+        try:
+            return len(_TOKEN_ENCODER.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return int(len(text.split()) * TOKENS_PER_WORD)
 
 
 def _split_sentences(text: str) -> list[str]:
