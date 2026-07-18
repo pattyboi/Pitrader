@@ -8,12 +8,18 @@ pi-trading-agent/config.json
 .last_email_report
 .news_learning_state.json
 .news_learning_state.json.*
+.news_learning_state_llm.json
+.news_learning_state_llm.json.*
 .rotation_state.json
 .rotation_state.json.*
 .portfolio_rotation_state.json
 .portfolio_rotation_state.json.*
 .portfolio_holding_state.json
 .portfolio_holding_state.json.*
+.portfolio_iteration_state.json
+.portfolio_iteration_state.json.*
+.nightly_preeval_state.json
+.nightly_preeval_state.json.*
 .autonomous_universe.json
 .autonomous_universe.json.*
 .autonomous_universe.duckdb
@@ -32,6 +38,8 @@ pi-trading-agent/config.json
 .cpu_watchdog_state
 .cpu_watchdog.log
 .cpu_watchdog.log.*
+.shutdown_diagnostic.log
+.shutdown_diagnostic.log.*
 
 # Python bytecode
 __pycache__/
