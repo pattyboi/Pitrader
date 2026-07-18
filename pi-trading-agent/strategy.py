@@ -386,6 +386,53 @@ class AssetRotationStrategy(Strategy):
         except OSError as exc:
             self.log_message(f"Could not persist portfolio iteration state: {exc}", color="red")
 
+    def _nightly_preeval_state_path(self) -> Path | None:
+        raw = self.parameters.get("nightly_preeval_state_file")
+        return Path(str(raw)) if raw else None
+
+    def _save_nightly_preeval_state(self, summary: str, symbol_count: int) -> None:
+        """Persist the overnight pass's findings so the live iteration's
+        email can show what was learned last night (see
+        _load_nightly_preeval_learnings). Keyed by date the same way
+        _save_portfolio_iteration_state is, so a stale file from a missed
+        night is never mistaken for tonight's."""
+        path = self._nightly_preeval_state_path()
+        if path is None:
+            return
+        try:
+            state = {
+                "date": self.get_datetime().date().isoformat(),
+                "symbol_count": symbol_count,
+                "summary": summary,
+            }
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+            temporary_path.replace(path)
+        except OSError as exc:
+            self.log_message(f"Could not persist nightly pre-evaluation state: {exc}", color="red")
+
+    def _load_nightly_preeval_learnings(self) -> dict[str, Any]:
+        """Today's nightly pre-evaluation summary, or {} if it hasn't run
+        yet today (feature disabled, timer hasn't fired, or a stale/corrupt
+        file) -- read once per iteration so the email can show what the
+        overnight pass found. Fails open like every other state read here.
+        """
+        path = self._nightly_preeval_state_path()
+        if path is None or not path.exists():
+            return {}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return {}
+            if state.get("date") != self.get_datetime().date().isoformat():
+                return {}
+            return {
+                "summary": str(state.get("summary", "")),
+                "symbol_count": int(state.get("symbol_count", 0)),
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+
     @staticmethod
     def _due_portfolio_iteration_window(
         now: Any,
@@ -520,6 +567,12 @@ class AssetRotationStrategy(Strategy):
             )
             message["From"] = str(self.parameters["email_from_address"])
             message["To"] = str(self.parameters["email_to_address"])
+            nightly_learned_line = (
+                f"Learned at night ({report['nightly_learned_symbol_count']} symbols checked): "
+                f"{report['nightly_learned_summary']}"
+                if "nightly_learned_summary" in report
+                else "Learned at night: not run last night"
+            )
             lines = [
                 "Raspberry Pi Trading Agent Daily Summary",
                 "",
@@ -549,6 +602,7 @@ class AssetRotationStrategy(Strategy):
                 f"LLM risk level: {report.get('llm_risk_level', 'unavailable')}",
                 f"LLM score: {report.get('llm_score', 'unavailable')}",
                 f"LLM reasoning: {report.get('llm_reasoning', 'unavailable')}",
+                nightly_learned_line,
                 f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                 f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                 f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
@@ -727,11 +781,24 @@ class AssetRotationStrategy(Strategy):
             ),
         ]
 
+        nightly_symbol_count = report.get("nightly_learned_symbol_count")
+        nightly_title = (
+            f"Learned at night ({nightly_symbol_count} symbols checked)"
+            if nightly_symbol_count is not None
+            else "Learned at night (not run last night)"
+        )
+        nightly_items = [
+            item
+            for item in str(report.get("nightly_learned_summary") or "").split("; ")
+            if item
+        ]
+
         sections = "".join(
             [
                 self._email_kv_section("Snapshot", snapshot_rows),
                 self._email_bullet_section("Portfolio actions", report.get("portfolio_actions", [])),
                 self._email_kv_section("News & Risk Signals", signal_rows),
+                self._email_bullet_section(nightly_title, nightly_items),
                 self._email_kv_section("Learning & Forecasts", forecast_rows),
                 self._email_bullet_section(
                     "Notable scored headlines", report.get("news_headlines", [])
@@ -1882,6 +1949,8 @@ This automated message is not financial advice.
         news_context: NewsContext,
         symbol_news_scores: dict[str, int],
         report: dict[str, Any],
+        *,
+        require_negative_score: bool = True,
     ) -> None:
         """For the same negative-coverage discovery candidates
         `_check_discovery_red_flags` screens, fetch that symbol's own
@@ -1892,14 +1961,20 @@ This automated message is not financial advice.
         article URL available rather than spending a fetch+call on nothing.
         `article_filter.extract_financial_context` never raises, so no
         per-symbol try/except is needed here.
+
+        `require_negative_score=False` (used by `_run_nightly_preevaluation`
+        to pre-warm the cache for every candidate symbol overnight, not just
+        discovery's negative-news ones) skips the score filter below and
+        checks every symbol passed in.
         """
         if not bool(self.parameters.get("llm_news_enabled", False)) or not news_context.available:
             return
         verdicts: dict[str, str] = {}
         for symbol in discovered_only:
-            score = symbol_news_scores.get(symbol)
-            if score is None or score >= 0:
-                continue
+            if require_negative_score:
+                score = symbol_news_scores.get(symbol)
+                if score is None or score >= 0:
+                    continue
             url = next(
                 (
                     str(article.get("url") or "").strip()
@@ -1925,6 +2000,43 @@ This automated message is not financial advice.
             report["discovery_article_context"] = "; ".join(
                 f"{symbol}: {verdict}" for symbol, verdict in verdicts.items()
             )
+
+    def _run_nightly_preevaluation(self) -> dict[str, Any]:
+        """One off-hours pass, meant to run once a night well after midnight:
+        every managed/held symbol gets its per-symbol LLM article verdict
+        pre-computed and cached (article_filter.py's `.article_verdicts.duckdb`,
+        keyed by calendar day), so the live market-open/midday iteration finds
+        a same-day cache hit instead of paying the Ollama round-trip live.
+
+        Deliberately uses `_managed_portfolio_symbols` rather than
+        `_portfolio_symbols` -- the latter calls `AutonomousUniverse.next_batch`,
+        which mutates discovery batch-rotation state on every call, and this
+        must never consume a discovery batch the live morning iteration
+        should get instead. Fails open like every other news/LLM path: any
+        problem here must never delay or block trading.
+        """
+        report: dict[str, Any] = {}
+        if not bool(self.parameters.get("llm_news_enabled", False)) or not bool(
+            self.parameters.get("portfolio_nightly_preeval_enabled", True)
+        ):
+            return report
+        managed_symbols = self._managed_portfolio_symbols()
+        positions = self._portfolio_held_positions(managed_symbols)
+        held = positions[0] if positions is not None else {}
+        all_symbols = sorted(managed_symbols | set(held))
+        news_context = self._get_news_context()
+        symbol_news_scores = self._symbol_news_scores(news_context, set(all_symbols))
+        self._check_discovery_article_context(
+            all_symbols,
+            news_context,
+            symbol_news_scores,
+            report,
+            require_negative_score=False,
+        )
+        self._save_nightly_preeval_state(
+            report.get("discovery_article_context", ""), len(all_symbols)
+        )
+        return report
 
     @staticmethod
     def _posture_adjusted_edge(
@@ -2332,6 +2444,12 @@ This automated message is not financial advice.
                 else llm_assessment.explanation
             ),
         )
+        nightly_learnings = self._load_nightly_preeval_learnings()
+        if nightly_learnings:
+            report["nightly_learned_summary"] = (
+                nightly_learnings.get("summary") or "no notable verdicts"
+            )
+            report["nightly_learned_symbol_count"] = nightly_learnings.get("symbol_count", 0)
 
         # Screen only symbols discovery itself just surfaced -- never a held
         # or statically-configured symbol -- for a severe, company-specific

@@ -1363,6 +1363,127 @@ def test_discovery_article_context_skips_symbols_without_negative_coverage_or_a_
     assert "discovery_article_context" not in report
 
 
+def test_discovery_article_context_checks_every_symbol_when_negative_score_not_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": True}
+    strategy.log_message = lambda *args, **kwargs: None
+
+    news_context = NewsContext(
+        available=True,
+        per_article=[
+            {"headline": "Neutral coverage", "summary": "", "symbols": ["AAAA"], "score": 0, "url": "https://x/a"},
+        ],
+    )
+
+    def fake_extract(url: str, watchlist: list[str]) -> dict:
+        return {
+            "sentiment": "neutral",
+            "confidence": 0.5,
+            "affected_tickers": ["AAAA"],
+            "key_risks": [],
+            "catalyst_type": "other",
+        }
+
+    monkeypatch.setattr(article_filter, "extract_financial_context", fake_extract)
+
+    report: dict = {}
+    strategy._check_discovery_article_context(
+        ["AAAA"], news_context, {"AAAA": 0}, report, require_negative_score=False
+    )
+
+    assert report["discovery_article_context"] == "AAAA: neutral (other): no specific risks cited"
+
+
+def test_nightly_preevaluation_never_consumes_a_discovery_batch() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": True, "portfolio_nightly_preeval_enabled": True}
+    strategy.log_message = lambda *args, **kwargs: None
+
+    def _fail_portfolio_symbols(*args, **kwargs):
+        raise AssertionError("must not call _portfolio_symbols (consumes a discovery batch)")
+
+    strategy._portfolio_symbols = _fail_portfolio_symbols
+    strategy._managed_portfolio_symbols = lambda: {"AAPL", "MSFT"}
+    strategy._portfolio_held_positions = lambda managed: ({}, {})
+    strategy._get_news_context = lambda: NewsContext(available=False)
+    strategy._symbol_news_scores = lambda news_context, candidates: {}
+
+    captured: dict = {}
+
+    def fake_check(candidate_symbols, news_context, symbol_news_scores, report, *, require_negative_score=True):
+        captured["symbols"] = candidate_symbols
+        captured["require_negative_score"] = require_negative_score
+
+    strategy._check_discovery_article_context = fake_check
+
+    strategy._run_nightly_preevaluation()
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+    assert captured["require_negative_score"] is False
+
+
+def test_nightly_preevaluation_short_circuits_when_llm_news_disabled() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": False, "portfolio_nightly_preeval_enabled": True}
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("must not touch the account/news layer when disabled")
+
+    strategy._managed_portfolio_symbols = _fail
+
+    assert strategy._run_nightly_preevaluation() == {}
+
+
+def test_nightly_preevaluation_short_circuits_when_nightly_pass_disabled() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"llm_news_enabled": True, "portfolio_nightly_preeval_enabled": False}
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("must not touch the account/news layer when disabled")
+
+    strategy._managed_portfolio_symbols = _fail
+
+    assert strategy._run_nightly_preevaluation() == {}
+
+
+def test_nightly_preeval_state_round_trips_within_the_same_day(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"nightly_preeval_state_file": str(tmp_path / "state.json")}
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.get_datetime = lambda: datetime(2026, 1, 5, 3, 0, tzinfo=timezone.utc)
+
+    strategy._save_nightly_preeval_state("AAPL: bullish (earnings): none", 5)
+
+    assert strategy._load_nightly_preeval_learnings() == {
+        "summary": "AAPL: bullish (earnings): none",
+        "symbol_count": 5,
+    }
+
+
+def test_nightly_preeval_state_is_ignored_once_stale(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"nightly_preeval_state_file": str(tmp_path / "state.json")}
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.get_datetime = lambda: datetime(2026, 1, 5, 3, 0, tzinfo=timezone.utc)
+    strategy._save_nightly_preeval_state("AAPL: bullish (earnings): none", 5)
+
+    # A later poll, on the next calendar day, must not surface yesterday's
+    # findings as if they were computed for today.
+    strategy.get_datetime = lambda: datetime(2026, 1, 6, 9, 30, tzinfo=timezone.utc)
+
+    assert strategy._load_nightly_preeval_learnings() == {}
+
+
+def test_nightly_preeval_state_load_fails_open_without_a_file(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"nightly_preeval_state_file": str(tmp_path / "missing.json")}
+    strategy.get_datetime = lambda: datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+
+    assert strategy._load_nightly_preeval_learnings() == {}
+
+
 def test_portfolio_builds_reserve_cash_across_same_pass_orders() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.get_cash = lambda: 100.0

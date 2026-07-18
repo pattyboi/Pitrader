@@ -7,6 +7,8 @@ WATCHDOG_TIMER_NAME="trading-agent-cpu-watchdog.timer"
 OLLAMA_SERVICE_NAME="ollama.service"
 OLLAMA_WARMUP_SERVICE_NAME="ollama-warmup.service"
 OLLAMA_WARMUP_TIMER_NAME="ollama-warmup.timer"
+NIGHTLY_PREEVAL_SERVICE_NAME="trading-agent-nightly-preeval.service"
+NIGHTLY_PREEVAL_TIMER_NAME="trading-agent-nightly-preeval.timer"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -15,6 +17,8 @@ WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_TIMER_NAME}"
 OLLAMA_SERVICE_FILE="/etc/systemd/system/${OLLAMA_SERVICE_NAME}"
 OLLAMA_WARMUP_SERVICE_FILE="/etc/systemd/system/${OLLAMA_WARMUP_SERVICE_NAME}"
 OLLAMA_WARMUP_TIMER_FILE="/etc/systemd/system/${OLLAMA_WARMUP_TIMER_NAME}"
+NIGHTLY_PREEVAL_SERVICE_FILE="/etc/systemd/system/${NIGHTLY_PREEVAL_SERVICE_NAME}"
+NIGHTLY_PREEVAL_TIMER_FILE="/etc/systemd/system/${NIGHTLY_PREEVAL_TIMER_NAME}"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP="$(id -gn "${RUN_USER}")"
 
@@ -53,6 +57,7 @@ chmod 600 "${PROJECT_DIR}/config.json"
 chmod 755 "${PROJECT_DIR}/main.py"
 chmod 755 "${PROJECT_DIR}/scripts/cpu_watchdog.sh"
 chmod 755 "${PROJECT_DIR}/scripts/ollama_warmup.sh"
+chmod 755 "${PROJECT_DIR}/scripts/nightly_preeval.py"
 
 # The optional LLM news assessment (llm_news.py) only ever talks to a local
 # Ollama server -- never an outside API -- so Ollama is provisioned here too.
@@ -69,6 +74,10 @@ fi
 # 8h keeps the model loaded from the 09:00 warm-up through both possible
 # calls regardless of that offset, still unloading well before the next
 # morning's warm-up instead of holding ~2GB of RAM around the clock.
+# OLLAMA_MAX_LOADED_MODELS=1 is a hard cap, not a reaction to any current
+# multi-model use -- LLM_NEWS_MODEL and article_filter.py's MODEL constant
+# are already the same tag -- but this Pi has no RAM to spare if that ever
+# changes, so the limit is made explicit rather than implicit.
 install -o root -g root -m 0644 /dev/null "${OLLAMA_SERVICE_FILE}"
 tee "${OLLAMA_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
@@ -83,6 +92,7 @@ Restart=always
 RestartSec=3
 Environment=OLLAMA_HOST=127.0.0.1:11434
 Environment=OLLAMA_KEEP_ALIVE=8h
+Environment=OLLAMA_MAX_LOADED_MODELS=1
 
 [Install]
 WantedBy=multi-user.target
@@ -112,6 +122,39 @@ Description=Trigger the Ollama news-model warm-up before market open
 # timezone); adjust if the host's timezone differs. 30 minutes ahead of the
 # 9:30 ET market open the strategy trades at.
 OnCalendar=Mon..Fri 09:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+install -o root -g root -m 0644 /dev/null "${NIGHTLY_PREEVAL_SERVICE_FILE}"
+tee "${NIGHTLY_PREEVAL_SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Pre-evaluate every candidate symbol's LLM news verdict before the trading day
+After=${OLLAMA_SERVICE_NAME}
+Requires=${OLLAMA_SERVICE_NAME}
+
+[Service]
+Type=oneshot
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/nightly_preeval.py
+EOF
+
+install -o root -g root -m 0644 /dev/null "${NIGHTLY_PREEVAL_TIMER_FILE}"
+tee "${NIGHTLY_PREEVAL_TIMER_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Trigger the nightly LLM pre-evaluation pass before the trading day
+
+[Timer]
+# Assumes the system timezone is America/New_York, same as the warmup timer.
+# Deliberately well after midnight -- article_filter.py's per-symbol verdict
+# cache is keyed by calendar day, so running before midnight would cache
+# under yesterday's date and never be read by the trading day it was meant
+# for -- and well before the 09:00 warmup so the two never overlap.
+OnCalendar=Mon..Fri 03:00:00
 Persistent=false
 
 [Install]
@@ -182,6 +225,7 @@ systemctl enable --now "${SERVICE_NAME}"
 systemctl enable --now "${WATCHDOG_TIMER_NAME}"
 systemctl enable --now "${OLLAMA_SERVICE_NAME}"
 systemctl enable --now "${OLLAMA_WARMUP_TIMER_NAME}"
+systemctl enable --now "${NIGHTLY_PREEVAL_TIMER_NAME}"
 
 echo "${SERVICE_NAME} is installed and running."
 echo "View status with: sudo systemctl status ${SERVICE_NAME}"

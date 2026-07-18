@@ -542,6 +542,13 @@ but does not send a second email. The report includes:
 - Current holdings, signal candidates, and discovered symbols.
 - The configured dip threshold.
 - News, LLM, and adaptive-learning summaries.
+- **Learned at night** — what `trading-agent-nightly-preeval.timer`'s 03:00
+  ET pass found when it pre-checked every managed/held symbol's own news
+  coverage with the local LLM (see "Nightly pre-evaluation" below). Purely
+  informational, same as the rest of this section — it only means today's
+  live checks were mostly cache hits, not a new signal on top of them.
+  Reads "not run last night" if the pass didn't run (feature disabled, or
+  the timer hasn't fired yet today).
 - The action taken or the reason no action was taken.
 - Any caught evaluation error.
 
@@ -768,23 +775,32 @@ key, no rate limit, and no dependency on an outside provider staying up.
 `llm_news.py` only speaks to Ollama's OpenAI-compatible endpoint; no other
 provider is supported.
 
-`setup_service.sh` installs and enables two extra systemd units alongside
+`setup_service.sh` installs and enables three extra systemd units alongside
 `trading-agent.service`:
 
 - `ollama.service` — runs `ollama serve` bound to `127.0.0.1:11434` only
-  (never reachable off the device), with `OLLAMA_KEEP_ALIVE=8h`. The strategy
-  makes up to two LLM calls a trading day (see "How often the agent checks
-  in" below), so the daemon itself stays up all the time (idle cost is
-  negligible with no model loaded), but the ~3GB of loaded model weights
-  unload again after the last call of the day instead of sitting in RAM
-  around the clock.
+  (never reachable off the device), with `OLLAMA_KEEP_ALIVE=8h` and
+  `OLLAMA_MAX_LOADED_MODELS=1` (a hard cap, since this Pi has no RAM to spare
+  for a second resident model). The strategy makes up to two LLM calls a
+  trading day (see "How often the agent checks in" below), so the daemon
+  itself stays up all the time (idle cost is negligible with no model
+  loaded), but the ~3GB of loaded model weights unload again after the last
+  call of the day instead of sitting in RAM around the clock.
+- `trading-agent-nightly-preeval.timer` — fires at 03:00 ET, Mon-Fri, well
+  after midnight so the per-symbol verdict cache below is stamped with the
+  correct trading day, and well before the next unit. Runs
+  `scripts/nightly_preeval.py`, which pre-computes and caches every managed
+  or held symbol's LLM article verdict (see "Other uses of the local model"
+  below) so the live iterations mostly find a cache hit instead of an
+  Ollama round-trip.
 - `ollama-warmup.timer` — fires at 09:00 ET (the Pi's system timezone is
   already `America/New_York`), 30 minutes before the 9:30 ET market open, and
   sends the configured model one trivial prompt to force a cold load to
   finish well ahead of the first trading iteration. The 8-hour keep-alive
   window comfortably covers the gap from this warm-up through both the
   morning and midday calls, however `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES`
-  is configured.
+  is configured — the earlier nightly pre-evaluation run doesn't change this,
+  since this 09:00 call re-arms the same 8-hour keep-alive window regardless.
 
 Pull the model once after installing:
 
@@ -845,8 +861,8 @@ LLM news assessment: risk=elevated, score=-3. Several articles describe ...
 
 #### Other uses of the local model
 
-Once the model is running locally for free with no rate limit, three more
-places reuse it. All three are purely descriptive or, in the discovery
+Once the model is running locally for free with no rate limit, four more
+places reuse it. All four are purely descriptive or, in the discovery
 case, advisory by default — none can create a trade, and none run unless
 `LLM_NEWS_ENABLED` is `true`.
 
@@ -873,6 +889,17 @@ case, advisory by default — none can create a trade, and none run unless
   (it's simply reconsidered again on a later discovery cycle, never
   permanently blacklisted). Symbols with no negative coverage aren't
   checked at all, so most days this makes zero extra calls.
+- **Nightly pre-evaluation.** `trading-agent-nightly-preeval.timer` (see
+  above) runs the same per-symbol article-verdict check the discovery
+  red-flag screening above uses, but at 03:00 ET over *every* managed or
+  held symbol, not just discovery's negative-news ones, and regardless of
+  sentiment. Each verdict lands in the same same-day cache
+  (`.article_verdicts.duckdb`) that screening reads from, so the live
+  iterations that morning mostly find a cache hit instead of paying an
+  Ollama round-trip live. Purely a cache warm-up — it cannot itself flag,
+  block, or otherwise change a trade; it only changes whether a later,
+  identical check is fast. Set `PORTFOLIO_NIGHTLY_PREEVAL_ENABLED` to
+  `false` to turn it off independently of `LLM_NEWS_ENABLED`.
 
 #### LLM limitations
 

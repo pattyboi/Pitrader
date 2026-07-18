@@ -250,6 +250,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_RISK_POSTURE": "conservative",
         "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED": False,
         "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES": 210,
+        "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED": True,
     }
     for key, default in portfolio_defaults.items():
         config.setdefault(key, default)
@@ -318,7 +319,9 @@ def load_config(path: Path) -> dict[str, Any]:
     risk_posture = str(config["PORTFOLIO_RISK_POSTURE"]).strip().lower()
     if risk_posture not in ("conservative", "risky"):
         raise ValueError("PORTFOLIO_RISK_POSTURE must be conservative or risky")
-    _require_booleans(config, "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED")
+    _require_booleans(
+        config, "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED", "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED"
+    )
     config["PORTFOLIO_RISK_POSTURE"] = risk_posture
     config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
     config["PORTFOLIO_MAX_POSITIONS"] = portfolio_max_positions
@@ -534,6 +537,119 @@ def _tidy_logging() -> None:
     )
 
 
+def build_strategy(
+    config: dict[str, Any], base_dir: Path
+) -> tuple["MarketOpenLoggingAlpaca", AssetRotationStrategy]:
+    """Construct the broker and strategy from validated config, without
+    starting the Trader loop. Shared by `main()` (which wraps the result in
+    `Trader().add_strategy(...).run_all()`) and `scripts/nightly_preeval.py`
+    (which calls a strategy method directly and exits), so the two never
+    drift out of sync as config keys are added.
+    """
+    broker = MarketOpenLoggingAlpaca(
+        {
+            "API_KEY": config["ALPACA_API_KEY"],
+            "API_SECRET": config["ALPACA_SECRET_KEY"],
+            "PAPER": config["IS_PAPER_TRADING"],
+        }
+    )
+    strategy = AssetRotationStrategy(
+        broker=broker,
+        parameters={
+            "asset_a": config["ASSET_A"],
+            "asset_b": config["ASSET_B"],
+            "dip_threshold_percent": config["DIP_THRESHOLD_PERCENT"],
+            "recent_high_lookback_days": config["RECENT_HIGH_LOOKBACK_DAYS"],
+            "email_report_enabled": config["EMAIL_REPORT_ENABLED"],
+            "email_smtp_host": config["EMAIL_SMTP_HOST"],
+            "email_smtp_port": config["EMAIL_SMTP_PORT"],
+            "email_smtp_username": config["EMAIL_SMTP_USERNAME"],
+            "email_from_address": config["EMAIL_FROM_ADDRESS"],
+            "email_to_address": config["EMAIL_TO_ADDRESS"],
+            "email_use_tls": config["EMAIL_USE_TLS"],
+            "email_state_file": str(base_dir / ".last_email_report"),
+            "shutdown_diagnostic_file": str(base_dir / ".shutdown_diagnostic.log"),
+            "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
+            "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
+            "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
+            "portfolio_min_signal_observations": config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"],
+            "portfolio_min_expected_profit_percent": config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"],
+            "portfolio_oos_min_observations": config["PORTFOLIO_OOS_MIN_OBSERVATIONS"],
+            "portfolio_oos_min_net_profit_percent": config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"],
+            "portfolio_round_trip_cost_percent": config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"],
+            "portfolio_take_profit_percent": config["PORTFOLIO_TAKE_PROFIT_PERCENT"],
+            "portfolio_stop_loss_percent": config["PORTFOLIO_STOP_LOSS_PERCENT"],
+            "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
+            "portfolio_holding_state_file": str(base_dir / ".portfolio_holding_state.json"),
+            "portfolio_rotation_state_file": str(base_dir / ".portfolio_rotation_state.json"),
+            "portfolio_iteration_state_file": str(base_dir / ".portfolio_iteration_state.json"),
+            "portfolio_second_iteration_offset_minutes": config[
+                "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"
+            ],
+            "portfolio_nightly_preeval_enabled": config["PORTFOLIO_NIGHTLY_PREEVAL_ENABLED"],
+            "nightly_preeval_state_file": str(base_dir / ".nightly_preeval_state.json"),
+            "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
+            "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
+            "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
+            "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
+            "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
+            "portfolio_universe_state_file": str(base_dir / ".autonomous_universe.json"),
+            "portfolio_universe_database_file": str(base_dir / ".autonomous_universe.duckdb"),
+            "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
+            "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
+            "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
+            "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
+            "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
+            "portfolio_discovery_llm_block_enabled": config["PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED"],
+            "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
+            "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
+            "news_max_articles": config["NEWS_MAX_ARTICLES"],
+            "news_block_on_high_risk": config["NEWS_BLOCK_ON_HIGH_RISK"],
+            "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
+            "news_learning_enabled": config["NEWS_LEARNING_ENABLED"],
+            "news_learning_block_enabled": config[
+                "NEWS_LEARNING_BLOCK_ENABLED"
+            ],
+            "news_learning_min_observations": config[
+                "NEWS_LEARNING_MIN_OBSERVATIONS"
+            ],
+            "news_learning_max_observations": config[
+                "NEWS_LEARNING_MAX_OBSERVATIONS"
+            ],
+            "news_learning_min_correlation": config[
+                "NEWS_LEARNING_MIN_CORRELATION"
+            ],
+            "news_predicted_return_block_percent": config[
+                "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
+            ],
+            "news_learning_state_file": str(base_dir / ".news_learning_state.json"),
+            "news_learning_llm_state_file": str(base_dir / ".news_learning_state_llm.json"),
+            "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
+            "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
+            "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],
+            "symbol_reference_database_file": str(base_dir / ".symbol_reference.duckdb"),
+            "decision_memory_enabled": config["DECISION_MEMORY_ENABLED"],
+            "decision_memory_block_enabled": config["DECISION_MEMORY_BLOCK_ENABLED"],
+            "decision_memory_min_observations": config["DECISION_MEMORY_MIN_OBSERVATIONS"],
+            "decision_memory_max_observations": config["DECISION_MEMORY_MAX_OBSERVATIONS"],
+            "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
+            "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
+            "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
+            "decision_memory_database_file": str(base_dir / ".trade_memory.duckdb"),
+            "portfolio_memory_enabled": config["PORTFOLIO_MEMORY_ENABLED"],
+            "portfolio_memory_min_observations": config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"],
+            "portfolio_memory_max_observations": config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"],
+            "portfolio_memory_database_file": str(base_dir / ".portfolio_memory.duckdb"),
+            "llm_news_enabled": config["LLM_NEWS_ENABLED"],
+            "llm_news_model": config["LLM_NEWS_MODEL"],
+            "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
+            "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
+            "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
+        },
+    )
+    return broker, strategy
+
+
 def main() -> int:
     """Configure Lumibot and run until the process receives a stop signal."""
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -552,105 +668,7 @@ def main() -> int:
         os.environ["ALPACA_IS_PAPER"] = str(config["IS_PAPER_TRADING"]).lower()
         os.environ["EMAIL_SMTP_PASSWORD"] = str(config["EMAIL_SMTP_PASSWORD"])
 
-        broker = MarketOpenLoggingAlpaca(
-            {
-                "API_KEY": config["ALPACA_API_KEY"],
-                "API_SECRET": config["ALPACA_SECRET_KEY"],
-                "PAPER": config["IS_PAPER_TRADING"],
-            }
-        )
-        strategy = AssetRotationStrategy(
-            broker=broker,
-            parameters={
-                "asset_a": config["ASSET_A"],
-                "asset_b": config["ASSET_B"],
-                "dip_threshold_percent": config["DIP_THRESHOLD_PERCENT"],
-                "recent_high_lookback_days": config["RECENT_HIGH_LOOKBACK_DAYS"],
-                "email_report_enabled": config["EMAIL_REPORT_ENABLED"],
-                "email_smtp_host": config["EMAIL_SMTP_HOST"],
-                "email_smtp_port": config["EMAIL_SMTP_PORT"],
-                "email_smtp_username": config["EMAIL_SMTP_USERNAME"],
-                "email_from_address": config["EMAIL_FROM_ADDRESS"],
-                "email_to_address": config["EMAIL_TO_ADDRESS"],
-                "email_use_tls": config["EMAIL_USE_TLS"],
-                "email_state_file": str(BASE_DIR / ".last_email_report"),
-                "shutdown_diagnostic_file": str(BASE_DIR / ".shutdown_diagnostic.log"),
-                "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
-                "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
-                "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
-                "portfolio_min_signal_observations": config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"],
-                "portfolio_min_expected_profit_percent": config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"],
-                "portfolio_oos_min_observations": config["PORTFOLIO_OOS_MIN_OBSERVATIONS"],
-                "portfolio_oos_min_net_profit_percent": config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"],
-                "portfolio_round_trip_cost_percent": config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"],
-                "portfolio_take_profit_percent": config["PORTFOLIO_TAKE_PROFIT_PERCENT"],
-                "portfolio_stop_loss_percent": config["PORTFOLIO_STOP_LOSS_PERCENT"],
-                "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
-                "portfolio_holding_state_file": str(BASE_DIR / ".portfolio_holding_state.json"),
-                "portfolio_rotation_state_file": str(BASE_DIR / ".portfolio_rotation_state.json"),
-                "portfolio_iteration_state_file": str(BASE_DIR / ".portfolio_iteration_state.json"),
-                "portfolio_second_iteration_offset_minutes": config[
-                    "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"
-                ],
-                "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
-                "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
-                "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
-                "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
-                "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
-                "portfolio_universe_state_file": str(BASE_DIR / ".autonomous_universe.json"),
-                "portfolio_universe_database_file": str(BASE_DIR / ".autonomous_universe.duckdb"),
-                "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
-                "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
-                "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
-                "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
-                "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
-                "portfolio_discovery_llm_block_enabled": config["PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED"],
-                "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
-                "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
-                "news_max_articles": config["NEWS_MAX_ARTICLES"],
-                "news_block_on_high_risk": config["NEWS_BLOCK_ON_HIGH_RISK"],
-                "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
-                "news_learning_enabled": config["NEWS_LEARNING_ENABLED"],
-                "news_learning_block_enabled": config[
-                    "NEWS_LEARNING_BLOCK_ENABLED"
-                ],
-                "news_learning_min_observations": config[
-                    "NEWS_LEARNING_MIN_OBSERVATIONS"
-                ],
-                "news_learning_max_observations": config[
-                    "NEWS_LEARNING_MAX_OBSERVATIONS"
-                ],
-                "news_learning_min_correlation": config[
-                    "NEWS_LEARNING_MIN_CORRELATION"
-                ],
-                "news_predicted_return_block_percent": config[
-                    "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
-                ],
-                "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
-                "news_learning_llm_state_file": str(BASE_DIR / ".news_learning_state_llm.json"),
-                "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
-                "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
-                "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],
-                "symbol_reference_database_file": str(BASE_DIR / ".symbol_reference.duckdb"),
-                "decision_memory_enabled": config["DECISION_MEMORY_ENABLED"],
-                "decision_memory_block_enabled": config["DECISION_MEMORY_BLOCK_ENABLED"],
-                "decision_memory_min_observations": config["DECISION_MEMORY_MIN_OBSERVATIONS"],
-                "decision_memory_max_observations": config["DECISION_MEMORY_MAX_OBSERVATIONS"],
-                "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
-                "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
-                "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
-                "decision_memory_database_file": str(BASE_DIR / ".trade_memory.duckdb"),
-                "portfolio_memory_enabled": config["PORTFOLIO_MEMORY_ENABLED"],
-                "portfolio_memory_min_observations": config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"],
-                "portfolio_memory_max_observations": config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"],
-                "portfolio_memory_database_file": str(BASE_DIR / ".portfolio_memory.duckdb"),
-                "llm_news_enabled": config["LLM_NEWS_ENABLED"],
-                "llm_news_model": config["LLM_NEWS_MODEL"],
-                "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
-                "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
-                "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
-            },
-        )
+        _, strategy = build_strategy(config, BASE_DIR)
 
         trader = Trader()
         trader.add_strategy(strategy)
