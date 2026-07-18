@@ -859,6 +859,8 @@ This automated message is not financial advice.
                 max_articles=int(self.parameters["news_max_articles"]),
                 block_score=int(self.parameters["news_high_risk_score"]),
                 refine_scoring=bool(self.parameters.get("news_score_refinement_enabled", False)),
+                rss_enabled=bool(self.parameters.get("news_rss_enabled", False)),
+                rss_feed_urls=list(self.parameters.get("news_rss_feed_urls", [])),
             )
             context = analyzer.analyze()
             self.log_message(

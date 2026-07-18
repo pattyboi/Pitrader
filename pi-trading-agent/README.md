@@ -222,6 +222,7 @@ pi-trading-agent/
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
 ├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
+├── rss_news.py         Optional free RSS headline ingestion (no API key)
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
 ├── llm_news.py         Optional LLM daily news assessment (local Ollama only)
@@ -430,6 +431,8 @@ chmod 600 config.json
 | `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
 | `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
 | `NEWS_SCORE_REFINEMENT_ENABLED` | Applies recency decay and duplicate-event dampening to the keyword score; changes its exact value, so off by default | `false` |
+| `NEWS_RSS_ENABLED` | Merges free, no-API-key RSS headlines into the same article set as Alpaca's | `false` |
+| `NEWS_RSS_FEED_URLS` | RSS 2.0 feed URLs to merge in when the above is `true` (max 10) | Yahoo Finance, MarketWatch, CNBC |
 | `SYMBOL_REFERENCE_ENABLED` | Cross-checks Alpaca's per-article symbol tags against a second source before trusting them for per-symbol ranking | `true` |
 | `SYMBOL_REFERENCE_REFRESH_DAYS` | Days between local symbol-mapping refreshes | `7` |
 | `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
@@ -651,6 +654,37 @@ Dip signal met, but rotation was blocked by the configured world-event risk guar
 ```
 
 Headlines in that example are illustrative. Actual output comes from Alpaca.
+
+#### Optional free RSS sources
+
+Alpaca is the only news source by default. Setting `NEWS_RSS_ENABLED` to
+`true` merges in headlines from `NEWS_RSS_FEED_URLS` — plain RSS 2.0 feeds,
+no API key or paid tier required (the default list points at Yahoo Finance,
+MarketWatch, and CNBC's public feeds). Each RSS article goes through the
+exact same keyword scoring as an Alpaca one, and — since RSS carries no
+ticker tags — becomes eligible for the same company-name text-scan
+attribution described below, so it can still be matched to a specific
+watched symbol. `article_filter.py`'s discovery-context check and the LLM
+assessment both already work over any article with a `url`, so an RSS
+article is treated identically to an Alpaca one everywhere downstream.
+
+Merging only ever adds coverage: if Alpaca's own fetch fails (missing
+credentials, an outage), the whole news layer still reports unavailable
+exactly as before — RSS never substitutes for a broken primary source, it
+only supplements a working one. A feed that's down or slow is skipped
+individually and logged; the rest still merge in normally. Free RSS
+endpoints can change or disappear over time, so if `NEWS_RSS_FEED_URLS`
+stops returning anything, verify the URLs still resolve (`curl -I <url>`)
+and swap in replacements — this is not a paid, contractually-stable API.
+
+```json
+"NEWS_RSS_ENABLED": true,
+"NEWS_RSS_FEED_URLS": [
+  "https://finance.yahoo.com/news/rssindex",
+  "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+  "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+]
+```
 
 #### Per-symbol relevance and score refinement
 

@@ -22,6 +22,7 @@ from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer
 from market_sessions import is_next_trading_session
 from news_context import NewsContext, WorldEventAnalyzer
+import rss_news
 from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
 from strategy import AssetRotationStrategy
@@ -1608,3 +1609,204 @@ def test_prioritize_articles_skips_an_oversize_article_and_keeps_shorter_ones() 
     kept = LLMNewsAnalyzer._prioritize_articles(articles, budget_tokens=2)
 
     assert kept == [articles[1]]
+
+
+_SAMPLE_RSS_FEED = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<item>
+<title>Widget Co beats earnings</title>
+<description>&lt;p&gt;Strong quarter for &amp;amp; Widget Co.&lt;/p&gt;</description>
+<link>https://example.com/widget-earnings</link>
+<pubDate>{recent}</pubDate>
+</item>
+<item>
+<title>Stale story from last week</title>
+<description>Old news.</description>
+<link>https://example.com/stale</link>
+<pubDate>{stale}</pubDate>
+</item>
+<item>
+<title></title>
+<description>Untitled items are skipped.</description>
+<link>https://example.com/no-title</link>
+<pubDate>{recent}</pubDate>
+</item>
+</channel></rss>"""
+
+
+def _rss_datetime(dt: datetime) -> str:
+    return dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def test_parse_feed_strips_html_and_skips_untitled_items() -> None:
+    now = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+
+    articles = rss_news._parse_feed(xml)
+
+    assert len(articles) == 2  # the untitled item is skipped
+    assert articles[0]["headline"] == "Widget Co beats earnings"
+    assert articles[0]["summary"] == "Strong quarter for & Widget Co."
+    assert articles[0]["url"] == "https://example.com/widget-earnings"
+    assert articles[0]["symbols"] == []
+    assert articles[0]["created_at"] == now
+
+
+def test_parse_feed_returns_nothing_for_malformed_xml() -> None:
+    assert rss_news._parse_feed("not xml at all <<<") == []
+
+
+def test_fetch_articles_filters_by_lookback_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+
+    class FakeResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    articles = rss_news.fetch_articles(["https://feed.example/rss"], lookback_hours=24, max_articles=10)
+
+    assert [a["headline"] for a in articles] == ["Widget Co beats earnings"]
+
+
+def test_fetch_articles_deduplicates_the_same_url_across_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+
+    class FakeResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    articles = rss_news.fetch_articles(
+        ["https://feed-a.example/rss", "https://feed-b.example/rss"], lookback_hours=24, max_articles=10
+    )
+
+    assert len(articles) == 1  # same url from both feeds counted once
+
+
+def test_fetch_articles_skips_a_failing_feed_and_keeps_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+
+    class FakeResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_get(url: str, *args, **kwargs):
+        if "broken" in url:
+            raise ConnectionError("feed host unreachable")
+        return FakeResponse()
+
+    monkeypatch.setattr(rss_news.requests, "get", fake_get)
+
+    articles = rss_news.fetch_articles(
+        ["https://broken.example/rss", "https://feed.example/rss"], lookback_hours=24, max_articles=10
+    )
+
+    assert [a["headline"] for a in articles] == ["Widget Co beats earnings"]
+
+
+def test_fetch_articles_caps_total_and_sorts_newest_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(hours=1)
+    xml = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<item><title>Older</title><description>d</description><link>https://x/1</link><pubDate>{older}</pubDate></item>
+<item><title>Newer</title><description>d</description><link>https://x/2</link><pubDate>{now}</pubDate></item>
+</channel></rss>""".format(older=_rss_datetime(older), now=_rss_datetime(now))
+
+    class FakeResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    articles = rss_news.fetch_articles(["https://feed.example/rss"], lookback_hours=24, max_articles=1)
+
+    assert len(articles) == 1
+    assert articles[0]["headline"] == "Newer"
+
+
+def test_world_event_analyzer_merges_rss_articles_after_alpaca(monkeypatch: pytest.MonkeyPatch) -> None:
+    """analyze() should merge RSS in only when the Alpaca fetch itself
+    succeeded -- a real Alpaca outage must still surface as unavailable
+    rather than being silently masked as 'normal, nothing to report'."""
+    import news_context as news_context_module
+
+    class FakeDataFrame:
+        empty = True
+
+        def iterrows(self):
+            return iter([])
+
+    class FakeResponse:
+        df = FakeDataFrame()
+
+    class FakeNewsClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._session = None
+
+        def get_news(self, request) -> "FakeResponse":
+            return FakeResponse()
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "alpaca.data.historical.news",
+        SimpleNamespace(NewsClient=FakeNewsClient),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "alpaca.data.requests",
+        SimpleNamespace(NewsRequest=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+
+    now = datetime.now(timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+
+    class FakeRssResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        news_context_module.rss_news.requests, "get", lambda *args, **kwargs: FakeRssResponse()
+    )
+
+    analyzer = WorldEventAnalyzer(
+        lookback_hours=24,
+        max_articles=10,
+        block_score=-6,
+        rss_enabled=True,
+        rss_feed_urls=["https://feed.example/rss"],
+    )
+
+    context = analyzer.analyze()
+
+    assert context.available is True
+    assert context.article_count == 1
+    assert context.per_article[0]["headline"] == "Widget Co beats earnings"

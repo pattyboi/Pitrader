@@ -1,10 +1,15 @@
 """Lightweight headline analysis for daily market context."""
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import rss_news
+
+logger = logging.getLogger(__name__)
 
 NEWS_REQUEST_TIMEOUT_SECONDS = 15
 
@@ -105,6 +110,8 @@ class WorldEventAnalyzer:
         max_articles: int,
         block_score: int,
         refine_scoring: bool = False,
+        rss_enabled: bool = False,
+        rss_feed_urls: list[str] | None = None,
     ):
         self.lookback_hours = lookback_hours
         self.max_articles = max_articles
@@ -114,6 +121,11 @@ class WorldEventAnalyzer:
         # target, so it is an explicit opt-in rather than a silent change to
         # an existing trade-blocking guard's behavior.
         self.refine_scoring = refine_scoring
+        # Free, no-API-key supplementary headlines (rss_news.py) merged in
+        # alongside Alpaca's own feed -- see analyze() below. Off by default,
+        # same posture as every other optional source in this pipeline.
+        self.rss_enabled = rss_enabled
+        self.rss_feed_urls = list(rss_feed_urls or [])
 
     @staticmethod
     def _contains(text: str, phrase: str) -> bool:
@@ -267,30 +279,59 @@ class WorldEventAnalyzer:
             session.request = request_with_timeout
         response = client.get_news(request)
         dataframe = getattr(response, "df", None)
-        if dataframe is None or dataframe.empty:
+
+        fetched_articles: list[dict[str, Any]] = []
+        if dataframe is not None and not dataframe.empty:
+            for _, row in dataframe.iterrows():
+                headline = str(self._row_value(row, "headline") or "").strip()
+                summary = str(self._row_value(row, "summary") or "").strip()
+                if not headline:
+                    continue
+                symbols_value = self._row_value(row, "symbols")
+                created_at = self._row_value(row, "created_at")
+                url = self._row_value(row, "url")
+                fetched_articles.append(
+                    {
+                        "headline": headline,
+                        "summary": summary,
+                        "symbols": list(symbols_value) if isinstance(symbols_value, (list, tuple)) else [],
+                        "created_at": created_at if isinstance(created_at, datetime) else None,
+                        "url": str(url).strip() if url else "",
+                    }
+                )
+
+        if self.rss_enabled and self.rss_feed_urls:
+            try:
+                rss_articles = rss_news.fetch_articles(
+                    self.rss_feed_urls, self.lookback_hours, self.max_articles
+                )
+            except Exception as exc:
+                # Belt-and-suspenders: fetch_articles already fails open
+                # per-feed and never raises, but a bad RSS day must never
+                # cost the Alpaca-sourced articles gathered above either.
+                logger.warning("RSS ingestion failed safely: %s: %s", type(exc).__name__, exc)
+                rss_articles = []
+            if rss_articles:
+                seen_urls = {
+                    str(article.get("url") or "") for article in fetched_articles if article.get("url")
+                }
+                fetched_articles.extend(
+                    article
+                    for article in rss_articles
+                    if not article["url"] or article["url"] not in seen_urls
+                )
+                fetched_articles.sort(
+                    key=lambda article: article.get("created_at")
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True,
+                )
+                fetched_articles = fetched_articles[: self.max_articles]
+
+        if not fetched_articles:
             return NewsContext(
                 available=True,
                 risk_level="normal",
-                explanation="Alpaca returned no recent news articles.",
-            )
-
-        fetched_articles: list[dict[str, Any]] = []
-        for _, row in dataframe.iterrows():
-            headline = str(self._row_value(row, "headline") or "").strip()
-            summary = str(self._row_value(row, "summary") or "").strip()
-            if not headline:
-                continue
-            symbols_value = self._row_value(row, "symbols")
-            created_at = self._row_value(row, "created_at")
-            url = self._row_value(row, "url")
-            fetched_articles.append(
-                {
-                    "headline": headline,
-                    "summary": summary,
-                    "symbols": list(symbols_value) if isinstance(symbols_value, (list, tuple)) else [],
-                    "created_at": created_at if isinstance(created_at, datetime) else None,
-                    "url": str(url).strip() if url else "",
-                }
+                explanation="No recent news articles were available from any configured source.",
             )
 
         scoring = self.score_articles(

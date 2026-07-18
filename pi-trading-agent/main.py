@@ -488,6 +488,31 @@ def load_config(path: Path) -> dict[str, Any]:
     _require_range("SYMBOL_REFERENCE_REFRESH_DAYS", symbol_reference_refresh_days, 1, 30)
     config["SYMBOL_REFERENCE_REFRESH_DAYS"] = symbol_reference_refresh_days
 
+    # Free, no-API-key supplementary headlines (rss_news.py), merged into the
+    # same article set news_context.py already builds from Alpaca. Off by
+    # default, same posture as every other optional source in this pipeline.
+    rss_defaults = {
+        "NEWS_RSS_ENABLED": False,
+        "NEWS_RSS_FEED_URLS": [
+            "https://finance.yahoo.com/news/rssindex",
+            "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        ],
+    }
+    for key, default in rss_defaults.items():
+        config.setdefault(key, default)
+    _require_booleans(config, "NEWS_RSS_ENABLED")
+    raw_feed_urls = config["NEWS_RSS_FEED_URLS"]
+    if not isinstance(raw_feed_urls, list):
+        raise TypeError("NEWS_RSS_FEED_URLS must be a JSON array of feed URLs")
+    feed_urls = list(dict.fromkeys(str(url).strip() for url in raw_feed_urls if str(url).strip()))
+    invalid_feed_urls = [url for url in feed_urls if not url.startswith(("http://", "https://"))]
+    if invalid_feed_urls:
+        raise ValueError(f"NEWS_RSS_FEED_URLS entries must be http(s) URLs: {', '.join(invalid_feed_urls)}")
+    if len(feed_urls) > 10:
+        raise ValueError("NEWS_RSS_FEED_URLS may contain at most 10 feeds")
+    config["NEWS_RSS_FEED_URLS"] = feed_urls
+
     return config
 
 
@@ -625,6 +650,8 @@ def build_strategy(
             "news_learning_state_file": str(base_dir / ".news_learning_state.json"),
             "news_learning_llm_state_file": str(base_dir / ".news_learning_state_llm.json"),
             "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
+            "news_rss_enabled": config["NEWS_RSS_ENABLED"],
+            "news_rss_feed_urls": config["NEWS_RSS_FEED_URLS"],
             "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
             "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],
             "symbol_reference_database_file": str(base_dir / ".symbol_reference.duckdb"),

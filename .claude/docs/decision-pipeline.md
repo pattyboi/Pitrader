@@ -17,7 +17,7 @@ flowchart TD
         HeldFail{"positions unavailable?"}
         Universe["_portfolio_symbols()<br/>managed ∪ held ∪ one discovery batch<br/>(mutates AutonomousUniverse's batch cursor)"]
         SymRef["_refresh_symbol_reference()<br/>(background thread)"]
-        News["_get_news_context()<br/>Alpaca headlines + keyword score"]
+        News["_get_news_context()<br/>Alpaca headlines (+ free RSS if enabled)<br/>+ keyword score"]
         SymScores["_symbol_news_scores()<br/>per-symbol cross-checked coverage"]
         LLM["_get_llm_news_assessment()<br/>Ollama market-wide risk read"]
         Nightly["_load_nightly_preeval_learnings()<br/>today's overnight verdict-cache summary, if any<br/>(surfaced in the report only, never gates anything)"]
