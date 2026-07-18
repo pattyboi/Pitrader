@@ -671,8 +671,10 @@ article is treated identically to an Alpaca one everywhere downstream.
 Merging only ever adds coverage: if Alpaca's own fetch fails (missing
 credentials, an outage), the whole news layer still reports unavailable
 exactly as before — RSS never substitutes for a broken primary source, it
-only supplements a working one. A feed that's down or slow is skipped
-individually and logged; the rest still merge in normally. Free RSS
+only supplements a working one. Configured feeds are fetched concurrently
+through a small bounded worker pool, so their 15-second timeouts do not add
+together. A feed that's down or slow is skipped individually and logged;
+the rest still merge in normally. Free RSS
 endpoints can change or disappear over time, so if `NEWS_RSS_FEED_URLS`
 stops returning anything, verify the URLs still resolve (`curl -I <url>`)
 and swap in replacements — this is not a paid, contractually-stable API.
@@ -916,25 +918,26 @@ case, advisory by default — none can create a trade, and none run unless
   portfolio actions log and email (`"Exit note: SYMBOL - ..."`). The sale
   itself already happened on price alone before this runs; it cannot delay
   or change the exit.
-- **Discovery red-flag screening.** Before a symbol autonomous discovery
-  just surfaced (never a held or statically-configured symbol) enters
-  today's evaluation, if it has negative dedicated news coverage, the model
-  is asked whether that coverage describes a severe, company-specific risk
-  (fraud, delisting, imminent bankruptcy, major legal action) that the
-  price/volume liquidity floor can't see. By default this is advisory only
-  — a flag is logged and shown in the email (`Discovery red flags: ...`)
-  but the symbol stays eligible. Set `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED`
-  to `true` to actually exclude a flagged symbol from that day's evaluation
-  (it's simply reconsidered again on a later discovery cycle, never
-  permanently blacklisted). Symbols with no negative coverage aren't
-  checked at all, so most days this makes zero extra calls.
+- **Discovery red-flag screening.** For a symbol autonomous discovery just
+  surfaced (never a held or statically-configured symbol), negative dedicated
+  coverage can be checked for a severe, company-specific risk (fraud,
+  delisting, imminent bankruptcy, major legal action) that the price/volume
+  liquidity floor cannot see. By default this is advisory only and starts in
+  a daemon worker after orders, persistence, narrative generation, and email
+  have completed; it can log a warning and warm the article cache, but cannot
+  delay or change that iteration. Set
+  `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` to `true` to check at most the first
+  discovery symbol synchronously and exclude it if flagged. The one-symbol
+  cap bounds worst-case local-model latency; remaining symbols are left
+  eligible for a later discovery cycle. Symbols with no negative coverage
+  make no model call.
 - **Nightly pre-evaluation.** `trading-agent-nightly-preeval.timer` (see
   above) runs the same per-symbol article-verdict check the discovery
   red-flag screening above uses, but at 03:00 ET over *every* managed or
   held symbol, not just discovery's negative-news ones, and regardless of
   sentiment. Each verdict lands in the same same-day cache
-  (`.article_verdicts.duckdb`) that screening reads from, so the live
-  iterations that morning mostly find a cache hit instead of paying an
+  (`.article_verdicts.duckdb`) that the advisory article-context analysis
+  reads from, so later checks mostly find a cache hit instead of paying an
   Ollama round-trip live. Purely a cache warm-up — it cannot itself flag,
   block, or otherwise change a trade; it only changes whether a later,
   identical check is fast. Set `PORTFOLIO_NIGHTLY_PREEVAL_ENABLED` to

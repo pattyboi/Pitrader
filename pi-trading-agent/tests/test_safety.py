@@ -80,6 +80,40 @@ def test_cpu_watchdog_skips_a_negative_percentage_after_a_service_restart(tmp_pa
     assert not log_lines[0].split(",")[1].startswith("-")
 
 
+def test_cpu_watchdog_treats_system_logger_failure_as_best_effort(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    script_source = Path(__file__).resolve().parent.parent / "scripts" / "cpu_watchdog.sh"
+    script_path = scripts_dir / "cpu_watchdog.sh"
+    script_path.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_dir = cgroup_root / "system.slice" / "trading-agent.service"
+    cgroup_dir.mkdir(parents=True)
+    cpu_stat_file = cgroup_dir / "cpu.stat"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in {
+        "systemctl": "echo '/system.slice/trading-agent.service'",
+        "logger": "exit 1",
+    }.items():
+        executable = fake_bin / name
+        executable.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
+        executable.chmod(executable.stat().st_mode | stat.S_IEXEC)
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CGROUP_ROOT"] = str(cgroup_root)
+
+    cpu_stat_file.write_text("usage_usec 1000000\n", encoding="utf-8")
+    subprocess.run([str(script_path)], check=True, env=env, cwd=str(project_dir))
+    cpu_stat_file.write_text("usage_usec 2000000\n", encoding="utf-8")
+    subprocess.run([str(script_path)], check=True, env=env, cwd=str(project_dir))
+
+    assert (project_dir / ".cpu_watchdog.log").exists()
+
+
 def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) -> None:
     memory = TradeMemory(tmp_path / "memory.duckdb", 1, 10)
     memory.backfill_history(
@@ -1397,6 +1431,112 @@ def test_discovery_article_context_checks_every_symbol_when_negative_score_not_r
     assert report["discovery_article_context"] == "AAAA: neutral (other): no specific risks cited"
 
 
+def test_advisory_discovery_analysis_is_queued_without_blocking() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "llm_news_enabled": True,
+        "portfolio_discovery_llm_block_enabled": False,
+    }
+    strategy._check_discovery_red_flags = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("advisory analysis must not run in the trading path")
+    )
+    strategy._check_discovery_article_context = strategy._check_discovery_red_flags
+    report: dict = {}
+
+    excluded = strategy._defer_or_run_discovery_analysis(
+        ["AAAA", "BBBB"], NewsContext(available=True), {"AAAA": -2}, report
+    )
+
+    assert excluded == set()
+    assert strategy._pending_discovery_analysis[0] == ["AAAA", "BBBB"]
+    assert report["discovery_analysis_status"].startswith("Deferred advisory")
+
+
+def test_blocking_discovery_analysis_is_capped_to_one_symbol() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "llm_news_enabled": True,
+        "portfolio_discovery_llm_block_enabled": True,
+    }
+    checked: list[list[str]] = []
+    strategy._check_discovery_red_flags = (
+        lambda symbols, *args, **kwargs: checked.append(symbols) or {symbols[0]}
+    )
+    strategy._check_discovery_article_context = (
+        lambda symbols, *args, **kwargs: checked.append(symbols)
+    )
+    report: dict = {}
+
+    excluded = strategy._defer_or_run_discovery_analysis(
+        ["AAAA", "BBBB", "CCCC"], NewsContext(available=True), {"AAAA": -2}, report
+    )
+
+    assert checked == [["AAAA"], ["AAAA"]]
+    assert excluded == {"AAAA"}
+    assert "2 left eligible" in report["discovery_analysis_status"]
+
+
+def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"dip_threshold_percent": 5.0}
+    events: list[str] = []
+    strategy._due_iteration_window_now = lambda: "open"
+    strategy._run_portfolio_iteration = lambda report: events.append("trade")
+    strategy._record_memory_decision = lambda report: events.append("memory")
+    strategy._generate_daily_narrative = lambda report: events.append("narrative") or "done"
+    strategy._send_daily_email = lambda report: events.append("email")
+    strategy._start_deferred_discovery_analysis = lambda: events.append("deferred")
+
+    strategy.on_trading_iteration()
+
+    assert events == ["trade", "memory", "narrative", "email", "deferred"]
+
+
+def test_pending_rotation_reconciliation_retries_replacement_purchase() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.vars = SimpleNamespace(
+        portfolio_pending_rotation={
+            "SPY": {"to": "QQQ", "budget": 50.0, "kind": "replacement"}
+        }
+    )
+    strategy.get_last_price = lambda symbol: 25.0
+    strategy._buy_portfolio_symbol = lambda symbol, price, budget: "submitted"
+    strategy._has_active_order = lambda symbol, side: False
+    strategy._remove_portfolio_rotation = lambda source: strategy.vars.portfolio_pending_rotation.pop(source)
+
+    actions, claimed = strategy._reconcile_pending_portfolio_rotations({})
+
+    assert actions == ["Portfolio QQQ purchase submitted after SPY sale"]
+    assert claimed == {"SPY", "QQQ"}
+
+
+def test_filled_replacement_buy_clears_restart_state(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"decision_memory_database_file": str(tmp_path / "memory.duckdb")}
+    strategy.vars = SimpleNamespace(
+        portfolio_pending_rotation={
+            "SPY": {"to": "QQQ", "budget": 50.0, "kind": "replacement"}
+        }
+    )
+    strategy.get_datetime = lambda: datetime(2026, 7, 18, tzinfo=timezone.utc)
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy._record_portfolio_entry = lambda symbol: None
+    strategy._remember_confirmed_portfolio_symbol = lambda symbol: None
+    strategy._remove_portfolio_entry = lambda symbol: None
+    strategy._forget_confirmed_portfolio_symbol = lambda symbol: None
+    strategy._remove_portfolio_rotation = lambda source: strategy.vars.portfolio_pending_rotation.pop(source)
+    order = SimpleNamespace(
+        asset=SimpleNamespace(symbol="QQQ"),
+        side="buy",
+        quantity=Decimal("2"),
+        get_fill_price=lambda: 25.0,
+    )
+
+    strategy.on_filled_order(None, order, 25.0, 2.0, 1.0)
+
+    assert strategy.vars.portfolio_pending_rotation == {}
+
+
 def test_nightly_preevaluation_never_consumes_a_discovery_batch() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {"llm_news_enabled": True, "portfolio_nightly_preeval_enabled": True}
@@ -1745,6 +1885,34 @@ def test_fetch_articles_caps_total_and_sorts_newest_first(monkeypatch: pytest.Mo
 
     assert len(articles) == 1
     assert articles[0]["headline"] == "Newer"
+
+
+def test_fetch_articles_requests_feeds_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime.now(timezone.utc)
+    xml = _SAMPLE_RSS_FEED.format(
+        recent=_rss_datetime(now), stale=_rss_datetime(now - timedelta(days=10))
+    )
+    barrier = threading.Barrier(2, timeout=2)
+
+    class FakeResponse:
+        text = xml
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_get(*args, **kwargs):
+        barrier.wait()
+        return FakeResponse()
+
+    monkeypatch.setattr(rss_news.requests, "get", fake_get)
+
+    articles = rss_news.fetch_articles(
+        ["https://feed-a.example/rss", "https://feed-b.example/rss"],
+        lookback_hours=24,
+        max_articles=10,
+    )
+
+    assert len(articles) == 1
 
 
 def test_world_event_analyzer_merges_rss_articles_after_alpaca(monkeypatch: pytest.MonkeyPatch) -> None:

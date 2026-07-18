@@ -65,5 +65,7 @@ echo "${now_iso},${cpu_pct}" >> "${LOG_FILE}"
 tail -n "${MAX_LOG_LINES}" "${LOG_FILE}" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "${LOG_FILE}"
 
 if awk -v p="${cpu_pct}" -v t="${WARN_THRESHOLD_PCT}" 'BEGIN { exit !(p >= t) }'; then
-    logger -t trading-agent-cpu-watchdog "trading-agent.service CPU at ${cpu_pct}% over the last sample interval (threshold ${WARN_THRESHOLD_PCT}%)"
+    # The CSV sample is the durable record. Journald/syslog notification is
+    # best-effort so a missing /dev/log socket cannot fail the timer unit.
+    logger -t trading-agent-cpu-watchdog "trading-agent.service CPU at ${cpu_pct}% over the last sample interval (threshold ${WARN_THRESHOLD_PCT}%)" || true
 fi

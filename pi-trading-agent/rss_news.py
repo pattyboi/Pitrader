@@ -15,6 +15,7 @@ attributable to a watched symbol without any change there.
 import html
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -25,6 +26,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 RSS_REQUEST_TIMEOUT_SECONDS = 15
+RSS_FETCH_WORKERS = 4
 # Some publishers reject requests with no User-Agent at all.
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; pi-trading-agent RSS reader)"}
 
@@ -90,16 +92,29 @@ def fetch_articles(
     raises, matching every other news source in this pipeline.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, lookback_hours))
-    seen_urls: set[str] = set()
-    collected: list[dict[str, Any]] = []
-    for feed_url in feed_urls:
+    def fetch_one(feed_url: str) -> list[dict[str, Any]]:
         try:
             response = requests.get(feed_url, timeout=timeout, headers=_REQUEST_HEADERS)
             response.raise_for_status()
         except Exception as exc:
             logger.warning("RSS feed unavailable, skipping: %s (%s: %s)", feed_url, type(exc).__name__, exc)
-            continue
-        for article in _parse_feed(response.text):
+            return []
+        return _parse_feed(response.text)
+
+    if not feed_urls:
+        return []
+    with ThreadPoolExecutor(
+        max_workers=min(RSS_FETCH_WORKERS, len(feed_urls)),
+        thread_name_prefix="rss-feed",
+    ) as executor:
+        feed_articles = executor.map(fetch_one, feed_urls)
+
+    seen_urls: set[str] = set()
+    collected: list[dict[str, Any]] = []
+    # executor.map preserves configured feed order, keeping duplicate handling
+    # deterministic even though the network requests run concurrently.
+    for articles in feed_articles:
+        for article in articles:
             url = article["url"]
             if url and url in seen_urls:
                 continue

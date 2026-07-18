@@ -88,6 +88,10 @@ class AssetRotationStrategy(Strategy):
     }
     _FAILED_ORDER_STATUSES = {"cancel", "canceled", "cancelled", "error", "expired", "rejected"}
     _PORTFOLIO_HISTORY_WORKERS = 4
+    # A blocking discovery veto is allowed to delay the iteration, but its
+    # worst-case local-model timeout must remain bounded. Advisory checks are
+    # deferred until the trading/reporting path has finished instead.
+    _MAX_BLOCKING_DISCOVERY_LLM_SYMBOLS = 1
     # Alpaca's free quote feed is IEX-only, not full NBBO -- a bad or thin
     # print should never make a symbol's live spread reading look enormous
     # and swamp the flat cost estimate it is only meant to floor.
@@ -102,6 +106,11 @@ class AssetRotationStrategy(Strategy):
         self._symbol_reference_refresh_lock = threading.Lock()
         self._symbol_reference_pending_symbols: set[str] = set()
         self._symbol_reference_refresh_running = False
+        self._discovery_analysis_lock = threading.Lock()
+        self._pending_discovery_analysis: tuple[
+            list[str], NewsContext, dict[str, int]
+        ] | None = None
+        self._discovery_analysis_running = False
         self._unpriceable_symbols_lock = threading.Lock()
         self._unpriceable_symbols_this_iteration: set[str] = set()
         # Historical bars are fetched during the first evaluation, after the
@@ -2003,6 +2012,101 @@ This automated message is not financial advice.
                 f"{symbol}: {verdict}" for symbol, verdict in verdicts.items()
             )
 
+    def _defer_or_run_discovery_analysis(
+        self,
+        discovered_only: list[str],
+        news_context: NewsContext,
+        symbol_news_scores: dict[str, int],
+        report: dict[str, Any],
+    ) -> set[str]:
+        """Run decision-changing checks synchronously; defer advisory work.
+
+        Blocking mode is explicitly bounded because every local-model call
+        may take minutes on a Raspberry Pi. In the default advisory mode the
+        latest batch is queued and started by ``on_trading_iteration`` only
+        after orders, persistence, narrative generation, and email complete.
+        """
+        if (
+            not discovered_only
+            or not bool(self.parameters.get("llm_news_enabled", False))
+            or not news_context.available
+        ):
+            return set()
+        if bool(self.parameters.get("portfolio_discovery_llm_block_enabled", False)):
+            checked = discovered_only[: self._MAX_BLOCKING_DISCOVERY_LLM_SYMBOLS]
+            deferred_count = len(discovered_only) - len(checked)
+            if deferred_count:
+                report["discovery_analysis_status"] = (
+                    f"Blocking analysis capped at {len(checked)} symbol; "
+                    f"{deferred_count} left eligible for later evaluation"
+                )
+            excluded = self._check_discovery_red_flags(
+                checked, news_context, symbol_news_scores, report
+            )
+            self._check_discovery_article_context(
+                checked, news_context, symbol_news_scores, report
+            )
+            return excluded
+
+        lock = getattr(self, "_discovery_analysis_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._discovery_analysis_lock = lock
+        with lock:
+            # Keep only the latest batch if two trading windows overlap a very
+            # slow local model. Stale advisory work must never form a backlog.
+            self._pending_discovery_analysis = (
+                list(discovered_only),
+                news_context,
+                dict(symbol_news_scores),
+            )
+        report["discovery_analysis_status"] = (
+            f"Deferred advisory analysis for {len(discovered_only)} symbol(s)"
+        )
+        return set()
+
+    def _start_deferred_discovery_analysis(self) -> None:
+        """Start one daemon worker for the latest queued advisory batch."""
+        lock = getattr(self, "_discovery_analysis_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if getattr(self, "_discovery_analysis_running", False):
+                return
+            if getattr(self, "_pending_discovery_analysis", None) is None:
+                return
+            self._discovery_analysis_running = True
+
+        def analyze_in_background() -> None:
+            while True:
+                with lock:
+                    payload = self._pending_discovery_analysis
+                    self._pending_discovery_analysis = None
+                    if payload is None:
+                        self._discovery_analysis_running = False
+                        return
+                symbols, context, scores = payload
+                background_report: dict[str, Any] = {}
+                try:
+                    self._check_discovery_red_flags(
+                        symbols, context, scores, background_report
+                    )
+                    self._check_discovery_article_context(
+                        symbols, context, scores, background_report
+                    )
+                except Exception as exc:
+                    self.log_message(
+                        "Deferred discovery analysis failed safely: "
+                        f"{type(exc).__name__}: {exc}",
+                        color="yellow",
+                    )
+
+        threading.Thread(
+            target=analyze_in_background,
+            name="discovery-news-analysis",
+            daemon=True,
+        ).start()
+
     def _run_nightly_preevaluation(self) -> dict[str, Any]:
         """One off-hours pass, meant to run once a night well after midnight:
         every managed/held symbol gets its per-symbol LLM article verdict
@@ -2394,6 +2498,64 @@ This automated message is not financial advice.
             )
             actions.append(f"Portfolio top-up: {symbol} purchase {outcome}")
 
+    def _reconcile_pending_portfolio_rotations(
+        self, held: dict[str, Decimal]
+    ) -> tuple[list[str], set[str]]:
+        """Reconcile restart-safe sale/buy pairs before new decisions.
+
+        This transaction phase is intentionally isolated from the large
+        portfolio orchestrator so restart recovery can be integration-tested
+        with broker-shaped state without running news and signal analysis.
+        """
+        actions: list[str] = []
+        # Iterate a snapshot so removals made mid-loop do not disturb it.
+        for source in sorted(self.vars.portfolio_pending_rotation):
+            entry = self.vars.portfolio_pending_rotation.get(source)
+            if entry is None:
+                continue
+            target = str(entry["to"])
+            budget = float(entry["budget"])
+            kind = str(entry["kind"])
+            if held.get(source, Decimal("0")) > 0:
+                if self._has_active_order(source, "sell"):
+                    actions.append(f"Portfolio pending: waiting for {source} sale")
+                    continue
+                self._remove_portfolio_rotation(source)
+                actions.append(f"Portfolio rotation reset: {source} sale did not fill")
+                continue
+            if held.get(target, Decimal("0")) > 0 and not self._has_active_order(
+                target, "buy"
+            ):
+                self._remove_portfolio_rotation(source)
+                actions.append(
+                    f"Portfolio rotation complete ({kind}): the {target} purchase filled"
+                )
+                continue
+            price = self.get_last_price(target)
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                actions.append(f"Portfolio pending: no valid {target} price")
+                continue
+            outcome = self._buy_portfolio_symbol(target, float(price), budget)
+            if outcome == "insufficient":
+                self._remove_portfolio_rotation(source)
+                actions.append(
+                    f"Portfolio rotation finished: cash is below the minimum {target} order"
+                )
+            elif outcome == "working":
+                actions.append(f"Portfolio pending: waiting for the {target} purchase to fill")
+            elif outcome == "rejected":
+                actions.append(
+                    f"Portfolio pending: broker rejected the {target} purchase; retrying next cycle"
+                )
+            else:
+                # Clear only after the replacement fill is confirmed.
+                actions.append(f"Portfolio {target} purchase submitted after {source} sale")
+        claimed_symbols = set(self.vars.portfolio_pending_rotation) | {
+            str(entry["to"])
+            for entry in self.vars.portfolio_pending_rotation.values()
+        }
+        return actions, claimed_symbols
+
     def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
         """Build or rotate a bounded portfolio from the explicit symbol list."""
         minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
@@ -2458,14 +2620,11 @@ This automated message is not financial advice.
         # red flag the liquidity/price floor can't see. Advisory by default;
         # see _check_discovery_red_flags.
         discovered_only = sorted(set(symbols) - managed_symbols - set(held))
-        excluded_symbols = self._check_discovery_red_flags(
+        excluded_symbols = self._defer_or_run_discovery_analysis(
             discovered_only, news_context, symbol_news_scores, report
         )
         if excluded_symbols:
             symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
-        self._check_discovery_article_context(
-            discovered_only, news_context, symbol_news_scores, report
-        )
 
         # The adaptive model keeps learning from the configured market proxy
         # (Asset B) so its forecast can veto portfolio trades exactly as it
@@ -2531,52 +2690,8 @@ This automated message is not financial advice.
         # `claimed_symbols` is the single source of truth preventing any symbol
         # from being touched twice in one pass; it starts from every symbol
         # already referenced by a surviving pending rotation.
-        actions: list[str] = []
+        actions, claimed_symbols = self._reconcile_pending_portfolio_rotations(held)
         held_working = dict(held)
-
-        # Phase 0: reconcile every existing pending rotation first. Completing
-        # an in-flight rotation is never vetoed: the sale already happened and
-        # leaving the proceeds in cash is its own risk. Iterate a snapshot so
-        # removals made mid-loop don't disturb iteration.
-        for source in sorted(self.vars.portfolio_pending_rotation):
-            entry = self.vars.portfolio_pending_rotation.get(source)
-            if entry is None:
-                continue
-            target, budget, kind = str(entry["to"]), float(entry["budget"]), str(entry["kind"])
-            if held.get(source, Decimal("0")) > 0:
-                if self._has_active_order(source, "sell"):
-                    actions.append(f"Portfolio pending: waiting for {source} sale")
-                    continue
-                self._remove_portfolio_rotation(source)
-                actions.append(f"Portfolio rotation reset: {source} sale did not fill")
-                continue
-            if held.get(target, Decimal("0")) > 0 and not self._has_active_order(target, "buy"):
-                # The buy filled but the fill callback was lost (restart).
-                self._remove_portfolio_rotation(source)
-                actions.append(f"Portfolio rotation complete ({kind}): the {target} purchase filled")
-                continue
-            price = self.get_last_price(target)
-            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
-                actions.append(f"Portfolio pending: no valid {target} price")
-                continue
-            outcome = self._buy_portfolio_symbol(target, float(price), budget)
-            if outcome == "insufficient":
-                # Balances are confirmed by now; the rotation ends here.
-                self._remove_portfolio_rotation(source)
-                actions.append(f"Portfolio rotation finished: cash is below the minimum {target} order")
-            elif outcome == "working":
-                actions.append(f"Portfolio pending: waiting for the {target} purchase to fill")
-            elif outcome == "rejected":
-                actions.append(
-                    f"Portfolio pending: broker rejected the {target} purchase; retrying next cycle"
-                )
-            else:
-                # The entry clears when the buy fills (on_filled_order), never
-                # on submission, so a rejected order is retried next cycle.
-                actions.append(f"Portfolio {target} purchase submitted after {source} sale")
-        claimed_symbols: set[str] = set(self.vars.portfolio_pending_rotation.keys()) | {
-            str(entry["to"]) for entry in self.vars.portfolio_pending_rotation.values()
-        }
 
         # Phase 1: manage every current holding for profit-taking and loss
         # containment, not just the first one. This is a plain single-leg
@@ -2921,9 +3036,14 @@ This automated message is not financial advice.
                 color="red",
             )
         finally:
-            self._record_memory_decision(report)
-            report["daily_narrative"] = self._generate_daily_narrative(report)
-            self._send_daily_email(report)
+            try:
+                self._record_memory_decision(report)
+                report["daily_narrative"] = self._generate_daily_narrative(report)
+                self._send_daily_email(report)
+            finally:
+                # Advisory local-model work is deliberately last: it cannot
+                # delay orders, state persistence, or the daily report.
+                self._start_deferred_discovery_analysis()
 
     def on_filled_order(
         self,
