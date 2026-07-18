@@ -107,9 +107,13 @@ class AssetRotationStrategy(Strategy):
         self._symbol_reference_pending_symbols: set[str] = set()
         self._symbol_reference_refresh_running = False
         self._discovery_analysis_lock = threading.Lock()
+        self._pending_market_llm_analysis: tuple[
+            NewsContext, list[str], set[str], dict[str, int]
+        ] | None = None
         self._pending_discovery_analysis: tuple[
             list[str], NewsContext, dict[str, int]
         ] | None = None
+        self._pending_exit_narratives: list[tuple[str, str, NewsContext]] = []
         self._discovery_analysis_running = False
         self._unpriceable_symbols_lock = threading.Lock()
         self._unpriceable_symbols_this_iteration: set[str] = set()
@@ -954,6 +958,43 @@ This automated message is not financial advice.
                     f"LLM assessment failed: {type(exc).__name__}: {exc}"
                 ),
             )
+
+    def _llm_assessment_for_iteration(
+        self,
+        news_context: NewsContext,
+        symbols: list[str],
+        held_symbols: set[str],
+        symbol_news_scores: dict[str, int],
+    ) -> LLMNewsAssessment:
+        """Return a synchronous veto assessment or queue advisory analysis."""
+        should_defer = (
+            bool(self.parameters.get("llm_news_enabled", False))
+            and not bool(self.parameters.get("llm_news_block_on_high_risk", False))
+            and news_context.available
+            and bool(news_context.articles)
+        )
+        if not should_defer:
+            return self._get_llm_news_assessment(
+                news_context, symbols, held_symbols, symbol_news_scores
+            )
+        lock = getattr(self, "_discovery_analysis_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._discovery_analysis_lock = lock
+        with lock:
+            self._pending_market_llm_analysis = (
+                news_context,
+                list(symbols),
+                set(held_symbols),
+                dict(symbol_news_scores),
+            )
+        return LLMNewsAssessment(
+            available=False,
+            risk_level="deferred",
+            explanation=(
+                "Advisory LLM assessment was deferred until after trading and reporting."
+            ),
+        )
 
     def _update_adaptive_learning(
         self,
@@ -2033,12 +2074,21 @@ This automated message is not financial advice.
         ):
             return set()
         if bool(self.parameters.get("portfolio_discovery_llm_block_enabled", False)):
-            checked = discovered_only[: self._MAX_BLOCKING_DISCOVERY_LLM_SYMBOLS]
-            deferred_count = len(discovered_only) - len(checked)
+            negative_candidates = sorted(
+                (
+                    symbol
+                    for symbol in discovered_only
+                    if symbol_news_scores.get(symbol) is not None
+                    and int(symbol_news_scores[symbol]) < 0
+                ),
+                key=lambda symbol: (int(symbol_news_scores[symbol]), symbol),
+            )
+            checked = negative_candidates[: self._MAX_BLOCKING_DISCOVERY_LLM_SYMBOLS]
+            deferred_count = len(negative_candidates) - len(checked)
             if deferred_count:
                 report["discovery_analysis_status"] = (
-                    f"Blocking analysis capped at {len(checked)} symbol; "
-                    f"{deferred_count} left eligible for later evaluation"
+                    f"Blocking analysis checked the {len(checked)} highest-risk symbol; "
+                    f"{deferred_count} lower-priority negative symbol(s) left eligible"
                 )
             excluded = self._check_discovery_red_flags(
                 checked, news_context, symbol_news_scores, report
@@ -2065,45 +2115,105 @@ This automated message is not financial advice.
         )
         return set()
 
-    def _start_deferred_discovery_analysis(self) -> None:
-        """Start one daemon worker for the latest queued advisory batch."""
+    def _queue_exit_narratives(
+        self, requests: list[tuple[str, str, NewsContext]]
+    ) -> None:
+        """Queue descriptive exit notes without delaying any order phase."""
+        if not requests:
+            return
+        lock = getattr(self, "_discovery_analysis_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._discovery_analysis_lock = lock
+        with lock:
+            pending = getattr(self, "_pending_exit_narratives", None)
+            if pending is None:
+                pending = []
+                self._pending_exit_narratives = pending
+            pending.extend(requests)
+
+    def _start_deferred_llm_analysis(self) -> None:
+        """Start one daemon worker for all queued descriptive LLM work."""
         lock = getattr(self, "_discovery_analysis_lock", None)
         if lock is None:
             return
         with lock:
             if getattr(self, "_discovery_analysis_running", False):
                 return
-            if getattr(self, "_pending_discovery_analysis", None) is None:
+            if (
+                getattr(self, "_pending_market_llm_analysis", None) is None
+                and getattr(self, "_pending_discovery_analysis", None) is None
+                and not getattr(self, "_pending_exit_narratives", [])
+            ):
                 return
             self._discovery_analysis_running = True
 
         def analyze_in_background() -> None:
             while True:
                 with lock:
-                    payload = self._pending_discovery_analysis
+                    market_payload = getattr(
+                        self, "_pending_market_llm_analysis", None
+                    )
+                    discovery_payload = getattr(
+                        self, "_pending_discovery_analysis", None
+                    )
+                    exit_payloads = list(
+                        getattr(self, "_pending_exit_narratives", [])
+                    )
+                    self._pending_market_llm_analysis = None
                     self._pending_discovery_analysis = None
-                    if payload is None:
+                    self._pending_exit_narratives = []
+                    if (
+                        market_payload is None
+                        and discovery_payload is None
+                        and not exit_payloads
+                    ):
                         self._discovery_analysis_running = False
                         return
-                symbols, context, scores = payload
-                background_report: dict[str, Any] = {}
                 try:
-                    self._check_discovery_red_flags(
-                        symbols, context, scores, background_report
-                    )
-                    self._check_discovery_article_context(
-                        symbols, context, scores, background_report
-                    )
+                    if market_payload is not None:
+                        context, symbols, held_symbols, scores = market_payload
+                        assessment = self._get_llm_news_assessment(
+                            context, symbols, held_symbols, scores
+                        )
+                        proxy_price = self.get_last_price(
+                            str(self.parameters["asset_b"]).upper()
+                        )
+                        if (
+                            proxy_price is not None
+                            and math.isfinite(float(proxy_price))
+                            and float(proxy_price) > 0
+                        ):
+                            self._update_llm_adaptive_learning(
+                                float(proxy_price), assessment
+                            )
+                    for symbol, price_reason, context in exit_payloads:
+                        narrative = self._generate_exit_narrative(
+                            symbol, price_reason, context
+                        )
+                        if narrative:
+                            self.log_message(
+                                f"Exit note: {symbol} - {narrative}", color="blue"
+                            )
+                    if discovery_payload is not None:
+                        symbols, context, scores = discovery_payload
+                        background_report: dict[str, Any] = {}
+                        self._check_discovery_red_flags(
+                            symbols, context, scores, background_report
+                        )
+                        self._check_discovery_article_context(
+                            symbols, context, scores, background_report
+                        )
                 except Exception as exc:
                     self.log_message(
-                        "Deferred discovery analysis failed safely: "
+                        "Deferred LLM analysis failed safely: "
                         f"{type(exc).__name__}: {exc}",
                         color="yellow",
                     )
 
         threading.Thread(
             target=analyze_in_background,
-            name="discovery-news-analysis",
+            name="deferred-llm-analysis",
             daemon=True,
         ).start()
 
@@ -2498,6 +2608,59 @@ This automated message is not financial advice.
             )
             actions.append(f"Portfolio top-up: {symbol} purchase {outcome}")
 
+    def _submit_due_portfolio_exits(
+        self,
+        held: dict[str, Decimal],
+        entry_prices: dict[str, float],
+        news_context: NewsContext,
+        actions: list[str],
+        claimed_symbols: set[str],
+        held_working: dict[str, Decimal],
+    ) -> list[tuple[str, str, NewsContext]]:
+        """Submit every due exit before queuing any descriptive LLM work."""
+        holding_dates = dict(self.vars.portfolio_holding_dates)
+        today = self.get_datetime().date()
+        new_dates = False
+        for symbol in held:
+            if symbol not in holding_dates:
+                holding_dates[symbol] = today.isoformat()
+                new_dates = True
+        for symbol in list(holding_dates):
+            if symbol not in held:
+                holding_dates.pop(symbol)
+                new_dates = True
+        if new_dates:
+            self._set_portfolio_holding_dates(holding_dates)
+
+        narrative_requests: list[tuple[str, str, NewsContext]] = []
+        exit_reasons = self._portfolio_exit_reasons(
+            held, entry_prices, holding_dates, today
+        )
+        for source in sorted(exit_reasons):
+            if source in claimed_symbols:
+                continue
+            if self._has_active_order(source, "sell"):
+                actions.append(f"Portfolio exit pending: waiting for {source} sale")
+                continue
+            reason = exit_reasons[source]
+            exit_order = self.create_order(
+                source,
+                quantity=held[source],
+                side="sell",
+                order_type="market",
+                time_in_force="day",
+            )
+            if not self._submit_order_checked(
+                exit_order, f"{source} exit sell ({reason})"
+            ):
+                actions.append(f"Portfolio exit rejected: {source} sale was not accepted")
+                continue
+            actions.append(f"Portfolio exit submitted: {source} {reason}")
+            narrative_requests.append((source, reason, news_context))
+            held_working.pop(source, None)
+            claimed_symbols.add(source)
+        return narrative_requests
+
     def _reconcile_pending_portfolio_rotations(
         self, held: dict[str, Decimal]
     ) -> tuple[list[str], set[str]]:
@@ -2596,7 +2759,7 @@ This automated message is not financial advice.
         # NewsContext.per_symbol_scores, and so the pipeline doesn't scan for
         # untagged symbol mentions twice in one iteration.
         symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
-        llm_assessment = self._get_llm_news_assessment(
+        llm_assessment = self._llm_assessment_for_iteration(
             news_context, symbols, set(held), symbol_news_scores
         )
         report.update(
@@ -2646,17 +2809,28 @@ This automated message is not financial advice.
             # Same regression, trained on the LLM's score instead, so the two
             # signals' predictive value can be compared once both have
             # enough history -- see _update_llm_adaptive_learning.
-            llm_learning_result = self._update_llm_adaptive_learning(float(proxy_price), llm_assessment)
-            report.update(
-                llm_learning_observations=llm_learning_result.observations,
-                llm_learned_forecast=(
-                    f"{llm_learning_result.predicted_return_percent:+.2f}%"
-                    if llm_learning_result.ready
-                    and llm_learning_result.predicted_return_percent is not None
-                    else "not ready"
-                ),
-                llm_learning_explanation=llm_learning_result.explanation,
-            )
+            if llm_assessment.risk_level == "deferred":
+                report.update(
+                    llm_learning_observations="deferred",
+                    llm_learned_forecast="deferred",
+                    llm_learning_explanation=(
+                        "LLM-score learning will update after trading and reporting."
+                    ),
+                )
+            else:
+                llm_learning_result = self._update_llm_adaptive_learning(
+                    float(proxy_price), llm_assessment
+                )
+                report.update(
+                    llm_learning_observations=llm_learning_result.observations,
+                    llm_learned_forecast=(
+                        f"{llm_learning_result.predicted_return_percent:+.2f}%"
+                        if llm_learning_result.ready
+                        and llm_learning_result.predicted_return_percent is not None
+                        else "not ready"
+                    ),
+                    llm_learning_explanation=llm_learning_result.explanation,
+                )
         veto_reason = self._market_veto_reason(news_context, llm_assessment, learning_result)
 
         # A/B is no longer an alternate strategy mode. It is a separately
@@ -2702,43 +2876,15 @@ This automated message is not financial advice.
         # horizon backstop) lives in _portfolio_exit_reasons. A configured
         # managed holding with no fill record is conservatively dated today
         # on first observation rather than sold immediately.
-        holding_dates = dict(self.vars.portfolio_holding_dates)
-        today = self.get_datetime().date()
-        new_dates = False
-        for symbol in held:
-            if symbol not in holding_dates:
-                holding_dates[symbol] = today.isoformat()
-                new_dates = True
-        for symbol in list(holding_dates):
-            if symbol not in held:
-                holding_dates.pop(symbol)
-                new_dates = True
-        if new_dates:
-            self._set_portfolio_holding_dates(holding_dates)
-        exit_reasons = self._portfolio_exit_reasons(held, entry_prices, holding_dates, today)
-        due_symbols = sorted(exit_reasons)
-        for source in due_symbols:
-            if source in claimed_symbols:
-                continue
-            if self._has_active_order(source, "sell"):
-                actions.append(f"Portfolio exit pending: waiting for {source} sale")
-                continue
-            exit_order = self.create_order(
-                source,
-                quantity=held[source],
-                side="sell",
-                order_type="market",
-                time_in_force="day",
-            )
-            if not self._submit_order_checked(exit_order, f"{source} exit sell ({exit_reasons[source]})"):
-                actions.append(f"Portfolio exit rejected: {source} sale was not accepted")
-                continue
-            actions.append(f"Portfolio exit submitted: {source} {exit_reasons[source]}")
-            exit_narrative = self._generate_exit_narrative(source, exit_reasons[source], news_context)
-            if exit_narrative:
-                actions.append(f"Exit note: {source} - {exit_narrative}")
-            held_working.pop(source, None)
-            claimed_symbols.add(source)
+        narrative_requests = self._submit_due_portfolio_exits(
+            held,
+            entry_prices,
+            news_context,
+            actions,
+            claimed_symbols,
+            held_working,
+        )
+        self._queue_exit_narratives(narrative_requests)
 
         # Alpaca requests for separate symbols are independent. A small fixed
         # pool removes the observed serial latency without creating an
@@ -3043,7 +3189,7 @@ This automated message is not financial advice.
             finally:
                 # Advisory local-model work is deliberately last: it cannot
                 # delay orders, state persistence, or the daily report.
-                self._start_deferred_discovery_analysis()
+                self._start_deferred_llm_analysis()
 
     def on_filled_order(
         self,

@@ -869,11 +869,13 @@ authority.
 ```
 
 With `LLM_NEWS_BLOCK_ON_HIGH_RISK` set to `false` (the default), the
-assessment is **advisory only**: the score, risk level, and reasoning appear
-in the logs and the daily email, but cannot block a trade. This is the
-recommended starting mode. Review several weeks of paper-trading logs and
-compare the model's assessments with what actually happened before setting it
-to `true`.
+assessment is **advisory only** and is queued until after orders, persistence,
+narrative generation, and email have finished. Its score and reasoning appear
+in the logs and still update the observational LLM-score learning model, but
+cannot delay or block a trade. The current email labels it `deferred` because
+the result intentionally does not exist yet. This is the recommended starting
+mode. Review several weeks of paper-trading logs and compare the model's
+assessments with what actually happened before setting it to `true`.
 
 `LLM_NEWS_MODEL` can be swapped for any other Ollama-pulled model tag, and
 `LLM_NEWS_BASE_URL` can point at a different host running Ollama on the local
@@ -890,9 +892,10 @@ removed.
    conservatively and treating duplicate coverage as one event.
 3. The model must reply in a fixed JSON format containing the score, a risk
    level, and two or three sentences of reasoning that cite the headlines.
-4. The score, level, and reasoning are logged and included in the email
-   report. When blocking is enabled and all normal trading conditions pass, a
-   score at or below `LLM_NEWS_BLOCK_SCORE` vetoes that day's rotation.
+4. The score, level, and reasoning are logged. In blocking mode they are also
+   included in that iteration's email, and a score at or below
+   `LLM_NEWS_BLOCK_SCORE` vetoes the trade. Advisory mode runs afterward and
+   therefore labels the current email as deferred.
 
 The log line looks like:
 
@@ -914,10 +917,10 @@ case, advisory by default — none can create a trade, and none run unless
   never feeds back into any decision — it's read-only, for the operator.
 - **Exit notes.** When a take-profit/stop-loss/holding-horizon exit fires
   on a symbol that has its own dedicated news coverage today, one plain
-  sentence connecting the price move to that coverage is added to the
-  portfolio actions log and email (`"Exit note: SYMBOL - ..."`). The sale
-  itself already happened on price alone before this runs; it cannot delay
-  or change the exit.
+  sentence connecting the price move to that coverage is generated in the
+  post-report worker and logged as `"Exit note: SYMBOL - ..."`. Every due
+  exit order is submitted before any such model call begins, so a slow model
+  cannot delay another sale or other portfolio action.
 - **Discovery red-flag screening.** For a symbol autonomous discovery just
   surfaced (never a held or statically-configured symbol), negative dedicated
   coverage can be checked for a severe, company-specific risk (fraud,
@@ -926,11 +929,11 @@ case, advisory by default — none can create a trade, and none run unless
   a daemon worker after orders, persistence, narrative generation, and email
   have completed; it can log a warning and warm the article cache, but cannot
   delay or change that iteration. Set
-  `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` to `true` to check at most the first
-  discovery symbol synchronously and exclude it if flagged. The one-symbol
-  cap bounds worst-case local-model latency; remaining symbols are left
-  eligible for a later discovery cycle. Symbols with no negative coverage
-  make no model call.
+  `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` to `true` to check at most the
+  most-negative covered discovery symbol synchronously and exclude it if
+  flagged. The severity-prioritized one-symbol cap bounds worst-case
+  local-model latency; lower-priority symbols remain eligible for a later
+  discovery cycle. Symbols with no negative coverage make no model call.
 - **Nightly pre-evaluation.** `trading-agent-nightly-preeval.timer` (see
   above) runs the same per-symbol article-verdict check the discovery
   red-flag screening above uses, but at 03:00 ET over *every* managed or

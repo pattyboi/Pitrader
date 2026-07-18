@@ -1468,12 +1468,55 @@ def test_blocking_discovery_analysis_is_capped_to_one_symbol() -> None:
     report: dict = {}
 
     excluded = strategy._defer_or_run_discovery_analysis(
-        ["AAAA", "BBBB", "CCCC"], NewsContext(available=True), {"AAAA": -2}, report
+        ["AAAA", "BBBB", "CCCC"],
+        NewsContext(available=True),
+        {"AAAA": 0, "BBBB": -2, "CCCC": -7},
+        report,
     )
 
-    assert checked == [["AAAA"], ["AAAA"]]
-    assert excluded == {"AAAA"}
-    assert "2 left eligible" in report["discovery_analysis_status"]
+    assert checked == [["CCCC"], ["CCCC"]]
+    assert excluded == {"CCCC"}
+    assert "1 lower-priority" in report["discovery_analysis_status"]
+
+
+def test_nonblocking_market_llm_assessment_is_deferred() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "llm_news_enabled": True,
+        "llm_news_block_on_high_risk": False,
+    }
+    strategy._get_llm_news_assessment = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("advisory assessment must not run in the trading path")
+    )
+    context = NewsContext(
+        available=True,
+        articles=[{"headline": "Market update", "summary": "", "symbols": []}],
+        per_article=[{"headline": "Market update", "summary": "", "symbols": []}],
+    )
+
+    assessment = strategy._llm_assessment_for_iteration(
+        context, ["SPY"], set(), {"SPY": -1}
+    )
+
+    assert not assessment.available
+    assert assessment.risk_level == "deferred"
+    assert strategy._pending_market_llm_analysis[1] == ["SPY"]
+
+
+def test_blocking_market_llm_assessment_stays_synchronous() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "llm_news_enabled": True,
+        "llm_news_block_on_high_risk": True,
+    }
+    expected = llm_news.LLMNewsAssessment(available=True, score=-5, risk_level="high")
+    strategy._get_llm_news_assessment = lambda *args, **kwargs: expected
+
+    assessment = strategy._llm_assessment_for_iteration(
+        NewsContext(available=True), ["SPY"], set(), {}
+    )
+
+    assert assessment is expected
 
 
 def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
@@ -1485,11 +1528,71 @@ def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
     strategy._record_memory_decision = lambda report: events.append("memory")
     strategy._generate_daily_narrative = lambda report: events.append("narrative") or "done"
     strategy._send_daily_email = lambda report: events.append("email")
-    strategy._start_deferred_discovery_analysis = lambda: events.append("deferred")
+    strategy._start_deferred_llm_analysis = lambda: events.append("deferred")
 
     strategy.on_trading_iteration()
 
     assert events == ["trade", "memory", "narrative", "email", "deferred"]
+
+
+def test_exit_phase_submits_every_order_without_generating_narratives() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    today = date(2026, 7, 18)
+    strategy.vars = SimpleNamespace(
+        portfolio_holding_dates={"AAAA": today.isoformat(), "BBBB": today.isoformat()}
+    )
+    strategy.get_datetime = lambda: datetime(2026, 7, 18, tzinfo=timezone.utc)
+    strategy._portfolio_exit_reasons = lambda *args: {
+        "AAAA": "take-profit",
+        "BBBB": "stop-loss",
+    }
+    strategy._has_active_order = lambda *args: False
+    submitted: list[str] = []
+    strategy.create_order = lambda symbol, **kwargs: SimpleNamespace(symbol=symbol)
+    strategy._submit_order_checked = (
+        lambda order, description: submitted.append(order.symbol) or True
+    )
+    strategy._set_portfolio_holding_dates = lambda dates: None
+    strategy._generate_exit_narrative = lambda *args: (_ for _ in ()).throw(
+        AssertionError("narratives must not run while exits are being submitted")
+    )
+    held = {"AAAA": Decimal("1"), "BBBB": Decimal("2")}
+    held_working = dict(held)
+    actions: list[str] = []
+    claimed: set[str] = set()
+    context = NewsContext(available=True)
+
+    queued = strategy._submit_due_portfolio_exits(
+        held, {"AAAA": 10.0, "BBBB": 20.0}, context, actions, claimed, held_working
+    )
+
+    assert submitted == ["AAAA", "BBBB"]
+    assert [item[0] for item in queued] == ["AAAA", "BBBB"]
+    assert claimed == {"AAAA", "BBBB"}
+    assert held_working == {}
+
+
+def test_deferred_worker_generates_exit_note_after_the_iteration() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {}
+    strategy._discovery_analysis_lock = threading.Lock()
+    strategy._discovery_analysis_running = False
+    strategy._pending_market_llm_analysis = None
+    strategy._pending_discovery_analysis = None
+    strategy._pending_exit_narratives = [
+        ("SPY", "take-profit", NewsContext(available=True))
+    ]
+    completed = threading.Event()
+    logged: list[str] = []
+    strategy._generate_exit_narrative = lambda *args: "price strength confirmed"
+    strategy.log_message = (
+        lambda message, **kwargs: logged.append(message) or completed.set()
+    )
+
+    strategy._start_deferred_llm_analysis()
+
+    assert completed.wait(timeout=1)
+    assert logged == ["Exit note: SPY - price strength confirmed"]
 
 
 def test_pending_rotation_reconciliation_retries_replacement_purchase() -> None:
@@ -1508,6 +1611,64 @@ def test_pending_rotation_reconciliation_retries_replacement_purchase() -> None:
 
     assert actions == ["Portfolio QQQ purchase submitted after SPY sale"]
     assert claimed == {"SPY", "QQQ"}
+
+
+def test_portfolio_orchestrator_completes_a_no_signal_broker_cycle() -> None:
+    """Exercise the real orchestration method across its transaction phases."""
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "portfolio_min_signal_observations": 20,
+        "portfolio_min_expected_profit_percent": 1.0,
+        "portfolio_oos_min_observations": 10,
+        "portfolio_oos_min_net_profit_percent": 0.0,
+        "portfolio_max_positions": 1,
+        "portfolio_min_order_dollars": 5.0,
+        "portfolio_cash_reserve_dollars": 0.0,
+        "portfolio_risk_posture": "conservative",
+        "portfolio_opportunistic_min_probability": 0.55,
+        "portfolio_autonomous_discovery": False,
+        "dip_threshold_percent": 5.0,
+        "asset_a": "SPY",
+        "asset_b": "QQQ",
+        "llm_news_enabled": False,
+        "llm_news_block_on_high_risk": False,
+        "news_block_on_high_risk": False,
+        "news_learning_block_enabled": False,
+    }
+    strategy.vars = SimpleNamespace(
+        portfolio_pending_rotation={},
+        portfolio_holding_dates={},
+        portfolio_iteration_state={"opportunistic_swap_done": False},
+    )
+    strategy._managed_portfolio_symbols = lambda: {"SPY"}
+    strategy._portfolio_held_positions = lambda managed: ({}, {})
+    strategy._portfolio_symbols = lambda report, held, managed: ["SPY"]
+    strategy._refresh_symbol_reference = lambda symbols: None
+    strategy._get_news_context = lambda: NewsContext(
+        available=False, explanation="news unavailable"
+    )
+    strategy._load_nightly_preeval_learnings = lambda: {}
+    strategy._defer_or_run_discovery_analysis = lambda *args: set()
+    strategy.get_last_price = lambda symbol: None
+    strategy._opportunistic_opportunity = lambda *args: {
+        "status": "unavailable",
+        "forecast_explanation": "no proxy data",
+    }
+    strategy._portfolio_signals = lambda symbols: []
+    strategy._remember_discovered_symbols = lambda symbols: None
+    strategy.get_portfolio_value = lambda: 100.0
+    strategy.get_cash = lambda: 100.0
+    strategy.get_datetime = lambda: datetime(2026, 7, 18, tzinfo=timezone.utc)
+    report: dict = {}
+
+    strategy._run_portfolio_iteration(report)
+
+    assert report["portfolio_holdings"] == "none"
+    assert report["portfolio_candidates"] == "none"
+    assert report["portfolio_actions"] == []
+    assert report["status"] == (
+        "No portfolio trade: no portfolio signal or Opportunistic Opportunity met its thresholds"
+    )
 
 
 def test_filled_replacement_buy_clears_restart_state(tmp_path: Path) -> None:
