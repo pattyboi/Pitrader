@@ -1145,7 +1145,7 @@ def test_article_filter_estimate_tokens_never_raises_on_special_token_lookalikes
 def test_extract_financial_context_returns_none_for_a_low_density_article(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(article_filter, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(article_filter, "DB_PATH", tmp_path / "verdicts.duckdb")
     monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "<html></html>")
     monkeypatch.setattr(
         article_filter.trafilatura,
@@ -1164,12 +1164,16 @@ def test_extract_financial_context_returns_none_for_a_low_density_article(
 def test_extract_financial_context_returns_cached_value_without_fetching(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
-    cache_key = article_filter._cache_key("https://example.com/a", ["AAPL"])
+    db_path = tmp_path / "verdicts.duckdb"
+    monkeypatch.setattr(article_filter, "DB_PATH", db_path)
     cached = {"sentiment": "bullish", "confidence": 0.9, "affected_tickers": ["AAPL"],
               "key_risks": [], "catalyst_type": "earnings"}
-    cache_path.write_text(json.dumps({cache_key: cached}), encoding="utf-8")
-    monkeypatch.setattr(article_filter, "CACHE_PATH", cache_path)
+    article_filter._save_verdict(
+        date.today().isoformat(),
+        "https://example.com/a",
+        article_filter._watchlist_digest(["AAPL"]),
+        cached,
+    )
 
     def _fail_fetch(url):
         raise AssertionError("a cache hit must never fetch the article")
@@ -1184,8 +1188,8 @@ def test_extract_financial_context_returns_cached_value_without_fetching(
 def test_extract_financial_context_parses_a_valid_model_response(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
-    monkeypatch.setattr(article_filter, "CACHE_PATH", cache_path)
+    db_path = tmp_path / "verdicts.duckdb"
+    monkeypatch.setattr(article_filter, "DB_PATH", db_path)
     article_text = (
         "Apple AAPL reports strong quarterly earnings and raises guidance for outlook. "
         "Analysts issued an upgrade after the surge in revenue beat estimates broadly. "
@@ -1217,8 +1221,12 @@ def test_extract_financial_context_parses_a_valid_model_response(
     result = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
 
     assert result == expected
-    cache_key = article_filter._cache_key("https://example.com/a", ["AAPL"])
-    assert json.loads(cache_path.read_text(encoding="utf-8"))[cache_key] == expected
+    stored = article_filter._load_verdict(
+        date.today().isoformat(),
+        "https://example.com/a",
+        article_filter._watchlist_digest(["AAPL"]),
+    )
+    assert stored == expected
 
 
 def test_discovery_article_context_is_advisory_and_scoped_to_the_symbols_own_url(
@@ -1362,7 +1370,7 @@ def test_adaptive_news_model_does_not_learn_from_a_multisession_gap(
 def test_article_context_cache_is_scoped_to_the_watchlist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(article_filter, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(article_filter, "DB_PATH", tmp_path / "verdicts.duckdb")
     monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "raw")
     monkeypatch.setattr(
         article_filter.trafilatura,

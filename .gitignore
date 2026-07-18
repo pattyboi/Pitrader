@@ -27,6 +27,8 @@ pi-trading-agent/config.json
 .portfolio_memory.duckdb.*
 .symbol_reference.duckdb
 .symbol_reference.duckdb.*
+.article_verdicts.duckdb
+.article_verdicts.duckdb.*
 .cpu_watchdog_state
 .cpu_watchdog.log
 .cpu_watchdog.log.*

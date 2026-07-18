@@ -16,6 +16,7 @@ from hashlib import sha256
 from datetime import date
 from pathlib import Path
 
+import duckdb
 import requests
 import trafilatura
 
@@ -35,7 +36,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-CACHE_PATH = Path(__file__).resolve().parent / ".article_cache.json"
+DB_PATH = Path(__file__).resolve().parent / ".article_verdicts.duckdb"
 
 OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 MODEL = "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"
@@ -125,24 +126,52 @@ def _truncate_to_token_limit(sentences: list[str], max_tokens: int) -> str:
     return ". ".join(kept)
 
 
-def _load_cache() -> dict:
-    if not CACHE_PATH.exists():
-        return {}
-    try:
-        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verdicts (
+            verdict_date TEXT NOT NULL,
+            url TEXT NOT NULL,
+            watchlist_digest TEXT NOT NULL,
+            verdict_json TEXT NOT NULL,
+            PRIMARY KEY (verdict_date, url, watchlist_digest)
+        )
+        """
+    )
 
 
-def _cache_key(url: str, watchlist: list[str]) -> str:
-    """Key model output by every input that can change its verdict."""
+def _watchlist_digest(watchlist: list[str]) -> str:
+    """Digest every input besides (url, day) that can change a verdict, so a
+    cache hit never serves a different watchlist's or model's prompt."""
     symbols = sorted({str(symbol).strip().upper() for symbol in watchlist if str(symbol).strip()})
-    digest = sha256("\0".join([MODEL, *symbols]).encode("utf-8")).hexdigest()[:16]
-    return f"{date.today().isoformat()}:{digest}:{url}"
+    return sha256("\0".join([MODEL, *symbols]).encode("utf-8")).hexdigest()[:16]
 
 
-def _save_cache(cache: dict) -> None:
-    CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
+def _connect() -> duckdb.DuckDBPyConnection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return duckdb.connect(str(DB_PATH))
+
+
+def _load_verdict(verdict_date: str, url: str, digest: str) -> dict | None:
+    with _connect() as conn:
+        _create_schema(conn)
+        row = conn.execute(
+            "SELECT verdict_json FROM verdicts "
+            "WHERE verdict_date = ? AND url = ? AND watchlist_digest = ?",
+            (verdict_date, url, digest),
+        ).fetchone()
+    return json.loads(row[0]) if row is not None else None
+
+
+def _save_verdict(verdict_date: str, url: str, digest: str, result: dict) -> None:
+    with _connect() as conn:
+        _create_schema(conn)
+        conn.execute(
+            "INSERT INTO verdicts (verdict_date, url, watchlist_digest, verdict_json) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (verdict_date, url, watchlist_digest) DO NOTHING",
+            (verdict_date, url, digest, json.dumps(result)),
+        )
+        conn.commit()
 
 
 def _build_prompt(filtered_text: str, watchlist: list[str]) -> str:
@@ -177,10 +206,11 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
     article is skipped (fetch/extraction failure, too low-signal, or any
     other problem). Cached per (url, calendar day)."""
     try:
-        cache_key = _cache_key(url, watchlist)
-        cache = _load_cache()
-        if cache_key in cache:
-            return cache[cache_key]
+        verdict_date = date.today().isoformat()
+        digest = _watchlist_digest(watchlist)
+        cached = _load_verdict(verdict_date, url, digest)
+        if cached is not None:
+            return cached
 
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
@@ -208,8 +238,7 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
 
         result = _query_model(filtered_text, watchlist)
 
-        cache[cache_key] = result
-        _save_cache(cache)
+        _save_verdict(verdict_date, url, digest, result)
         return result
     except Exception:
         logger.exception("extract_financial_context failed for %s", url)
