@@ -249,6 +249,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
         "PORTFOLIO_RISK_POSTURE": "conservative",
         "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED": False,
+        "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES": 210,
     }
     for key, default in portfolio_defaults.items():
         config.setdefault(key, default)
@@ -279,6 +280,7 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
     portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
     opportunity_min_probability = float(config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"])
+    second_iteration_offset_minutes = int(config["PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"])
     # Autonomous discovery expands the daily candidate universe beyond the
     # static seed list, so the cap on concurrent positions shouldn't be tied
     # to len(portfolio_symbols) when discovery can supply the rest. Without
@@ -305,6 +307,11 @@ def load_config(path: Path) -> dict[str, Any]:
         ("PORTFOLIO_CASH_RESERVE_DOLLARS", portfolio_cash_reserve, 0, 1000),
         ("PORTFOLIO_MIN_ORDER_DOLLARS", portfolio_min_order, 1, 1000),
         ("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY", opportunity_min_probability, 0.5, 0.95),
+        # Minutes after market open for the day's second evaluation. Lower
+        # bound keeps it a meaningfully later, independent read rather than
+        # a near-duplicate of the open window; upper bound keeps it inside
+        # even a shortened trading session.
+        ("PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES", second_iteration_offset_minutes, 30, 360),
     )
     for name, value, minimum, maximum in range_checks:
         _require_range(name, value, minimum, maximum)
@@ -331,6 +338,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
     config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
     config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
+    config["PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"] = second_iteration_offset_minutes
 
     _require_booleans(config, "EMAIL_REPORT_ENABLED", "EMAIL_USE_TLS")
     email_port = int(config["EMAIL_SMTP_PORT"])
@@ -580,6 +588,10 @@ def main() -> int:
                 "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
                 "portfolio_holding_state_file": str(BASE_DIR / ".portfolio_holding_state.json"),
                 "portfolio_rotation_state_file": str(BASE_DIR / ".portfolio_rotation_state.json"),
+                "portfolio_iteration_state_file": str(BASE_DIR / ".portfolio_iteration_state.json"),
+                "portfolio_second_iteration_offset_minutes": config[
+                    "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"
+                ],
                 "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
                 "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
                 "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
@@ -615,6 +627,7 @@ def main() -> int:
                     "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
                 ],
                 "news_learning_state_file": str(BASE_DIR / ".news_learning_state.json"),
+                "news_learning_llm_state_file": str(BASE_DIR / ".news_learning_state_llm.json"),
                 "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
                 "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
                 "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],

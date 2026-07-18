@@ -63,7 +63,12 @@ fi
 
 # The official installer's own ollama.service has no loopback restriction and
 # no keep-alive; overwrite it so the server is never reachable off the device
-# and the model stays resident between daily runs instead of reloading.
+# and the model stays resident between daily runs instead of reloading. The
+# strategy now evaluates up to twice a trading day (market open, plus
+# PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES later, default 210 = ~3.5h) --
+# 8h keeps the model loaded from the 09:00 warm-up through both possible
+# calls regardless of that offset, still unloading well before the next
+# morning's warm-up instead of holding ~2GB of RAM around the clock.
 install -o root -g root -m 0644 /dev/null "${OLLAMA_SERVICE_FILE}"
 tee "${OLLAMA_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
@@ -77,7 +82,7 @@ Group=ollama
 Restart=always
 RestartSec=3
 Environment=OLLAMA_HOST=127.0.0.1:11434
-Environment=OLLAMA_KEEP_ALIVE=1h
+Environment=OLLAMA_KEEP_ALIVE=8h
 
 [Install]
 WantedBy=multi-user.target

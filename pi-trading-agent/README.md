@@ -50,6 +50,21 @@ understand the risks.
 
 ## How the strategy trades
 
+### How often the agent checks in
+
+The agent evaluates the market up to twice on a given trading day: once at
+market open, and again `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES` after
+open (210 minutes / 3.5 hours by default, landing around midday). Each of
+these is a full, independent evaluation — fresh prices, fresh news, a fresh
+LLM read if enabled — and either one can open, replace, or exit a position.
+Everything that should only ever happen once a day still does: the
+Opportunistic Opportunity swap (see below) and the daily email report are
+both capped at one per calendar day even though the agent checks in twice.
+Behind the scenes it actually polls every 10 minutes, but almost every poll
+is a no-op — real evaluation work only happens at the two windows above.
+Change `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES` in `config.json` to move
+the second check-in earlier or later in the day (30-360 minutes after open).
+
 ### Portfolio mode (default)
 
 Portfolio mode is the default. It only considers the
@@ -147,11 +162,14 @@ default). If it fires, the sale of Asset A and purchase of Asset B are staged
 the same restart-safe two-step way as an ordinary replacement above. It is
 reported separately from ordinary portfolio candidates, so it does not turn
 the two systems into interchangeable ranking signals. It is evaluated exactly
-once per day, as a single decision made before the ordinary per-symbol pass
-described above, and it never competes for one of that pass's
-`PORTFOLIO_MAX_POSITIONS` slots. When it fires, Asset A and Asset B are
-excluded from ordinary building or replacement for the rest of that same
-iteration, so the same pair can't also be picked up by the per-symbol logic.
+once per iteration, as a single decision made before the ordinary per-symbol
+pass described above, and it never competes for one of that pass's
+`PORTFOLIO_MAX_POSITIONS` slots. Even on a day that runs two iterations (see
+"How often the agent checks in" below), it can only actually fire once: a
+persisted per-day flag blocks a second swap once the first one submits. When
+it fires, Asset A and Asset B are excluded from ordinary building or
+replacement for the rest of that same iteration, so the same pair can't also
+be picked up by the per-symbol logic.
 
 For a small account funded in roughly $50 increments, start with one position
 and fractional shares. The default portfolio settings reserve $2 for price
@@ -515,8 +533,10 @@ sudo journalctl -u trading-agent.service -f
 ### Daily email report
 
 Email reporting is initially disabled. Leaving it disabled does not affect
-trading. When enabled, the agent attempts to send one summary after its daily
-market evaluation. The report includes:
+trading. When enabled, the agent attempts to send one summary a day, after
+its first market evaluation of that day (see "How often the agent checks
+in" below) — a second same-day evaluation still runs and can still trade,
+but does not send a second email. The report includes:
 
 - Evaluation date and time.
 - Current holdings, signal candidates, and discovered symbols.
@@ -728,8 +748,9 @@ trusts Alpaca's raw article tags unfiltered — exactly today's behavior.
 ### LLM news assessment
 
 In addition to the fixed keyword rules, the agent can send the same daily
-Alpaca headlines to a language model for one risk assessment per trading day.
-Unlike the keyword scorer, the model reads the articles with genuine language
+Alpaca headlines to a language model for a risk assessment, up to twice a
+trading day (see "How often the agent checks in" below). Unlike the keyword
+scorer, the model reads the articles with genuine language
 understanding: it can recognize that ten articles describe one event, that a
 headline is speculation rather than fact, or that a negative-sounding story
 is irrelevant to broad US equity markets.
@@ -751,17 +772,19 @@ provider is supported.
 `trading-agent.service`:
 
 - `ollama.service` — runs `ollama serve` bound to `127.0.0.1:11434` only
-  (never reachable off the device), with `OLLAMA_KEEP_ALIVE=1h`. The strategy
-  makes exactly one LLM call per day (`sleeptime = "1D"`), so there is no
-  reason to keep the model resident around the clock; the daemon itself stays
-  up all the time (idle cost is negligible with no model loaded), but the
-  ~3GB of loaded model weights unload again about an hour after last use
-  instead of sitting in RAM for the other 23 hours.
+  (never reachable off the device), with `OLLAMA_KEEP_ALIVE=8h`. The strategy
+  makes up to two LLM calls a trading day (see "How often the agent checks
+  in" below), so the daemon itself stays up all the time (idle cost is
+  negligible with no model loaded), but the ~3GB of loaded model weights
+  unload again after the last call of the day instead of sitting in RAM
+  around the clock.
 - `ollama-warmup.timer` — fires at 09:00 ET (the Pi's system timezone is
   already `America/New_York`), 30 minutes before the 9:30 ET market open, and
   sends the configured model one trivial prompt to force a cold load to
-  finish well ahead of the actual trading iteration. The 1-hour keep-alive
-  window comfortably covers the gap from this warm-up through the 9:30 call.
+  finish well ahead of the first trading iteration. The 8-hour keep-alive
+  window comfortably covers the gap from this warm-up through both the
+  morning and midday calls, however `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES`
+  is configured.
 
 Pull the model once after installing:
 
@@ -773,8 +796,8 @@ This Pi's CPU-only inference is slow regardless of which small (~3-4B) model
 is configured — roughly 27-31 tokens/sec reading the prompt and ~4
 tokens/sec writing the reply, measured directly against this model. The
 request timeout is sized generously around that (see `llm_news.py`'s
-`REQUEST_TIMEOUT_SECONDS`) since this is a once-a-day background call, not a
-latency-sensitive one. It also does noticeably weaker risk judgment than a
+`REQUEST_TIMEOUT_SECONDS`) since this is a background call at most twice a
+day, not a latency-sensitive one. It also does noticeably weaker risk judgment than a
 large hosted model — treat it as a plausible advisory signal, not an
 authority.
 
@@ -924,6 +947,18 @@ forecasts to affect orders, temporarily use:
 
 To stop collection as well, set `NEWS_LEARNING_ENABLED` to `false`. Existing
 state is preserved and becomes available again if learning is re-enabled.
+
+#### A second model, trained on the LLM score
+
+When `LLM_NEWS_ENABLED` is on, the agent trains a second copy of this same
+regression against the LLM assessment's score instead of the keyword score,
+in its own state file (`.news_learning_state_llm.json`) so the two never mix.
+It appears in logs and the email as the "LLM-score" learned forecast,
+alongside the keyword-based one above. This second model is purely
+observational for now — it does not veto trades — so over time the two
+forecasts' actual correlation with realized returns can be compared before
+deciding whether the LLM-trained one should ever be allowed to block a
+rotation too.
 
 #### Rolling and bounded behavior
 

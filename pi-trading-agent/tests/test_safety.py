@@ -426,6 +426,69 @@ def test_holding_horizon_is_due_on_the_next_trading_day_interval() -> None:
     assert not AssetRotationStrategy._holding_is_due("2026-01-05", date(2026, 1, 5), 1)
 
 
+def test_due_iteration_window_is_none_before_market_open() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    now = market_open - timedelta(minutes=1)
+
+    assert AssetRotationStrategy._due_portfolio_iteration_window(now, market_open, 210, []) is None
+
+
+def test_due_iteration_window_is_open_right_at_market_open() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+
+    assert (
+        AssetRotationStrategy._due_portfolio_iteration_window(market_open, market_open, 210, [])
+        == "open"
+    )
+
+
+def test_due_iteration_window_skips_open_once_completed_today() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+
+    assert (
+        AssetRotationStrategy._due_portfolio_iteration_window(
+            market_open, market_open, 210, ["open"]
+        )
+        is None
+    )
+
+
+def test_due_iteration_window_returns_midday_after_the_configured_offset() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    now = market_open + timedelta(minutes=210)
+
+    assert (
+        AssetRotationStrategy._due_portfolio_iteration_window(
+            now, market_open, 210, ["open"]
+        )
+        == "midday"
+    )
+
+
+def test_due_iteration_window_does_not_fire_midday_early() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    now = market_open + timedelta(minutes=209)
+
+    assert (
+        AssetRotationStrategy._due_portfolio_iteration_window(
+            now, market_open, 210, ["open"]
+        )
+        is None
+    )
+
+
+def test_due_iteration_window_is_none_once_both_windows_completed() -> None:
+    market_open = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    now = market_open + timedelta(hours=6)
+
+    assert (
+        AssetRotationStrategy._due_portfolio_iteration_window(
+            now, market_open, 210, ["open", "midday"]
+        )
+        is None
+    )
+
+
 def test_decision_memory_uses_duckdb_and_imports_legacy_sqlite(tmp_path: Path) -> None:
     legacy_path = tmp_path / ".trade_memory.sqlite3"
     with sqlite3.connect(legacy_path) as conn:

@@ -94,8 +94,9 @@ class AssetRotationStrategy(Strategy):
     _PORTFOLIO_LIVE_SPREAD_CAP_PERCENT = 5.0
 
     def initialize(self) -> None:
-        """Configure one evaluation per trading day."""
-        self.sleeptime = "1D"
+        """Poll frequently; _due_portfolio_iteration_window gates actual evaluations
+        to at most twice a trading day (see on_trading_iteration)."""
+        self.sleeptime = "10M"
         self._rotation_lock = threading.Lock()
         self._portfolio_state_lock = threading.RLock()
         self._symbol_reference_refresh_lock = threading.Lock()
@@ -109,6 +110,7 @@ class AssetRotationStrategy(Strategy):
         self.vars.portfolio_memory_backfilled_symbols = set()
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
         self.vars.portfolio_holding_dates = self._load_portfolio_holding_dates()
+        self.vars.portfolio_iteration_state = self._load_portfolio_iteration_state()
         if self.vars.portfolio_pending_rotation:
             pending = self.vars.portfolio_pending_rotation
             summary = ", ".join(
@@ -336,6 +338,79 @@ class AssetRotationStrategy(Strategy):
             dates.pop(str(symbol).upper(), None)
             self._set_portfolio_holding_dates(dates)
 
+    def _portfolio_iteration_state_path(self) -> Path | None:
+        raw = self.parameters.get("portfolio_iteration_state_file")
+        return Path(str(raw)) if raw else None
+
+    @staticmethod
+    def _default_portfolio_iteration_state() -> dict[str, Any]:
+        return {"date": "", "windows_completed": [], "opportunistic_swap_done": False}
+
+    def _load_portfolio_iteration_state(self) -> dict[str, Any]:
+        """Restore today's iteration progress after a restart.
+
+        Needed now that a trading day can run more than one evaluation
+        (see _due_portfolio_iteration_window): without this surviving a
+        restart, a crash between the day's two windows would forget the
+        first one ran and re-fire it immediately on the next poll.
+        """
+        path = self._portfolio_iteration_state_path()
+        if path is None or not path.exists():
+            return self._default_portfolio_iteration_state()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return self._default_portfolio_iteration_state()
+            date_value = str(state.get("date", ""))
+            windows = state.get("windows_completed", [])
+            windows = [str(w) for w in windows] if isinstance(windows, list) else []
+            return {
+                "date": date_value if self._valid_iso_date(date_value) else "",
+                "windows_completed": windows,
+                "opportunistic_swap_done": bool(state.get("opportunistic_swap_done", False)),
+            }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return self._default_portfolio_iteration_state()
+
+    def _save_portfolio_iteration_state(self) -> None:
+        path = self._portfolio_iteration_state_path()
+        if path is None:
+            return
+        try:
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(
+                json.dumps(self.vars.portfolio_iteration_state, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except OSError as exc:
+            self.log_message(f"Could not persist portfolio iteration state: {exc}", color="red")
+
+    @staticmethod
+    def _due_portfolio_iteration_window(
+        now: Any,
+        market_open: Any,
+        second_offset_minutes: int,
+        windows_completed: list[str],
+    ) -> str | None:
+        """Return the label of the iteration window that is due, or None.
+
+        "open" is due once `now` reaches market open; "midday" is due once
+        `now` reaches market_open + second_offset_minutes. Each label fires
+        at most once per trading day -- `windows_completed` is reset by the
+        caller whenever the calendar date rolls over -- regardless of how
+        often this is polled (sleeptime="10M", see initialize).
+        """
+        completed = set(windows_completed)
+        windows = (
+            ("open", market_open),
+            ("midday", market_open + timedelta(minutes=second_offset_minutes)),
+        )
+        for label, due_at in windows:
+            if label not in completed and now >= due_at:
+                return label
+        return None
+
     @staticmethod
     def _holding_is_due(entry_date: str, today: date_type, maximum_days: int) -> bool:
         """Return whether a confirmed entry has reached its configured horizon."""
@@ -477,6 +552,9 @@ class AssetRotationStrategy(Strategy):
                 f"Learning observations: {report.get('learning_observations', 'unavailable')}",
                 f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                 f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
+                f"LLM-score learning observations: {report.get('llm_learning_observations', 'unavailable')}",
+                f"LLM-score learned return forecast: {report.get('llm_learned_forecast', 'not ready')}",
+                f"LLM-score learning explanation: {report.get('llm_learning_explanation', 'unavailable')}",
                 f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
                 f"Opportunistic Opportunity probability: {report.get('opportunistic_opportunity_probability', 'unavailable')}",
                 f"Opportunistic Opportunity evidence: {report.get('opportunistic_opportunity_explanation', 'unavailable')}",
@@ -623,6 +701,18 @@ class AssetRotationStrategy(Strategy):
             ("Learning observations", report.get("learning_observations", "unavailable")),
             ("Learned return forecast", report.get("learned_forecast", "not ready")),
             ("Learning explanation", report.get("learning_explanation", "unavailable")),
+            (
+                "LLM-score learning observations",
+                report.get("llm_learning_observations", "unavailable"),
+            ),
+            (
+                "LLM-score learned return forecast",
+                report.get("llm_learned_forecast", "not ready"),
+            ),
+            (
+                "LLM-score learning explanation",
+                report.get("llm_learning_explanation", "unavailable"),
+            ),
             (
                 "Opportunistic Opportunity",
                 report.get("opportunistic_opportunity_status", "unavailable"),
@@ -822,6 +912,59 @@ This automated message is not financial advice.
         except Exception as exc:
             self.log_message(
                 f"Adaptive news learning failed safely: {type(exc).__name__}: {exc}",
+                color="red",
+            )
+            return LearningResult(
+                0,
+                False,
+                None,
+                None,
+                None,
+                f"Learning update failed: {type(exc).__name__}: {exc}",
+            )
+
+    def _update_llm_adaptive_learning(
+        self,
+        price_b: float,
+        llm_assessment: LLMNewsAssessment,
+    ) -> LearningResult:
+        """Same regression as _update_adaptive_learning, trained on the LLM
+        score instead of the deterministic keyword score, in its own state
+        file. The two scores can diverge on the same day's news (a keyword
+        scorer only matches a fixed phrase list; the LLM reads the full
+        headline set) -- training both against realized next-session returns
+        is how that disagreement gets resolved with evidence instead of by
+        assumption. Purely observational for now: this forecast is reported
+        alongside the keyword one but does not feed _market_veto_reason."""
+        if not bool(self.parameters.get("news_learning_enabled", True)):
+            return LearningResult(
+                observations=0,
+                ready=False,
+                predicted_return_percent=None,
+                slope=None,
+                correlation=None,
+                explanation="Adaptive news learning is disabled in config.json.",
+            )
+        try:
+            model = AdaptiveNewsModel(
+                state_path=Path(str(self.parameters["news_learning_llm_state_file"])),
+                minimum_observations=int(
+                    self.parameters["news_learning_min_observations"]
+                ),
+                maximum_observations=int(
+                    self.parameters["news_learning_max_observations"]
+                ),
+            )
+            result = model.update(
+                evaluation_date=self.get_datetime().date().isoformat(),
+                current_price=price_b,
+                news_score=llm_assessment.score if llm_assessment.available else None,
+            )
+            self.log_message(f"LLM-score {result.explanation}", color="blue")
+            return result
+        except Exception as exc:
+            self.log_message(
+                f"LLM-score adaptive news learning failed safely: {type(exc).__name__}: {exc}",
                 color="red",
             )
             return LearningResult(
@@ -2221,6 +2364,20 @@ This automated message is not financial advice.
                 ),
                 learning_explanation=learning_result.explanation,
             )
+            # Same regression, trained on the LLM's score instead, so the two
+            # signals' predictive value can be compared once both have
+            # enough history -- see _update_llm_adaptive_learning.
+            llm_learning_result = self._update_llm_adaptive_learning(float(proxy_price), llm_assessment)
+            report.update(
+                llm_learning_observations=llm_learning_result.observations,
+                llm_learned_forecast=(
+                    f"{llm_learning_result.predicted_return_percent:+.2f}%"
+                    if llm_learning_result.ready
+                    and llm_learning_result.predicted_return_percent is not None
+                    else "not ready"
+                ),
+                llm_learning_explanation=llm_learning_result.explanation,
+            )
         veto_reason = self._market_veto_reason(news_context, llm_assessment, learning_result)
 
         # A/B is no longer an alternate strategy mode. It is a separately
@@ -2441,6 +2598,7 @@ This automated message is not financial advice.
             and float(opportunity_probability) >= float(self.parameters["portfolio_opportunistic_min_probability"])
             and opportunity_edge is not None
             and float(opportunity_edge) >= minimum_profit
+            and not self.vars.portfolio_iteration_state.get("opportunistic_swap_done", False)
         )
         # Persist only positions the strategy actually owns. Merely qualifying
         # a discovered ticker must not grant permission to manage a manual
@@ -2465,11 +2623,13 @@ This automated message is not financial advice.
         # `eligible`. Reserving both legs here (via claimed_symbols) is what
         # structurally keeps it distinct from -- never folded into or
         # competing for a slot within -- the up-to-max_positions batch below,
-        # even though PORTFOLIO_SYMBOLS defaults to include both assets. Since
-        # this function already runs at most once per trading day
-        # (sleeptime="1D"), that structural isolation is sufficient on its own
-        # to guarantee at most one Opportunistic Opportunity swap per day; no
-        # separate persisted rate limit is needed.
+        # even though PORTFOLIO_SYMBOLS defaults to include both assets. Now
+        # that a trading day can run this function up to twice (see
+        # _due_portfolio_iteration_window), "at most one swap per day" is no
+        # longer structurally guaranteed by call count alone -- enforced
+        # instead by opportunity_is_eligible's opportunistic_swap_done check
+        # above, persisted in .portfolio_iteration_state.json so it survives
+        # a restart between the day's two windows.
         if opportunity_is_eligible and not veto_reason:
             if self._has_active_order(asset_a, "sell"):
                 actions.append("Opportunistic Opportunity pending: waiting for Asset A sale")
@@ -2486,6 +2646,8 @@ This automated message is not financial advice.
                         budget,
                         kind="opportunistic",
                     ):
+                        self.vars.portfolio_iteration_state["opportunistic_swap_done"] = True
+                        self._save_portfolio_iteration_state()
                         held_working.pop(asset_a, None)
                         claimed_symbols.update({asset_a, asset_b})
                         actions.append(
@@ -2578,8 +2740,52 @@ This automated message is not financial advice.
             return actions[0]
         return f"Portfolio: {len(actions)} actions this iteration -- " + "; ".join(actions)
 
+    def _due_iteration_window_now(self) -> str | None:
+        """Return the due window label, or None to skip this poll cheaply.
+
+        Polled every sleeptime tick (see initialize) but the full pipeline
+        below should only actually run at the day's "open" and "midday"
+        windows -- see _due_portfolio_iteration_window. Fails open to
+        "skip, retry next poll" (never "run unconditionally") if today's
+        market open can't be determined right now.
+        """
+        now = self.get_datetime()
+        today = now.date().isoformat()
+        state = self.vars.portfolio_iteration_state
+        if state.get("date") != today:
+            state = self._default_portfolio_iteration_state()
+            state["date"] = today
+            self.vars.portfolio_iteration_state = state
+        try:
+            market_open = self.broker.market_hours(close=False, next=False)
+            offset_minutes = int(self.parameters.get("portfolio_second_iteration_offset_minutes", 0))
+            window = self._due_portfolio_iteration_window(
+                now, market_open, offset_minutes, state["windows_completed"]
+            )
+        except Exception as exc:
+            self.log_message(
+                f"Could not evaluate the iteration schedule safely, skipping this poll: "
+                f"{type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            return None
+        if window is None:
+            return None
+        state["windows_completed"] = [*state["windows_completed"], window]
+        self._save_portfolio_iteration_state()
+        return window
+
     def on_trading_iteration(self) -> None:
-        """Evaluate today's portfolio dip signals and advance any pending rotation."""
+        """Evaluate today's portfolio dip signals up to twice a trading day.
+
+        Polled every sleeptime tick; _due_iteration_window_now gates the
+        actual pipeline below to the day's "open" and "midday" windows so
+        the news layer (and everything else) gets a second, independent
+        daily read without doubling every tick into a trade decision.
+        """
+        window = self._due_iteration_window_now()
+        if window is None:
+            return
         report = {
             "threshold": float(self.parameters["dip_threshold_percent"]),
             "status": "Evaluation started",
