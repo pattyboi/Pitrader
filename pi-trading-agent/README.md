@@ -53,7 +53,7 @@ understand the risks.
 For the full phase-by-phase decision pipeline as a diagram — every step from
 the 10-minute poll through news/LLM screening, the market veto, each trade
 phase, and the daily email — see
-[`.claude/docs/decision-pipeline.md`](.claude/docs/decision-pipeline.md).
+[`.claude/docs/decision-pipeline.md`](../.claude/docs/decision-pipeline.md).
 
 ### How often the agent checks in
 
