@@ -7,6 +7,9 @@ has reliably paid off, rotates cash into the best-qualifying one. It also
 runs a labelled Asset A → Asset B "Opportunistic Opportunity" check
 internally as one candidate among the others.
 
+New here, or just want the plain-English version with no jargon? Read
+[`TLDR.md`](TLDR.md) first.
+
 Start with Alpaca paper trading. Paper trading uses simulated money and is the
 appropriate place to learn how the agent behaves. Do not enable live trading
 until you have watched it operate successfully for an extended period and fully
