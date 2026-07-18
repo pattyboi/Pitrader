@@ -149,12 +149,6 @@ class WorldEventAnalyzer:
         return matches
 
     @classmethod
-    def score_text(cls, text: str) -> tuple[int, list[str]]:
-        """Return a transparent score and the terms responsible for it."""
-        matches = cls._matched_terms(text)
-        return sum(delta for _, delta in matches), [phrase for phrase, _ in matches]
-
-    @classmethod
     def score_articles(
         cls,
         articles: list[dict[str, Any]],

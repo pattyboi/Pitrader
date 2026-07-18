@@ -20,19 +20,7 @@ import duckdb
 import requests
 import trafilatura
 
-try:
-    import tiktoken
-
-    # cl100k_base is not this pipeline's actual tokenizer (MODEL's GGUF vocab
-    # differs, and Ollama has no tokenize endpoint to query it -- see
-    # llm_news.py's _TOKEN_ENCODER for the same reasoning), but a real BPE
-    # encoder still segments dense financial text (tickers, "%", table-like
-    # runs of digits) the way a subword tokenizer actually would, unlike a
-    # linear words/chars heuristic. Fast enough (~0.3ms/article) to cost
-    # nothing extra when available.
-    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _TOKEN_ENCODER = None
+from token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +50,6 @@ MIN_SENTENCE_WORDS = 8
 TOP_SENTENCES = 15
 TICKER_SCORE = 3
 SIGNAL_WORD_SCORE = 1
-# ~4 chars/token undercounted real tokenizer output for dense financial text
-# (see llm_news.py's MAX_PROMPT_TOKENS_ESTIMATE); a words*1.3 estimate is used
-# here instead, still an approximation, not an exact count.
-TOKENS_PER_WORD = 1.3
 MIN_TOKENS = 80
 MAX_TOKENS = 800
 
@@ -79,21 +63,6 @@ SIGNAL_WORDS = {
 }
 
 _WORD_PATTERN = re.compile(r"[A-Za-z']+")
-
-
-def _estimate_tokens(text: str) -> int:
-    """tiktoken's real BPE count when available (see _TOKEN_ENCODER); a
-    words*TOKENS_PER_WORD estimate otherwise. Never raises: arbitrary
-    third-party article text can contain sequences tiktoken treats as
-    special tokens."""
-    if not text:
-        return 0
-    if _TOKEN_ENCODER is not None:
-        try:
-            return len(_TOKEN_ENCODER.encode(text, disallowed_special=()))
-        except Exception:
-            pass
-    return int(len(text.split()) * TOKENS_PER_WORD)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -120,7 +89,7 @@ def _truncate_to_token_limit(sentences: list[str], max_tokens: int) -> str:
     kept: list[str] = []
     for sentence in sentences:
         candidate = ". ".join(kept + [sentence])
-        if kept and _estimate_tokens(candidate) > max_tokens:
+        if kept and estimate_tokens(candidate) > max_tokens:
             break
         kept.append(sentence)
     return ". ".join(kept)
@@ -232,7 +201,7 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
         tickers = {str(symbol).strip().upper() for symbol in watchlist if str(symbol).strip()}
         selected = _select_top_sentences(candidates, tickers)
         filtered_text = ". ".join(selected)
-        if _estimate_tokens(filtered_text) < MIN_TOKENS:
+        if estimate_tokens(filtered_text) < MIN_TOKENS:
             return None
         filtered_text = _truncate_to_token_limit(selected, MAX_TOKENS)
 

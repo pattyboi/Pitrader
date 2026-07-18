@@ -17,6 +17,7 @@ import pytest
 import article_filter
 import autonomous_universe
 import llm_news
+import token_estimate
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer
@@ -756,7 +757,8 @@ def test_score_articles_with_refine_off_matches_score_text_exactly() -> None:
 
     scoring = WorldEventAnalyzer.score_articles(articles, lookback_hours=24, refine=False)
     manual_total = sum(
-        WorldEventAnalyzer.score_text(f"{a['headline']} {a.get('summary', '')}")[0] for a in articles
+        sum(delta for _, delta in WorldEventAnalyzer._matched_terms(f"{a['headline']} {a.get('summary', '')}"))
+        for a in articles
     )
 
     assert scoring.total_score == manual_total
@@ -1136,25 +1138,25 @@ def test_symbol_news_scores_extends_coverage_via_text_scan() -> None:
 
 
 def test_estimate_tokens_uses_the_real_tokenizer_when_available() -> None:
-    assert LLMNewsAnalyzer._estimate_tokens("") == 0
+    assert token_estimate.estimate_tokens("") == 0
     # A dense, space-free run (e.g. a table cell or a long ticker/number
     # blob) is exactly the case a words/chars heuristic undercounts but a
     # real BPE encoder still segments correctly.
-    assert LLMNewsAnalyzer._estimate_tokens("x" * 400) > 40
+    assert token_estimate.estimate_tokens("x" * 400) > 40
 
 
 def test_estimate_tokens_falls_back_to_words_times_token_ratio_without_tiktoken(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(llm_news, "_TOKEN_ENCODER", None)
-    assert LLMNewsAnalyzer._estimate_tokens("") == 0
-    assert LLMNewsAnalyzer._estimate_tokens(" ".join(["word"] * 10)) == 13
+    monkeypatch.setattr(token_estimate, "_TOKEN_ENCODER", None)
+    assert token_estimate.estimate_tokens("") == 0
+    assert token_estimate.estimate_tokens(" ".join(["word"] * 10)) == 13
 
 
 def test_estimate_tokens_never_raises_on_special_token_lookalikes() -> None:
     # tiktoken's default encode() raises on text resembling a special
     # token; arbitrary headline/article text must never trip that up.
-    assert LLMNewsAnalyzer._estimate_tokens("breaking: <|endoftext|> leaked") > 0
+    assert token_estimate.estimate_tokens("breaking: <|endoftext|> leaked") > 0
 
 
 def test_prioritize_articles_keeps_the_highest_signal_article_within_budget() -> None:
@@ -1221,23 +1223,6 @@ def test_assess_bounds_article_count_to_the_prompt_token_budget() -> None:
 
     assert assessment.available
     assert f"assessed {len(articles)} articles" not in assessment.explanation
-
-
-def test_article_filter_estimate_tokens_uses_the_real_tokenizer_when_available() -> None:
-    assert article_filter._estimate_tokens("") == 0
-    assert article_filter._estimate_tokens("x" * 400) > 40
-
-
-def test_article_filter_estimate_tokens_falls_back_to_words_times_token_ratio_without_tiktoken(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(article_filter, "_TOKEN_ENCODER", None)
-    assert article_filter._estimate_tokens("") == 0
-    assert article_filter._estimate_tokens(" ".join(["word"] * 10)) == 13
-
-
-def test_article_filter_estimate_tokens_never_raises_on_special_token_lookalikes() -> None:
-    assert article_filter._estimate_tokens("breaking: <|endoftext|> leaked") > 0
 
 
 def test_extract_financial_context_returns_none_for_a_low_density_article(

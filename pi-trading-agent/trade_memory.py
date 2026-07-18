@@ -12,6 +12,7 @@ from pathlib import Path
 import duckdb
 
 from market_sessions import is_next_trading_session
+from ridge_regression import fit_two_feature_ridge
 
 @dataclass
 class RotationForecast:
@@ -312,31 +313,10 @@ class TradeMemory:
                 count, False, None, None,
                 f"Decision memory is warming up: {count}/{self.minimum_observations} comparable dip signals settled.",
             )
-        # Use a two-feature, ridge-stabilized linear regression implemented
-        # directly to keep this Pi service dependency-free and auditable.
-        xs = [(float(row[0]), float(row[1] if row[1] is not None else 0)) for row in rows]
-        ys = [float(row[2]) for row in rows]
-        mean_x = [sum(values[index] for values in xs) / count for index in range(2)]
-        mean_y = sum(ys) / count
-        centered = [[values[index] - mean_x[index] for index in range(2)] for values in xs]
-        # Small ridge penalty makes a nearly constant news score harmless.
-        a = sum(row[0] * row[0] for row in centered) + 1.0
-        b = sum(row[0] * row[1] for row in centered)
-        d = sum(row[1] * row[1] for row in centered) + 1.0
-        determinant = a * d - b * b
-        if determinant <= 1e-9:
+        fit = fit_two_feature_ridge(rows, dip, score)
+        if fit is None:
             return RotationForecast(count, False, None, None, "Decision memory lacks enough feature variation for a trustworthy forecast.")
-        target = [sum(row[index] * (y - mean_y) for row, y in zip(centered, ys)) for index in range(2)]
-        beta_dip = (d * target[0] - b * target[1]) / determinant
-        beta_news = (a * target[1] - b * target[0]) / determinant
-        predicted = mean_y + beta_dip * (dip - mean_x[0]) + beta_news * ((score or 0) - mean_x[1])
-        predicted = max(-10.0, min(10.0, predicted))
-        fitted = [mean_y + beta_dip * row[0] + beta_news * row[1] for row in centered]
-        mean_fit = sum(fitted) / count
-        variance_y = sum((value - mean_y) ** 2 for value in ys)
-        variance_fit = sum((value - mean_fit) ** 2 for value in fitted)
-        covariance = sum((y - mean_y) * (fit - mean_fit) for y, fit in zip(ys, fitted))
-        correlation = covariance / math.sqrt(variance_y * variance_fit) if variance_y > 0 and variance_fit > 0 else 0.0
+        predicted, correlation = fit
         return RotationForecast(
             count, True, predicted, correlation,
             f"Decision memory used {count} prior dip signals; predicted next-session B-minus-A edge {predicted:+.2f}% (fit correlation {correlation:+.2f}).",

@@ -932,6 +932,7 @@ This automated message is not financial advice.
             analyzer = LLMNewsAnalyzer(
                 model=str(self.parameters["llm_news_model"]),
                 base_url=str(self.parameters.get("llm_news_base_url", "")),
+                block_score=int(self.parameters["llm_news_block_score"]),
             )
             assessment = analyzer.assess(
                 news_context.per_article,

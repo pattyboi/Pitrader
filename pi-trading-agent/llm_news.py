@@ -16,20 +16,7 @@ import json
 import re
 from dataclasses import dataclass
 
-try:
-    import tiktoken
-
-    # cl100k_base is not this pipeline's actual tokenizer (the local GGUF
-    # models have their own vocabs, and Ollama exposes no tokenize endpoint
-    # to query them -- see MAX_PROMPT_TOKENS_ESTIMATE), but a real BPE
-    # encoder still segments dense financial text (tickers, "%", table-like
-    # runs of digits) the way a subword tokenizer actually would, which a
-    # linear words/chars heuristic cannot. Encoding is Rust-backed and fast
-    # (~0.3ms for a full article on this Pi), so this is a strictly better
-    # estimate at negligible extra cost when available.
-    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    _TOKEN_ENCODER = None
+from token_estimate import estimate_tokens
 
 OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -53,15 +40,15 @@ OLLAMA_NUM_CTX = 8192
 # (Pi-constrained installs, and a real one -- e.g. tiktoken -- would tokenize
 # with an OpenAI vocab that has nothing to do with the local GGUF models this
 # actually calls, so it would just be a differently-wrong estimate dressed up
-# as an exact one). A words*TOKENS_PER_WORD estimate is used instead of a
-# chars/4 one (see article_filter.py's TOKENS_PER_WORD, calibrated the same
-# way): measured against this Pi's actual Ollama server, chars/4 undercounted
-# llama3.2:3b's real tokens by ~1.6x but overcounted granite-4.0-micro's by
-# ~1.1x for the same content (different tokenizers). This budget is sized
-# against the worse (undercounting) case so it stays safe if LLM_NEWS_MODEL
-# is changed again. When the budget would be exceeded, articles are
-# prioritized by |score| rather than hard-truncated in place.
-TOKENS_PER_WORD = 1.3
+# as an exact one). A words*token_estimate.TOKENS_PER_WORD estimate is used
+# instead of a chars/4 one (shared with article_filter.py, calibrated the
+# same way): measured against this Pi's actual Ollama server, chars/4
+# undercounted llama3.2:3b's real tokens by ~1.6x but overcounted
+# granite-4.0-micro's by ~1.1x for the same content (different tokenizers).
+# This budget is sized against the worse (undercounting) case so it stays
+# safe if LLM_NEWS_MODEL is changed again. When the budget would be
+# exceeded, articles are prioritized by |score| rather than hard-truncated
+# in place.
 MAX_PROMPT_TOKENS_ESTIMATE = 1800
 MIN_SCORE = -10
 MAX_SCORE = 10
@@ -183,9 +170,10 @@ RED_FLAG_SYSTEM_PROMPT = (
 class LLMNewsAnalyzer:
     """Score the day's headlines with one call to a local Ollama model."""
 
-    def __init__(self, model: str, base_url: str = ""):
+    def __init__(self, model: str, base_url: str = "", block_score: int = -6):
         self.model = str(model).strip()
         self.base_url = str(base_url).strip() or OLLAMA_DEFAULT_BASE_URL
+        self.block_score = block_score
 
     @staticmethod
     def _format_articles(articles: list[dict]) -> str:
@@ -200,23 +188,6 @@ class LLMNewsAnalyzer:
             else:
                 lines.append(f"{index}. {headline}")
         return "\n".join(lines)
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """tiktoken's real BPE count when available (see _TOKEN_ENCODER for
-        why this is a better proxy than a linear heuristic despite not
-        matching the local model's actual vocab); a words*TOKENS_PER_WORD
-        estimate otherwise. Approximate either way, see
-        MAX_PROMPT_TOKENS_ESTIMATE. Never raises: arbitrary headline/summary
-        text can contain sequences tiktoken treats as special tokens."""
-        if not text:
-            return 0
-        if _TOKEN_ENCODER is not None:
-            try:
-                return len(_TOKEN_ENCODER.encode(text, disallowed_special=()))
-            except Exception:
-                pass
-        return int(len(text.split()) * TOKENS_PER_WORD)
 
     @classmethod
     def _prioritize_articles(cls, articles: list[dict], budget_tokens: int) -> list[dict]:
@@ -242,7 +213,7 @@ class LLMNewsAnalyzer:
                 continue
             summary = str(article.get("summary", "")).strip()[:MAX_SUMMARY_CHARS]
             line = f"{headline} - {summary}" if summary else headline
-            tokens = cls._estimate_tokens(line)
+            tokens = estimate_tokens(line)
             if used + tokens > budget_tokens:
                 continue
             keep.add(index)
@@ -365,7 +336,7 @@ class LLMNewsAnalyzer:
         symbol's own headlines, if it has dedicated coverage today. Purely
         descriptive -- the exit already fired on price alone before this is
         ever called. Raises on any problem; callers should fail open."""
-        reserved = self._estimate_tokens(EXIT_NARRATIVE_SYSTEM_PROMPT)
+        reserved = estimate_tokens(EXIT_NARRATIVE_SYSTEM_PROMPT)
         article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         article_text = self._format_articles(
             self._prioritize_articles(articles, article_budget)
@@ -387,7 +358,7 @@ class LLMNewsAnalyzer:
         company-specific risk before it's allowed into today's tradeable
         universe. Raises on any problem; callers should fail open (treat as
         not flagged, exactly as before this feature)."""
-        reserved = self._estimate_tokens(RED_FLAG_SYSTEM_PROMPT)
+        reserved = estimate_tokens(RED_FLAG_SYSTEM_PROMPT)
         article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         article_text = self._format_articles(
             self._prioritize_articles(articles, article_budget)
@@ -401,11 +372,12 @@ class LLMNewsAnalyzer:
         return self._parse_red_flag(text)
 
     @staticmethod
-    def _risk_level_for_score(score: int) -> str:
-        """Derive risk_level from score using the same thresholds
-        WorldEventAnalyzer.analyze uses for its own risk_level, so the two
-        signals stay comparable in logs/reports."""
-        if score <= -6:
+    def _risk_level_for_score(score: int, block_score: int) -> str:
+        """Derive risk_level from score using the configured block threshold
+        (LLM_NEWS_BLOCK_SCORE) as the "high" cutoff, so a reported risk_level
+        can never disagree with the actual block/no-block decision at that
+        score."""
+        if score <= block_score:
             return "high"
         if score < 0:
             return "elevated"
@@ -414,7 +386,9 @@ class LLMNewsAnalyzer:
         return "normal"
 
     @classmethod
-    def _parse_assessment(cls, text: str, article_count: int, model: str) -> LLMNewsAssessment:
+    def _parse_assessment(
+        cls, text: str, article_count: int, model: str, block_score: int
+    ) -> LLMNewsAssessment:
         """Validate and repair a model reply into a usable assessment."""
         cleaned = text.strip()
         # Some models wrap JSON in a markdown code fence despite instructions.
@@ -429,7 +403,7 @@ class LLMNewsAnalyzer:
         # would otherwise pass validation silently and mislead anyone
         # skimming the daily report/log line, even though it never affects
         # trade-blocking (_market_veto_reason only checks score).
-        risk_level = cls._risk_level_for_score(score)
+        risk_level = cls._risk_level_for_score(score, block_score)
         reasoning = str(data.get("reasoning", "")).strip()
         return LLMNewsAssessment(
             available=True,
@@ -468,9 +442,9 @@ class LLMNewsAnalyzer:
         # previously left out of this reservation entirely, which is why a
         # 50-article day still overflowed the intended budget in practice.
         reserved = (
-            self._estimate_tokens(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS)
-            + self._estimate_tokens(wrapper)
-            + self._estimate_tokens(symbol_context)
+            estimate_tokens(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS)
+            + estimate_tokens(wrapper)
+            + estimate_tokens(symbol_context)
         )
         article_budget = max(0, MAX_PROMPT_TOKENS_ESTIMATE - reserved)
         try:
@@ -487,4 +461,4 @@ class LLMNewsAnalyzer:
         if symbol_context:
             user_text += "\n\n" + symbol_context
         text = self._chat(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS, user_text, json_mode=True)
-        return self._parse_assessment(text, len(selected_articles), self.model)
+        return self._parse_assessment(text, len(selected_articles), self.model, self.block_score)
