@@ -1,14 +1,9 @@
 """Bounded, persistent discovery of Alpaca-tradable US equities.
 
 Backed by embedded DuckDB, like ``trade_memory.py``, ``portfolio_memory.py``,
-and ``symbol_reference.py`` -- this used to be the one remaining memory
-module on plain JSON, rewriting the whole state file on every call. An
-existing ``.autonomous_universe.json`` from before this migration is
-imported once (mirroring ``trade_memory.py``'s ``_migrate_legacy_sqlite``
-pattern) and never deleted.
+and ``symbol_reference.py``.
 """
 
-import json
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,8 +12,6 @@ from pathlib import Path
 
 import duckdb
 import requests
-
-import migration_state
 
 
 class AutonomousUniverse:
@@ -36,17 +29,14 @@ class AutonomousUniverse:
         refresh_days: int,
         batch_size: int,
         paper: bool = True,
-        legacy_json_path: Path | None = None,
     ):
         self.database_path = database_path
         self.refresh_days = refresh_days
         self.batch_size = batch_size
         self.assets_url = self.ASSETS_URL_PAPER if paper else self.ASSETS_URL_LIVE
-        self.legacy_json_path = legacy_json_path
 
     def next_batch(self, api_key: str, secret_key: str) -> list[str]:
         with self._open() as conn:
-            self._migrate_legacy_json(conn)
             refreshed_value = self._get_state(conn, "refreshed")
             cursor_value = self._get_state(conn, "cursor")
             symbols = [
@@ -118,7 +108,6 @@ class AutonomousUniverse:
         if not valid:
             return
         with self._open() as conn:
-            self._migrate_legacy_json(conn)
             next_rank = (
                 conn.execute("SELECT COALESCE(MAX(last_seen_rank), 0) FROM learned_symbols").fetchone()[0] or 0
             ) + 1
@@ -148,7 +137,6 @@ class AutonomousUniverse:
         """
         try:
             with self._open() as conn:
-                self._migrate_legacy_json(conn)
                 rows = conn.execute("SELECT symbol FROM owned_symbols ORDER BY symbol").fetchall()
                 conn.commit()
             return list(dict.fromkeys(row[0] for row in rows))
@@ -226,9 +214,7 @@ class AutonomousUniverse:
     @contextmanager
     def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
         """Ensure the directory/schema exist, then hand back a ready
-        connection -- shared prologue for every call site below. Does not
-        run `_migrate_legacy_json` itself: only some call sites need it, so
-        each keeps its own explicit call exactly where it was before."""
+        connection -- shared prologue for every call site below."""
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             self._create_schema(conn)
@@ -274,7 +260,6 @@ class AutonomousUniverse:
             )
             """
         )
-        migration_state.ensure_table(conn)
 
     @staticmethod
     def _get_state(conn: duckdb.DuckDBPyConnection, name: str) -> str | None:
@@ -287,56 +272,3 @@ class AutonomousUniverse:
             "INSERT INTO universe_state VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value",
             (name, value),
         )
-
-    def _migrate_legacy_json(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Copy the old JSON state once when upgrading an existing installation.
-
-        Guarded by a migration_state marker, exactly like
-        ``trade_memory.py``'s ``_migrate_legacy_sqlite``. Fails open: a
-        missing or corrupt legacy file simply leaves the new database empty,
-        never blocking discovery. The old file is never deleted.
-        """
-        if (
-            migration_state.already_done(conn, "json_to_duckdb")
-            or self.legacy_json_path is None
-            or not self.legacy_json_path.is_file()
-        ):
-            return
-        try:
-            raw = json.loads(self.legacy_json_path.read_text(encoding="utf-8"))
-            legacy_state = raw if isinstance(raw, dict) else {}
-        except (OSError, ValueError, json.JSONDecodeError):
-            legacy_state = {}
-        symbols = legacy_state.get("symbols", [])
-        if isinstance(symbols, list) and symbols:
-            rows = [
-                (str(symbol).upper(), rank)
-                for rank, symbol in enumerate(symbols)
-                if self._SYMBOL.fullmatch(str(symbol).upper())
-            ]
-            if rows:
-                conn.executemany(
-                    "INSERT INTO universe_symbols (symbol, rank) VALUES (?, ?) ON CONFLICT (symbol) DO NOTHING",
-                    rows,
-                )
-        try:
-            cursor = int(legacy_state.get("cursor", 0))
-            self._set_state(conn, "cursor", str(cursor))
-        except (TypeError, ValueError):
-            pass
-        refreshed = legacy_state.get("refreshed")
-        if isinstance(refreshed, str) and refreshed:
-            self._set_state(conn, "refreshed", refreshed)
-        learned = legacy_state.get("learned", [])
-        if isinstance(learned, list) and learned:
-            rows = [
-                (str(symbol).upper(), rank)
-                for rank, symbol in enumerate(learned)
-                if self._SYMBOL.fullmatch(str(symbol).upper())
-            ]
-            if rows:
-                conn.executemany(
-                    "INSERT INTO learned_symbols (symbol, last_seen_rank) VALUES (?, ?) ON CONFLICT (symbol) DO NOTHING",
-                    rows,
-                )
-        migration_state.mark_done(conn, "json_to_duckdb")

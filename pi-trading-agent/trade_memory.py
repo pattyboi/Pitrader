@@ -5,7 +5,6 @@ never stores API credentials, account balances, or order identifiers.
 """
 
 import math
-import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,7 +12,6 @@ from pathlib import Path
 
 import duckdb
 
-import migration_state
 from market_sessions import is_next_trading_session
 from ridge_regression import fit_two_feature_ridge
 
@@ -206,7 +204,6 @@ class TradeMemory:
             )
             """
         )
-        migration_state.ensure_table(conn)
 
     @staticmethod
     def _settle_prior_observations(conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float) -> None:
@@ -241,62 +238,16 @@ class TradeMemory:
 
     @contextmanager
     def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
-        """Ensure the directory/schema exist and the legacy sqlite journal is
-        migrated, then hand back a ready connection -- shared prologue for
-        every public method below."""
+        """Ensure the directory/schema exist, then hand back a ready
+        connection -- shared prologue for every public method below."""
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
             yield conn
 
     @staticmethod
     def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
-
-    def _migrate_legacy_sqlite(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Copy the old journal once when upgrading an existing installation.
-
-        This uses Python's built-in SQLite reader rather than DuckDB extensions,
-        so it works on the Pi without fetching or installing an extension.
-        """
-        legacy_path = self.database_path.with_suffix(".sqlite3")
-        if migration_state.already_done(conn, "sqlite_to_duckdb") or not legacy_path.is_file():
-            return
-        try:
-            with sqlite3.connect(legacy_path) as legacy:
-                observations = legacy.execute(
-                    """
-                    SELECT evaluation_date, price_a, price_b, dip_percent, news_score,
-                           signal_present, decision, decision_reason, relative_return_percent
-                    FROM observations
-                    """
-                ).fetchall()
-                executions = legacy.execute(
-                    "SELECT id, evaluation_date, symbol, side, price, quantity FROM executions"
-                ).fetchall()
-        except sqlite3.Error:
-            # A malformed or incompatible old file must not stop trading. The
-            # new database remains usable and can be reviewed independently.
-            return
-        if observations:
-            conn.executemany(
-                """
-                INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(evaluation_date) DO NOTHING
-                """,
-                observations,
-            )
-        if executions:
-            conn.executemany(
-                """
-                INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                executions,
-            )
-        migration_state.mark_done(conn, "sqlite_to_duckdb")
-        conn.commit()
 
     def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:
         count = len(rows)

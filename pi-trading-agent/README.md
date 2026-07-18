@@ -236,19 +236,17 @@ agent also creates `.last_email_report`. That small file contains only the date
 of the most recently sent report and prevents duplicates after a restart. The
 adaptive model creates `.news_learning_state.json` to preserve its observations.
 Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
-snapshots, decisions, and fills (never credentials or balances).
-On upgrade, an existing `.trade_memory.sqlite3` journal is imported once without
-requiring a DuckDB extension download. Portfolio memory keeps its own DuckDB
-database, `.portfolio_memory.duckdb`, of every evaluated symbol's daily
-context and settled next-session returns (see "Portfolio memory: learning
-across the whole watchlist" below). The local symbol cross-reference keeps
-its own small DuckDB database, `.symbol_reference.duckdb`.
+snapshots, decisions, and fills (never credentials or balances). Portfolio
+memory keeps its own DuckDB database, `.portfolio_memory.duckdb`, of every
+evaluated symbol's daily context and settled next-session returns (see
+"Portfolio memory: learning across the whole watchlist" below). The local
+symbol cross-reference keeps its own small DuckDB database,
+`.symbol_reference.duckdb`.
 `.portfolio_rotation_state.json` remembers a staged replacement (sold one
 symbol, not yet bought its replacement) so restarts cannot strand the cash,
 and autonomous discovery keeps its own small DuckDB database,
 `.autonomous_universe.duckdb`, tracking the discovery cursor and learned
-watchlist. On upgrade, an existing `.autonomous_universe.json` is imported
-into it once, the same way the legacy `.trade_memory.sqlite3` journal is.
+watchlist.
 
 ## Quick start
 

@@ -618,7 +618,6 @@ def build_strategy(
             "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
             "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
             "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
-            "portfolio_universe_state_file": str(base_dir / ".autonomous_universe.json"),
             "portfolio_universe_database_file": str(base_dir / ".autonomous_universe.duckdb"),
             "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
             "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],

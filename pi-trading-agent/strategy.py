@@ -2324,7 +2324,6 @@ This automated message is not financial advice.
             int(self.parameters["portfolio_discovery_refresh_days"]),
             int(self.parameters["portfolio_discovery_batch_size"]),
             paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
-            legacy_json_path=Path(str(self.parameters["portfolio_universe_state_file"])),
         )
 
     def _symbol_reference(self) -> SymbolReference:

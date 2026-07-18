@@ -5,7 +5,6 @@ from decimal import Decimal
 import json
 import logging
 import os
-import sqlite3
 import stat
 import subprocess
 import threading
@@ -302,28 +301,6 @@ def test_autonomous_candidates_are_not_managed_until_a_buy_is_confirmed(
     assert universe.managed_symbols() == []
 
 
-def test_autonomous_universe_migrates_legacy_json_once(tmp_path: Path) -> None:
-    legacy = tmp_path / "universe.json"
-    legacy.write_text(
-        json.dumps({"symbols": ["AAPL", "MSFT"], "cursor": 1, "refreshed": "2026-07-01", "learned": ["AAPL"]})
-    )
-    database_path = tmp_path / "universe.duckdb"
-
-    universe = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
-    assert universe.managed_symbols() == []
-    with duckdb.connect(str(database_path)) as conn:
-        cursor = conn.execute("SELECT value FROM universe_state WHERE name = 'cursor'").fetchone()[0]
-        learned = conn.execute("SELECT symbol FROM learned_symbols").fetchone()[0]
-    assert cursor == "1"
-    assert learned == "AAPL"
-
-    # Migration only ever runs once: changing the legacy file afterward must
-    # not re-import or overwrite already-migrated state.
-    legacy.write_text(json.dumps({"symbols": [], "cursor": 0, "refreshed": "2026-07-02", "learned": ["ZZZZ"]}))
-    universe_again = AutonomousUniverse(database_path, refresh_days=7, batch_size=5, legacy_json_path=legacy)
-    assert universe_again.managed_symbols() == []
-
-
 def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
     noise_filter = _DropOptionalLumiwealthWarning()
 
@@ -523,42 +500,6 @@ def test_due_iteration_window_is_none_once_both_windows_completed() -> None:
         )
         is None
     )
-
-
-def test_decision_memory_uses_duckdb_and_imports_legacy_sqlite(tmp_path: Path) -> None:
-    legacy_path = tmp_path / ".trade_memory.sqlite3"
-    with sqlite3.connect(legacy_path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE observations (
-                evaluation_date TEXT PRIMARY KEY, price_a REAL, price_b REAL,
-                dip_percent REAL, news_score INTEGER, signal_present INTEGER,
-                decision TEXT, decision_reason TEXT, relative_return_percent REAL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE executions (
-                id INTEGER PRIMARY KEY, evaluation_date TEXT, symbol TEXT,
-                side TEXT, price REAL, quantity REAL
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO observations VALUES
-            ('2026-01-02', 100, 100, -2, NULL, 1, 'hold', 'legacy', 1.5)
-            """
-        )
-        conn.commit()
-
-    memory = TradeMemory(tmp_path / ".trade_memory.duckdb", 1, 10)
-    result = memory.update_and_forecast("2026-01-05", 101.0, 102.0, -2.0, None, True)
-
-    assert (tmp_path / ".trade_memory.duckdb").is_file()
-    assert result.observations == 1
-    memory.record_execution("2026-01-05", "SPY", "buy", 102.0, 1.0)
 
 
 def test_posture_adjusted_edge_keeps_the_expected_profit_floor_unchanged() -> None:
