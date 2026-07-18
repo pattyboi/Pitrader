@@ -6,11 +6,14 @@ never stores API credentials, account balances, or order identifiers.
 
 import math
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
 
+import migration_state
 from market_sessions import is_next_trading_session
 from ridge_regression import fit_two_feature_ridge
 
@@ -56,10 +59,7 @@ class TradeMemory:
         observations train the model, preventing ordinary market days from
         diluting the decision-specific evidence.
         """
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
+        with self._open() as conn:
             self._settle_prior_observations(conn, evaluation_date, price_a, price_b)
             conn.execute(
                 """
@@ -97,10 +97,7 @@ class TradeMemory:
         if len(rows) < 2:
             return 0
         inserted = 0
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
+        with self._open() as conn:
             before = self._observation_count(conn)
             for (date, price_a, price_b, dip, signal), (_, next_a, next_b, _, _) in zip(
                 rows, rows[1:]
@@ -133,9 +130,7 @@ class TradeMemory:
 
     def record_decision(self, evaluation_date: str, decision: str, reason: str) -> None:
         """Attach the final decision to today's already-recorded snapshot."""
-        with self._connect() as conn:
-            self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
+        with self._open() as conn:
             conn.execute(
                 "UPDATE observations SET decision = ?, decision_reason = ? WHERE evaluation_date = ?",
                 (decision[:40], reason[:500], evaluation_date),
@@ -144,9 +139,7 @@ class TradeMemory:
 
     def record_execution(self, evaluation_date: str, symbol: str, side: str, price: float, quantity: float) -> None:
         """Keep an immutable local record of broker-confirmed fills."""
-        with self._connect() as conn:
-            self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
+        with self._open() as conn:
             conn.execute(
                 """
                 INSERT INTO executions (id, evaluation_date, symbol, side, price, quantity)
@@ -163,10 +156,7 @@ class TradeMemory:
         correction that avoids claiming 0% or 100% certainty from a small
         sample. It only reads outcomes recorded before the current decision.
         """
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
-            self._migrate_legacy_sqlite(conn)
+        with self._open() as conn:
             observations, wins = conn.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(CASE WHEN relative_return_percent > 0 THEN 1 ELSE 0 END), 0)
@@ -216,13 +206,7 @@ class TradeMemory:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS migration_state (
-                name TEXT PRIMARY KEY
-            )
-            """
-        )
+        migration_state.ensure_table(conn)
 
     @staticmethod
     def _settle_prior_observations(conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float) -> None:
@@ -255,6 +239,17 @@ class TradeMemory:
         """Open the host-native analytical store used for decision memory."""
         return duckdb.connect(str(self.database_path))
 
+    @contextmanager
+    def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Ensure the directory/schema exist and the legacy sqlite journal is
+        migrated, then hand back a ready connection -- shared prologue for
+        every public method below."""
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            self._migrate_legacy_sqlite(conn)
+            yield conn
+
     @staticmethod
     def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
@@ -266,10 +261,7 @@ class TradeMemory:
         so it works on the Pi without fetching or installing an extension.
         """
         legacy_path = self.database_path.with_suffix(".sqlite3")
-        migrated = conn.execute(
-            "SELECT 1 FROM migration_state WHERE name = 'sqlite_to_duckdb'"
-        ).fetchone()
-        if migrated or not legacy_path.is_file():
+        if migration_state.already_done(conn, "sqlite_to_duckdb") or not legacy_path.is_file():
             return
         try:
             with sqlite3.connect(legacy_path) as legacy:
@@ -303,7 +295,7 @@ class TradeMemory:
                 """,
                 executions,
             )
-        conn.execute("INSERT INTO migration_state VALUES ('sqlite_to_duckdb')")
+        migration_state.mark_done(conn, "sqlite_to_duckdb")
         conn.commit()
 
     def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:

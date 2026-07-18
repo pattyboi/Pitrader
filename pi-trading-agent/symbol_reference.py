@@ -14,6 +14,8 @@ already-collected news-to-symbol association is trustworthy enough to use.
 
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -94,14 +96,12 @@ class SymbolReference:
         symbols = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
         if not symbols:
             return False
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
         # The interval applies to already-known symbols, not to the whole
         # database. Autonomous discovery changes the candidate list every day;
         # newly seen symbols must be enriched immediately even when the last
         # full refresh happened recently.
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             last_refreshed = conn.execute(
                 "SELECT value FROM refresh_state WHERE name = 'last_refreshed'"
             ).fetchone()
@@ -163,8 +163,7 @@ class SymbolReference:
         if not source_succeeded:
             return False
 
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             for record in records:
                 conn.execute(
                     """
@@ -221,8 +220,7 @@ class SymbolReference:
         if not self.database_path.is_file():
             return set()
         try:
-            with self._connect() as conn:
-                self._create_schema(conn)
+            with self._open() as conn:
                 rows = conn.execute("SELECT ticker FROM symbols").fetchall()
             return {row[0] for row in rows}
         except Exception:
@@ -236,8 +234,7 @@ class SymbolReference:
         if not normalized:
             return {}
         try:
-            with self._connect() as conn:
-                self._create_schema(conn)
+            with self._open() as conn:
                 placeholders = ", ".join("?" for _ in normalized)
                 rows = conn.execute(
                     f"SELECT ticker, alpaca_name, sec_name FROM symbols "
@@ -287,6 +284,15 @@ class SymbolReference:
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path))
+
+    @contextmanager
+    def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Ensure the directory/schema exist, then hand back a ready
+        connection -- shared prologue for every call site above."""
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            yield conn
 
     @staticmethod
     def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:

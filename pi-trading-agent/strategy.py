@@ -13,7 +13,7 @@ from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from lumibot.strategies import Strategy
 
@@ -997,12 +997,16 @@ This automated message is not financial advice.
             ),
         )
 
-    def _update_adaptive_learning(
+    def _update_news_learning(
         self,
         price_b: float,
-        news_context: NewsContext,
+        state_file_key: str,
+        news_score: int | None,
+        log_prefix: str = "",
     ) -> LearningResult:
-        """Update the persistent model and return its explainable forecast."""
+        """Shared body for _update_adaptive_learning/_update_llm_adaptive_learning:
+        persist one day's (price, news_score) observation to the named state
+        file and return its explainable forecast."""
         if not bool(self.parameters.get("news_learning_enabled", True)):
             return LearningResult(
                 observations=0,
@@ -1014,7 +1018,7 @@ This automated message is not financial advice.
             )
         try:
             model = AdaptiveNewsModel(
-                state_path=Path(str(self.parameters["news_learning_state_file"])),
+                state_path=Path(str(self.parameters[state_file_key])),
                 minimum_observations=int(
                     self.parameters["news_learning_min_observations"]
                 ),
@@ -1025,13 +1029,13 @@ This automated message is not financial advice.
             result = model.update(
                 evaluation_date=self.get_datetime().date().isoformat(),
                 current_price=price_b,
-                news_score=news_context.score if news_context.available else None,
+                news_score=news_score,
             )
-            self.log_message(result.explanation, color="blue")
+            self.log_message(f"{log_prefix}{result.explanation}", color="blue")
             return result
         except Exception as exc:
             self.log_message(
-                f"Adaptive news learning failed safely: {type(exc).__name__}: {exc}",
+                f"{log_prefix}Adaptive news learning failed safely: {type(exc).__name__}: {exc}",
                 color="red",
             )
             return LearningResult(
@@ -1042,6 +1046,18 @@ This automated message is not financial advice.
                 None,
                 f"Learning update failed: {type(exc).__name__}: {exc}",
             )
+
+    def _update_adaptive_learning(
+        self,
+        price_b: float,
+        news_context: NewsContext,
+    ) -> LearningResult:
+        """Update the persistent model and return its explainable forecast."""
+        return self._update_news_learning(
+            price_b,
+            "news_learning_state_file",
+            news_context.score if news_context.available else None,
+        )
 
     def _update_llm_adaptive_learning(
         self,
@@ -1056,45 +1072,12 @@ This automated message is not financial advice.
         is how that disagreement gets resolved with evidence instead of by
         assumption. Purely observational for now: this forecast is reported
         alongside the keyword one but does not feed _market_veto_reason."""
-        if not bool(self.parameters.get("news_learning_enabled", True)):
-            return LearningResult(
-                observations=0,
-                ready=False,
-                predicted_return_percent=None,
-                slope=None,
-                correlation=None,
-                explanation="Adaptive news learning is disabled in config.json.",
-            )
-        try:
-            model = AdaptiveNewsModel(
-                state_path=Path(str(self.parameters["news_learning_llm_state_file"])),
-                minimum_observations=int(
-                    self.parameters["news_learning_min_observations"]
-                ),
-                maximum_observations=int(
-                    self.parameters["news_learning_max_observations"]
-                ),
-            )
-            result = model.update(
-                evaluation_date=self.get_datetime().date().isoformat(),
-                current_price=price_b,
-                news_score=llm_assessment.score if llm_assessment.available else None,
-            )
-            self.log_message(f"LLM-score {result.explanation}", color="blue")
-            return result
-        except Exception as exc:
-            self.log_message(
-                f"LLM-score adaptive news learning failed safely: {type(exc).__name__}: {exc}",
-                color="red",
-            )
-            return LearningResult(
-                0,
-                False,
-                None,
-                None,
-                None,
-                f"Learning update failed: {type(exc).__name__}: {exc}",
-            )
+        return self._update_news_learning(
+            price_b,
+            "news_learning_llm_state_file",
+            llm_assessment.score if llm_assessment.available else None,
+            log_prefix="LLM-score ",
+        )
 
     def _update_decision_memory(
         self,
@@ -2438,48 +2421,44 @@ This automated message is not financial advice.
             )
             return symbols
 
-    def _remember_discovered_symbols(self, symbols: list[str]) -> None:
+    def _guarded_universe_call(self, action: Callable[[], None], error_message: str) -> None:
+        """Shared guard for every AutonomousUniverse write: no-op unless
+        portfolio_autonomous_discovery is on, and any failure is logged,
+        never raised, since discovery bookkeeping must never block a
+        trading decision."""
         if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
             return
         try:
-            self._autonomous_universe().remember(symbols)
+            action()
         except Exception as exc:
-            self.log_message(f"Could not persist learned symbols: {type(exc).__name__}: {exc}", color="yellow")
+            self.log_message(f"{error_message}: {type(exc).__name__}: {exc}", color="yellow")
+
+    def _remember_discovered_symbols(self, symbols: list[str]) -> None:
+        self._guarded_universe_call(
+            lambda: self._autonomous_universe().remember(symbols),
+            "Could not persist learned symbols",
+        )
 
     def _exclude_unpriceable_discovered_symbols(self, symbols: list[str]) -> None:
         """Stop a discovery-only symbol with no Alpaca price history from resurfacing."""
-        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
-            return
-        try:
-            self._autonomous_universe().exclude_unpriceable(symbols)
-        except Exception as exc:
-            self.log_message(
-                f"Could not persist unpriceable symbols: {type(exc).__name__}: {exc}", color="yellow"
-            )
+        self._guarded_universe_call(
+            lambda: self._autonomous_universe().exclude_unpriceable(symbols),
+            "Could not persist unpriceable symbols",
+        )
 
     def _remember_confirmed_portfolio_symbol(self, symbol: str) -> None:
         """Grant management permission only after a broker-confirmed buy fill."""
-        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
-            return
-        try:
-            self._autonomous_universe().remember_owned([str(symbol).upper()])
-        except Exception as exc:
-            self.log_message(
-                f"Could not persist strategy ownership: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
+        self._guarded_universe_call(
+            lambda: self._autonomous_universe().remember_owned([str(symbol).upper()]),
+            "Could not persist strategy ownership",
+        )
 
     def _forget_confirmed_portfolio_symbol(self, symbol: str) -> None:
         """Revoke discovery management permission after the position is sold."""
-        if not bool(self.parameters.get("portfolio_autonomous_discovery", False)):
-            return
-        try:
-            self._autonomous_universe().forget_owned([str(symbol).upper()])
-        except Exception as exc:
-            self.log_message(
-                f"Could not revoke strategy ownership: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
+        self._guarded_universe_call(
+            lambda: self._autonomous_universe().forget_owned([str(symbol).upper()]),
+            "Could not revoke strategy ownership",
+        )
 
     def _submit_portfolio_builds(
         self,

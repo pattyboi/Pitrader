@@ -12,6 +12,8 @@ a caller can simply skip the article.
 import json
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from datetime import date
 from pathlib import Path
@@ -121,9 +123,17 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(DB_PATH))
 
 
-def _load_verdict(verdict_date: str, url: str, digest: str) -> dict | None:
+@contextmanager
+def _open() -> Iterator[duckdb.DuckDBPyConnection]:
+    """Ensure the directory/schema exist, then hand back a ready
+    connection -- shared prologue for both call sites below."""
     with _connect() as conn:
         _create_schema(conn)
+        yield conn
+
+
+def _load_verdict(verdict_date: str, url: str, digest: str) -> dict | None:
+    with _open() as conn:
         row = conn.execute(
             "SELECT verdict_json FROM verdicts "
             "WHERE verdict_date = ? AND url = ? AND watchlist_digest = ?",
@@ -133,8 +143,7 @@ def _load_verdict(verdict_date: str, url: str, digest: str) -> dict | None:
 
 
 def _save_verdict(verdict_date: str, url: str, digest: str, result: dict) -> None:
-    with _connect() as conn:
-        _create_schema(conn)
+    with _open() as conn:
         conn.execute(
             "INSERT INTO verdicts (verdict_date, url, watchlist_digest, verdict_json) "
             "VALUES (?, ?, ?, ?) ON CONFLICT (verdict_date, url, watchlist_digest) DO NOTHING",

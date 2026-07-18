@@ -10,11 +10,15 @@ pattern) and never deleted.
 
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
 import requests
+
+import migration_state
 
 
 class AutonomousUniverse:
@@ -41,9 +45,7 @@ class AutonomousUniverse:
         self.legacy_json_path = legacy_json_path
 
     def next_batch(self, api_key: str, secret_key: str) -> list[str]:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             self._migrate_legacy_json(conn)
             refreshed_value = self._get_state(conn, "refreshed")
             cursor_value = self._get_state(conn, "cursor")
@@ -71,8 +73,7 @@ class AutonomousUniverse:
                 and item.get("fractionable") is True
                 and self._SYMBOL.fullmatch(str(item.get("symbol", "")).upper())
             )
-            with self._connect() as conn:
-                self._create_schema(conn)
+            with self._open() as conn:
                 conn.execute("DELETE FROM universe_symbols")
                 if symbols:
                     conn.executemany(
@@ -89,8 +90,7 @@ class AutonomousUniverse:
             return []
         batch = [symbols[(cursor + offset) % len(symbols)] for offset in range(min(self.batch_size, len(symbols)))]
         new_cursor = (cursor + len(batch)) % len(symbols)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             self._set_state(conn, "cursor", str(new_cursor))
             learned = [
                 row[0]
@@ -117,9 +117,7 @@ class AutonomousUniverse:
         )
         if not valid:
             return
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             self._migrate_legacy_json(conn)
             next_rank = (
                 conn.execute("SELECT COALESCE(MAX(last_seen_rank), 0) FROM learned_symbols").fetchone()[0] or 0
@@ -149,9 +147,7 @@ class AutonomousUniverse:
         only after it is in the configured watchlist or this persisted list.
         """
         try:
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as conn:
-                self._create_schema(conn)
+            with self._open() as conn:
                 self._migrate_legacy_json(conn)
                 rows = conn.execute("SELECT symbol FROM owned_symbols ORDER BY symbol").fetchall()
                 conn.commit()
@@ -170,9 +166,7 @@ class AutonomousUniverse:
         )
         if not valid:
             return
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             conn.executemany(
                 "INSERT INTO owned_symbols (symbol) VALUES (?) ON CONFLICT DO NOTHING",
                 [(symbol,) for symbol in valid],
@@ -198,9 +192,7 @@ class AutonomousUniverse:
         )
         if not valid:
             return
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             conn.executemany(
                 "INSERT INTO unpriceable_symbols (symbol) VALUES (?) ON CONFLICT DO NOTHING",
                 [(symbol,) for symbol in valid],
@@ -221,8 +213,7 @@ class AutonomousUniverse:
         )
         if not valid:
             return
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             placeholders = ", ".join("?" for _ in valid)
             conn.execute(
                 f"DELETE FROM owned_symbols WHERE symbol IN ({placeholders})", valid
@@ -231,6 +222,17 @@ class AutonomousUniverse:
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path))
+
+    @contextmanager
+    def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Ensure the directory/schema exist, then hand back a ready
+        connection -- shared prologue for every call site below. Does not
+        run `_migrate_legacy_json` itself: only some call sites need it, so
+        each keeps its own explicit call exactly where it was before."""
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            yield conn
 
     @staticmethod
     def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -272,13 +274,7 @@ class AutonomousUniverse:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS migration_state (
-                name TEXT PRIMARY KEY
-            )
-            """
-        )
+        migration_state.ensure_table(conn)
 
     @staticmethod
     def _get_state(conn: duckdb.DuckDBPyConnection, name: str) -> str | None:
@@ -300,10 +296,11 @@ class AutonomousUniverse:
         missing or corrupt legacy file simply leaves the new database empty,
         never blocking discovery. The old file is never deleted.
         """
-        migrated = conn.execute(
-            "SELECT 1 FROM migration_state WHERE name = 'json_to_duckdb'"
-        ).fetchone()
-        if migrated or self.legacy_json_path is None or not self.legacy_json_path.is_file():
+        if (
+            migration_state.already_done(conn, "json_to_duckdb")
+            or self.legacy_json_path is None
+            or not self.legacy_json_path.is_file()
+        ):
             return
         try:
             raw = json.loads(self.legacy_json_path.read_text(encoding="utf-8"))
@@ -342,4 +339,4 @@ class AutonomousUniverse:
                     "INSERT INTO learned_symbols (symbol, last_seen_rank) VALUES (?, ?) ON CONFLICT (symbol) DO NOTHING",
                     rows,
                 )
-        conn.execute("INSERT INTO migration_state VALUES ('json_to_duckdb')")
+        migration_state.mark_done(conn, "json_to_duckdb")

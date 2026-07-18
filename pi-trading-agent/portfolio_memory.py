@@ -9,6 +9,8 @@ qualifying symbol's daily observation contribute to the same model.
 """
 
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -52,9 +54,7 @@ class PortfolioMemory:
         with ordinary non-dip market days. The extra fact columns are
         durable context for the day, not model inputs.
         """
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             self._settle_prior_observations(conn, symbol, evaluation_date, price)
             conn.execute(
                 """
@@ -100,9 +100,7 @@ class PortfolioMemory:
         """
         if not rows:
             return 0
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            self._create_schema(conn)
+        with self._open() as conn:
             before = self._observation_count(conn)
             for date, dip, next_return in rows:
                 if not math.isfinite(dip) or not math.isfinite(next_return):
@@ -199,6 +197,15 @@ class PortfolioMemory:
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path))
+
+    @contextmanager
+    def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Ensure the directory/schema exist, then hand back a ready
+        connection -- shared prologue for every public method above."""
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            self._create_schema(conn)
+            yield conn
 
     @staticmethod
     def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
