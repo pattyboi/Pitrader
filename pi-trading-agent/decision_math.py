@@ -9,6 +9,8 @@ aliases onto these functions so its own call sites and tests are unaffected.
 
 import math
 
+import numpy as np
+
 # How strongly the risky/conservative reasoning pattern reshapes a symbol's
 # historical edge in posture_adjusted_edge: conservative leans on consistency
 # (penalizing variance and bad-news days harder), risky leans on raw edge
@@ -39,14 +41,43 @@ def walk_forward_net_returns(
     event. This prevents a candidate's realised return from helping select
     itself, unlike an in-sample average.
     """
+    if minimum_observations >= len(returns):
+        return []
+    running_net_sum = sum(returns[:minimum_observations]) - (
+        round_trip_cost_percent * minimum_observations
+    )
     outcomes: list[float] = []
     for index in range(minimum_observations, len(returns)):
-        prior_net_mean = (
-            sum(value - round_trip_cost_percent for value in returns[:index]) / index
-        )
+        prior_net_mean = running_net_sum / index
         if prior_net_mean >= entry_threshold_percent:
             outcomes.append(returns[index] - round_trip_cost_percent)
+        running_net_sum += returns[index] - round_trip_cost_percent
     return outcomes
+
+
+def historical_dip_returns(
+    highs: np.ndarray,
+    closes: np.ndarray,
+    lookback: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return aligned historical dip sizes and next-session returns.
+
+    Each dip uses only the preceding ``lookback`` highs. The final bar has no
+    known next-session return, so it is intentionally excluded.
+    """
+    count = min(highs.size, closes.size)
+    if lookback < 1 or count <= lookback + 1:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty
+    highs = np.asarray(highs[:count], dtype=np.float64)
+    closes = np.asarray(closes[:count], dtype=np.float64)
+    prior_windows = np.lib.stride_tricks.sliding_window_view(highs, lookback)
+    prior_highs = prior_windows[: count - lookback - 1].max(axis=1)
+    event_closes = closes[lookback:-1]
+    next_closes = closes[lookback + 1 :]
+    dips = ((prior_highs - event_closes) / prior_highs) * 100.0
+    next_returns = ((next_closes - event_closes) / event_closes) * 100.0
+    return dips, next_returns
 
 
 def posture_adjusted_edge(
@@ -111,10 +142,13 @@ def optimal_position_count(
 
     best_n = 1
     best_score = float("-inf")
-    for n in range(1, ceiling + 1):
-        top = candidate_edges[:n]
-        mean_edge = sum(edge for edge, _ in top) / n
-        mean_variance = sum(stdev * stdev for _, stdev in top) / n
+    edge_sum = 0.0
+    variance_sum = 0.0
+    for n, (edge, stdev) in enumerate(candidate_edges[:ceiling], start=1):
+        edge_sum += edge
+        variance_sum += stdev * stdev
+        mean_edge = edge_sum / n
+        mean_variance = variance_sum / n
         portfolio_stdev = math.sqrt(mean_variance / n)
         score = mean_edge / portfolio_stdev if portfolio_stdev > 0 else mean_edge * 1e6
         if score > best_score:

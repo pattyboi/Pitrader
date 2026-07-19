@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from lumibot.strategies import Strategy
+import numpy as np
 
 import article_filter
 import decision_math
@@ -25,7 +26,7 @@ from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
 from news_context import NewsContext, WorldEventAnalyzer
-from portfolio_memory import PortfolioMemory
+from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 from symbol_reference import SymbolReference
 
@@ -1144,11 +1145,66 @@ class AssetRotationStrategy(Strategy):
             )
 
     def _portfolio_memory(self) -> PortfolioMemory:
-        return PortfolioMemory(
-            database_path=Path(str(self.parameters["portfolio_memory_database_file"])),
-            minimum_observations=int(self.parameters["portfolio_memory_min_observations"]),
-            maximum_observations=int(self.parameters["portfolio_memory_max_observations"]),
+        key = (
+            str(self.parameters["portfolio_memory_database_file"]),
+            int(self.parameters["portfolio_memory_min_observations"]),
+            int(self.parameters["portfolio_memory_max_observations"]),
         )
+        cached = getattr(self, "_portfolio_memory_instance", None)
+        if cached is None or getattr(self, "_portfolio_memory_key", None) != key:
+            cached = PortfolioMemory(
+                database_path=Path(key[0]),
+                minimum_observations=key[1],
+                maximum_observations=key[2],
+            )
+            self._portfolio_memory_instance = cached
+            self._portfolio_memory_key = key
+        return cached
+
+    def _update_portfolio_memories(
+        self,
+        signals: list[dict[str, Any]],
+        symbol_news_scores: dict[str, int],
+        market_wide_news_score: int | None,
+    ) -> dict[str, RotationForecast]:
+        """Record and forecast every evaluated symbol with one pooled fit."""
+        if not signals:
+            return {}
+        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
+            disabled = RotationForecast(
+                0, False, None, None, "Portfolio memory is disabled in config.json."
+            )
+            return {str(signal["symbol"]): disabled for signal in signals}
+        inputs = [
+            PortfolioMemoryInput(
+                symbol=str(signal["symbol"]),
+                price=float(signal["price"]),
+                dip_percent=float(signal["dip"]),
+                news_score=symbol_news_scores.get(
+                    str(signal["symbol"]), market_wide_news_score
+                ),
+                signal_present=bool(signal.get("qualifies")),
+                live_spread_percent=signal.get("live_spread_percent"),
+                recent_avg_volume=signal.get("recent_avg_volume"),
+                historical_expected_profit=signal.get("expected_profit"),
+                historical_win_probability=signal.get("win_probability"),
+                historical_return_stdev=signal.get("return_stdev"),
+            )
+            for signal in signals
+        ]
+        try:
+            return self._portfolio_memory().update_many_and_forecast(
+                self.get_datetime().date().isoformat(), inputs
+            )
+        except Exception as exc:
+            self.log_message(
+                f"Portfolio memory batch update failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            failed = RotationForecast(
+                0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
+            )
+            return {item.symbol: failed for item in inputs}
 
     def _update_portfolio_memory(
         self,
@@ -1202,7 +1258,11 @@ class AssetRotationStrategy(Strategy):
                 0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
             )
 
-    def _backfill_portfolio_memory(self, symbol: str) -> None:
+    def _backfill_portfolio_memory(
+        self,
+        symbol: str,
+        history: list[tuple[str, float, float]] | None = None,
+    ) -> None:
         """Seed one symbol's pooled memory from settled daily bars, once ever.
 
         Mirrors _backfill_decision_memory's price-only, once-per-symbol
@@ -1216,31 +1276,33 @@ class AssetRotationStrategy(Strategy):
         if not bool(self.parameters.get("portfolio_memory_enabled", True)):
             return
         try:
-            bars = self.get_historical_prices(
-                symbol, int(self.parameters["portfolio_analysis_days"]), "day"
-            )
-            if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
-                return
-            rows = [
-                (str(index.date() if hasattr(index, "date") else index), float(row["high"]), float(row["close"]))
-                for index, row in bars.df[["high", "close"]].dropna().iterrows()
-                if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
-                and float(row["high"]) > 0 and float(row["close"]) > 0
-            ]
-            lookback = int(self.parameters["recent_high_lookback_days"])
-            threshold = float(self.parameters["dip_threshold_percent"])
-            history = []
-            # Same full-windows-only, previous-lookback-high loop _portfolio_signal
-            # already uses, so backfilled dips match how the live check measures them.
-            for position in range(lookback, len(rows) - 1):
-                recent_high = max(row[1] for row in rows[position - lookback : position])
-                close = rows[position][2]
-                dip = ((recent_high - close) / recent_high) * 100.0
-                if dip < threshold:
-                    continue
-                next_close = rows[position + 1][2]
-                next_return = ((next_close - close) / close) * 100.0
-                history.append((rows[position][0], dip, next_return))
+            if history is None:
+                bars = self.get_historical_prices(
+                    symbol, int(self.parameters["portfolio_analysis_days"]), "day"
+                )
+                if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
+                    return
+                frame = bars.df[["high", "close"]].dropna()
+                values = frame.to_numpy(dtype=np.float64, copy=False)
+                valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
+                values = values[valid]
+                dates = frame.index[valid]
+                lookback = int(self.parameters["recent_high_lookback_days"])
+                threshold = float(self.parameters["dip_threshold_percent"])
+                dips, next_returns = decision_math.historical_dip_returns(
+                    values[:, 0], values[:, 1], lookback
+                )
+                selected = dips >= threshold
+                history = [
+                    (
+                        str(date.date() if hasattr(date, "date") else date),
+                        float(dip),
+                        float(next_return),
+                    )
+                    for date, dip, next_return in zip(
+                        dates[lookback:-1][selected], dips[selected], next_returns[selected]
+                    )
+                ]
             inserted = self._portfolio_memory().backfill_history(symbol, history)
             if inserted:
                 self.log_message(
@@ -1585,7 +1647,7 @@ class AssetRotationStrategy(Strategy):
 
     def _portfolio_signal(
         self, symbol: str
-    ) -> dict[str, float | int | str | bool | None] | None:
+    ) -> dict[str, Any] | None:
         """Compute today's per-symbol trade context, whether or not it qualifies.
 
         Returns ``None`` only when there isn't enough data to say anything
@@ -1615,14 +1677,13 @@ class AssetRotationStrategy(Strategy):
                     self._unpriceable_symbols_this_iteration = set()
                 self._unpriceable_symbols_this_iteration.add(symbol)
             return None
-        rows = [
-            (float(row["high"]), float(row["close"]))
-            for _, row in bars.df[["high", "close"]].dropna().iterrows()
-            if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
-            and float(row["high"]) > 0 and float(row["close"]) > 0
-        ]
+        frame = bars.df[["high", "close"]].dropna()
+        values = frame.to_numpy(dtype=np.float64, copy=False)
+        valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
+        values = values[valid]
+        dates = frame.index[valid]
         lookback = int(self.parameters["recent_high_lookback_days"])
-        if len(rows) <= lookback:
+        if len(values) <= lookback:
             return None
         price = self.get_last_price(symbol)
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
@@ -1647,16 +1708,22 @@ class AssetRotationStrategy(Strategy):
         if min_avg_volume > 0 and volume_available and (recent_avg_volume is None or recent_avg_volume < min_avg_volume):
             return None
         threshold = float(self.parameters["dip_threshold_percent"])
-        returns: list[float] = []
-        # Historical dips are measured against the *previous* lookback bars,
-        # excluding the event day's own high, to match the live check below
-        # (which compares today's price against already-completed bars).
-        for index in range(lookback, len(rows) - 1):
-            recent_high = max(high for high, _ in rows[index - lookback : index])
-            dip = ((recent_high - rows[index][1]) / recent_high) * 100.0
-            if dip >= threshold:
-                returns.append(((rows[index + 1][1] - rows[index][1]) / rows[index][1]) * 100.0)
-        recent_high = max(high for high, _ in rows[-lookback:])
+        dips, historical_returns = decision_math.historical_dip_returns(
+            values[:, 0], values[:, 1], lookback
+        )
+        selected = dips >= threshold
+        returns = historical_returns[selected].tolist()
+        memory_history = [
+            (
+                str(date.date() if hasattr(date, "date") else date),
+                float(dip),
+                float(next_return),
+            )
+            for date, dip, next_return in zip(
+                dates[lookback:-1][selected], dips[selected], historical_returns[selected]
+            )
+        ]
+        recent_high = float(values[-lookback:, 0].max())
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         configured_round_trip_cost = float(
             self.parameters.get("portfolio_round_trip_cost_percent", 0.20)
@@ -1682,16 +1749,16 @@ class AssetRotationStrategy(Strategy):
         return_stdev: float | None = None
         win_probability: float | None = None
         if returns:
-            net_returns = [value - round_trip_cost for value in returns]
+            net_returns = np.asarray(returns, dtype=np.float64) - round_trip_cost
             walk_forward_returns = self._walk_forward_net_returns(
                 returns,
                 round_trip_cost,
                 int(self.parameters.get("portfolio_oos_min_observations", 10)),
                 float(self.parameters["portfolio_min_expected_profit_percent"]),
             )
-            mean_net_return = sum(net_returns) / len(net_returns)
-            variance = sum((value - mean_net_return) ** 2 for value in net_returns) / len(net_returns)
-            wins = sum(1 for value in net_returns if value > 0)
+            mean_net_return = float(net_returns.mean())
+            variance = float(net_returns.var())
+            wins = int(np.count_nonzero(net_returns > 0))
             expected_profit = mean_net_return
             observations = len(returns)
             oos_expected_profit = (
@@ -1729,6 +1796,7 @@ class AssetRotationStrategy(Strategy):
             # that PortfolioMemory now records for every evaluated symbol.
             "live_spread_percent": live_spread,
             "recent_avg_volume": recent_avg_volume,
+            "_memory_history": memory_history,
         }
 
     def _portfolio_signals(
@@ -2754,6 +2822,28 @@ class AssetRotationStrategy(Strategy):
         # gates on the raw historical expected_profit, unaffected by posture.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
         market_wide_news_score = news_context.score if news_context.available else None
+        pending_backfill = {
+            str(signal["symbol"]): signal.get("_memory_history", [])
+            for signal in signals
+            if str(signal["symbol"]) not in self.vars.portfolio_memory_backfilled_symbols
+        }
+        if pending_backfill and bool(self.parameters.get("portfolio_memory_enabled", True)):
+            self.vars.portfolio_memory_backfilled_symbols.update(pending_backfill)
+            try:
+                inserted = self._portfolio_memory().backfill_many(pending_backfill)
+                if inserted:
+                    self.log_message(
+                        f"Portfolio-memory historical backfill added {inserted} pooled observations.",
+                        color="blue",
+                    )
+            except Exception as exc:
+                self.log_message(
+                    f"Portfolio-memory batch backfill failed safely: {type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+        forecasts = self._update_portfolio_memories(
+            signals, symbol_news_scores, market_wide_news_score
+        )
         for signal in signals:
             symbol = str(signal["symbol"])
             # A symbol with dedicated coverage today (even a genuinely
@@ -2768,22 +2858,9 @@ class AssetRotationStrategy(Strategy):
             # symbol" means. signal_present keeps the pooled regression
             # trained on decision-specific dip days only, exactly like
             # trade_memory.py's own signal_present column, so broader daily
-            # coverage doesn't dilute the forecast. Sequential, not
-            # parallelized, to avoid concurrent DuckDB writes from multiple
-            # threads.
-            self._backfill_portfolio_memory(symbol)
-            forecast = self._update_portfolio_memory(
-                symbol,
-                float(signal["price"]),
-                float(signal["dip"]),
-                news_score,
-                signal_present=qualifies,
-                live_spread_percent=signal.get("live_spread_percent"),
-                recent_avg_volume=signal.get("recent_avg_volume"),
-                historical_expected_profit=signal.get("expected_profit"),
-                historical_win_probability=signal.get("win_probability"),
-                historical_return_stdev=signal.get("return_stdev"),
-            )
+            # coverage doesn't dilute the forecast. All database writes and
+            # the pooled fit were performed once above for the full batch.
+            forecast = forecasts[symbol]
             # Ranking/eligibility fields are only meaningful -- and only ever
             # read downstream -- for a symbol that qualifies today; leaving
             # them absent/None for the rest reproduces exactly how these

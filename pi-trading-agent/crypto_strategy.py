@@ -34,13 +34,14 @@ from typing import Any, Callable
 
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
+import numpy as np
 
 import decision_math
 import email_render
 import signal_snapshot
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
-from portfolio_memory import PortfolioMemory
+from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 
 _CRYPTO_BASE_SYMBOL = re.compile(r"^[A-Z0-9]{1,10}$")
@@ -500,7 +501,7 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Signal --------------------------------------------------------------
 
-    def _crypto_signal(self, symbol: str) -> dict[str, float | int | str | bool | None] | None:
+    def _crypto_signal(self, symbol: str) -> dict[str, Any] | None:
         """Compute today's dip signal for symbol. Mirrors
         AssetRotationStrategy._portfolio_signal (strategy.py), minus the
         discovery-liquidity-floor checks that don't apply to crypto's tiny,
@@ -519,26 +520,34 @@ class CryptoRotationStrategy(Strategy):
             with self._unpriceable_symbols_lock:
                 self._unpriceable_symbols_this_iteration.add(symbol)
             return None
-        rows = [
-            (float(row["high"]), float(row["close"]))
-            for _, row in bars.df[["high", "close"]].dropna().iterrows()
-            if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
-            and float(row["high"]) > 0 and float(row["close"]) > 0
-        ]
+        frame = bars.df[["high", "close"]].dropna()
+        values = frame.to_numpy(dtype=np.float64, copy=False)
+        valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
+        values = values[valid]
+        dates = frame.index[valid]
         lookback = int(self.parameters["crypto_recent_high_lookback_days"])
-        if len(rows) <= lookback:
+        if len(values) <= lookback:
             return None
         price = self.get_last_price(base, quote=self.quote_asset)
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
         threshold = float(self.parameters["crypto_dip_threshold_percent"])
-        returns: list[float] = []
-        for index in range(lookback, len(rows) - 1):
-            recent_high = max(high for high, _ in rows[index - lookback : index])
-            dip = ((recent_high - rows[index][1]) / recent_high) * 100.0
-            if dip >= threshold:
-                returns.append(((rows[index + 1][1] - rows[index][1]) / rows[index][1]) * 100.0)
-        recent_high = max(high for high, _ in rows[-lookback:])
+        dips, historical_returns = decision_math.historical_dip_returns(
+            values[:, 0], values[:, 1], lookback
+        )
+        selected = dips >= threshold
+        returns = historical_returns[selected].tolist()
+        memory_history = [
+            (
+                str(date.date() if hasattr(date, "date") else date),
+                float(dip),
+                float(next_return),
+            )
+            for date, dip, next_return in zip(
+                dates[lookback:-1][selected], dips[selected], historical_returns[selected]
+            )
+        ]
+        recent_high = float(values[-lookback:, 0].max())
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         configured_round_trip_cost = float(self.parameters.get("crypto_round_trip_cost_percent", 0.50))
         live_spread = self._crypto_live_spread_percent(symbol)
@@ -552,16 +561,16 @@ class CryptoRotationStrategy(Strategy):
         return_stdev: float | None = None
         win_probability: float | None = None
         if returns:
-            net_returns = [value - round_trip_cost for value in returns]
+            net_returns = np.asarray(returns, dtype=np.float64) - round_trip_cost
             walk_forward_returns = decision_math.walk_forward_net_returns(
                 returns,
                 round_trip_cost,
                 int(self.parameters.get("crypto_oos_min_observations", 10)),
                 float(self.parameters["crypto_min_expected_profit_percent"]),
             )
-            mean_net_return = sum(net_returns) / len(net_returns)
-            variance = sum((value - mean_net_return) ** 2 for value in net_returns) / len(net_returns)
-            wins = sum(1 for value in net_returns if value > 0)
+            mean_net_return = float(net_returns.mean())
+            variance = float(net_returns.var())
+            wins = int(np.count_nonzero(net_returns > 0))
             expected_profit = mean_net_return
             observations = len(returns)
             oos_expected_profit = (
@@ -583,6 +592,7 @@ class CryptoRotationStrategy(Strategy):
             "win_probability": win_probability,
             "round_trip_cost": round_trip_cost,
             "live_spread_percent": live_spread,
+            "_memory_history": memory_history,
         }
 
     def _crypto_signals(self, symbols: list[str]) -> list[dict[str, Any] | None]:
@@ -601,14 +611,28 @@ class CryptoRotationStrategy(Strategy):
     # next_session_predicate instead of the NYSE-session-based default) -----
 
     def _crypto_memory(self) -> PortfolioMemory:
-        return PortfolioMemory(
-            database_path=Path(str(self.parameters["crypto_memory_database_file"])),
-            minimum_observations=int(self.parameters["crypto_memory_min_observations"]),
-            maximum_observations=int(self.parameters["crypto_memory_max_observations"]),
-            next_session_predicate=is_next_calendar_day,
+        key = (
+            str(self.parameters["crypto_memory_database_file"]),
+            int(self.parameters["crypto_memory_min_observations"]),
+            int(self.parameters["crypto_memory_max_observations"]),
         )
+        cached = getattr(self, "_crypto_memory_instance", None)
+        if cached is None or getattr(self, "_crypto_memory_key", None) != key:
+            cached = PortfolioMemory(
+                database_path=Path(key[0]),
+                minimum_observations=key[1],
+                maximum_observations=key[2],
+                next_session_predicate=is_next_calendar_day,
+            )
+            self._crypto_memory_instance = cached
+            self._crypto_memory_key = key
+        return cached
 
-    def _backfill_crypto_memory(self, symbol: str) -> None:
+    def _backfill_crypto_memory(
+        self,
+        symbol: str,
+        history: list[tuple[str, float, float]] | None = None,
+    ) -> None:
         """Seed one symbol's pooled memory from settled daily bars, once ever."""
         backfilled = self.vars.crypto_memory_backfilled_symbols
         if symbol in backfilled:
@@ -617,32 +641,36 @@ class CryptoRotationStrategy(Strategy):
         if not bool(self.parameters.get("crypto_memory_enabled", True)):
             return
         try:
-            bars = self.get_historical_prices(
-                self._crypto_asset(symbol),
-                int(self.parameters["crypto_analysis_days"]),
-                "day",
-                quote=self.quote_asset,
-            )
-            if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
-                return
-            rows = [
-                (str(index.date() if hasattr(index, "date") else index), float(row["high"]), float(row["close"]))
-                for index, row in bars.df[["high", "close"]].dropna().iterrows()
-                if math.isfinite(float(row["high"])) and math.isfinite(float(row["close"]))
-                and float(row["high"]) > 0 and float(row["close"]) > 0
-            ]
-            lookback = int(self.parameters["crypto_recent_high_lookback_days"])
-            threshold = float(self.parameters["crypto_dip_threshold_percent"])
-            history = []
-            for position in range(lookback, len(rows) - 1):
-                recent_high = max(row[1] for row in rows[position - lookback : position])
-                close = rows[position][2]
-                dip = ((recent_high - close) / recent_high) * 100.0
-                if dip < threshold:
-                    continue
-                next_close = rows[position + 1][2]
-                next_return = ((next_close - close) / close) * 100.0
-                history.append((rows[position][0], dip, next_return))
+            if history is None:
+                bars = self.get_historical_prices(
+                    self._crypto_asset(symbol),
+                    int(self.parameters["crypto_analysis_days"]),
+                    "day",
+                    quote=self.quote_asset,
+                )
+                if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
+                    return
+                frame = bars.df[["high", "close"]].dropna()
+                values = frame.to_numpy(dtype=np.float64, copy=False)
+                valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
+                values = values[valid]
+                dates = frame.index[valid]
+                lookback = int(self.parameters["crypto_recent_high_lookback_days"])
+                threshold = float(self.parameters["crypto_dip_threshold_percent"])
+                dips, next_returns = decision_math.historical_dip_returns(
+                    values[:, 0], values[:, 1], lookback
+                )
+                selected = dips >= threshold
+                history = [
+                    (
+                        str(date.date() if hasattr(date, "date") else date),
+                        float(dip),
+                        float(next_return),
+                    )
+                    for date, dip, next_return in zip(
+                        dates[lookback:-1][selected], dips[selected], next_returns[selected]
+                    )
+                ]
             inserted = self._crypto_memory().backfill_history(symbol, history)
             if inserted:
                 self.log_message(
@@ -691,6 +719,42 @@ class CryptoRotationStrategy(Strategy):
                 color="yellow",
             )
             return RotationForecast(0, False, None, None, f"Crypto memory failed: {type(exc).__name__}: {exc}")
+
+    def _update_crypto_memories(
+        self, signals: list[dict[str, Any]], evaluation_date: str
+    ) -> dict[str, RotationForecast]:
+        if not signals:
+            return {}
+        if not bool(self.parameters.get("crypto_memory_enabled", True)):
+            disabled = RotationForecast(
+                0, False, None, None, "Crypto memory is disabled in config.json."
+            )
+            return {str(signal["symbol"]): disabled for signal in signals}
+        inputs = [
+            PortfolioMemoryInput(
+                symbol=str(signal["symbol"]),
+                price=float(signal["price"]),
+                dip_percent=float(signal["dip"]),
+                news_score=None,
+                signal_present=bool(signal.get("qualifies")),
+                live_spread_percent=signal.get("live_spread_percent"),
+                historical_expected_profit=signal.get("expected_profit"),
+                historical_win_probability=signal.get("win_probability"),
+                historical_return_stdev=signal.get("return_stdev"),
+            )
+            for signal in signals
+        ]
+        try:
+            return self._crypto_memory().update_many_and_forecast(evaluation_date, inputs)
+        except Exception as exc:
+            self.log_message(
+                f"Crypto memory batch update failed safely: {type(exc).__name__}: {exc}",
+                color="yellow",
+            )
+            failed = RotationForecast(
+                0, False, None, None, f"Crypto memory failed: {type(exc).__name__}: {exc}"
+            )
+            return {item.symbol: failed for item in inputs}
 
     # -- Autonomous discovery (mirrors AssetRotationStrategy's
     # _autonomous_universe/_portfolio_symbols/_managed_portfolio_symbols and
@@ -1127,21 +1191,32 @@ class CryptoRotationStrategy(Strategy):
         oos_min_observations = int(self.parameters.get("crypto_oos_min_observations", 10))
         oos_min_profit = float(self.parameters.get("crypto_oos_min_net_profit_percent", 0.0))
         eligible: list[dict[str, Any]] = []
+        signals = list(signals_by_symbol.values())
+        pending_backfill = {
+            str(signal["symbol"]): signal.get("_memory_history", [])
+            for signal in signals
+            if str(signal["symbol"]) not in self.vars.crypto_memory_backfilled_symbols
+        }
+        if pending_backfill and bool(self.parameters.get("crypto_memory_enabled", True)):
+            self.vars.crypto_memory_backfilled_symbols.update(pending_backfill)
+            try:
+                inserted = self._crypto_memory().backfill_many(pending_backfill)
+                if inserted:
+                    self.log_message(
+                        f"Crypto-memory historical backfill added {inserted} pooled observations.",
+                        color="blue",
+                    )
+            except Exception as exc:
+                self.log_message(
+                    f"Crypto-memory batch backfill failed safely: {type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+        forecasts = self._update_crypto_memories(signals, today.isoformat())
         # Every evaluated symbol -- not just one clearing today's dip
         # threshold -- contributes a daily learning observation to the pooled
         # memory, mirroring AssetRotationStrategy's _run_portfolio_iteration.
         for symbol, signal in signals_by_symbol.items():
-            self._backfill_crypto_memory(symbol)
-            forecast = self._update_crypto_memory(
-                symbol,
-                float(signal["price"]),
-                float(signal["dip"]),
-                signal_present=bool(signal.get("qualifies")),
-                live_spread_percent=signal.get("live_spread_percent"),
-                historical_expected_profit=signal.get("expected_profit"),
-                historical_win_probability=signal.get("win_probability"),
-                historical_return_stdev=signal.get("return_stdev"),
-            )
+            forecast = forecasts[symbol]
             if not bool(signal.get("qualifies")) or symbol in held_working or symbol in exited_this_pass:
                 signal["learned_edge_ready"] = False
                 signal["learned_edge"] = None

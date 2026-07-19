@@ -10,11 +10,13 @@ import subprocess
 import threading
 
 import duckdb
+import numpy as np
 import pandas as pd
 import pytest
 
 import article_filter
 import autonomous_universe
+import decision_math
 import llm_news
 import signal_snapshot
 import token_estimate
@@ -24,7 +26,7 @@ from llm_news import LLMNewsAnalyzer
 from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_is_open
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
-from portfolio_memory import PortfolioMemory
+from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from symbol_reference import SymbolReference
 from crypto_strategy import CryptoRotationStrategy, _crypto_asset_symbol_filter
 from strategy import AssetRotationStrategy
@@ -305,6 +307,42 @@ def test_portfolio_memory_records_daily_facts_for_a_non_qualifying_symbol(tmp_pa
         ).fetchone()
 
     assert row == pytest.approx((0, 0.3, 1_000_000.0, 0.8, 0.6, 1.2))
+
+
+def test_portfolio_memory_batches_updates_and_forecasts(tmp_path: Path) -> None:
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=2, maximum_observations=50)
+    assert memory.backfill_many(
+        {
+            "SPY": [("2026-01-02", 5.0, 1.0)],
+            "AAPL": [("2026-01-02", 6.0, 2.0)],
+        }
+    ) == 2
+
+    forecasts = memory.update_many_and_forecast(
+        "2026-01-05",
+        [
+            PortfolioMemoryInput("MSFT", 100.0, 5.5, 0),
+            PortfolioMemoryInput("NVDA", 200.0, 6.5, None, signal_present=False),
+        ],
+    )
+
+    assert set(forecasts) == {"MSFT", "NVDA"}
+    assert all(forecast.ready for forecast in forecasts.values())
+    with duckdb.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE evaluation_date = '2026-01-05'"
+        ).fetchone()[0] == 2
+
+
+def test_historical_dip_returns_excludes_event_day_high_and_final_bar() -> None:
+    highs = np.array([10.0, 12.0, 11.0, 15.0, 14.0])
+    closes = np.array([9.0, 11.0, 9.0, 12.0, 13.0])
+
+    dips, returns = decision_math.historical_dip_returns(highs, closes, lookback=2)
+
+    assert dips == pytest.approx([25.0, 0.0])
+    assert returns == pytest.approx([100.0 / 3.0, 100.0 / 12.0])
 
 
 def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
