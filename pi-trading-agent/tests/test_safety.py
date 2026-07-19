@@ -430,7 +430,7 @@ def test_portfolio_ignores_unmanaged_account_positions() -> None:
     assert entry_prices == {"SPY": 400.0}
 
 
-def _stub_buy_portfolio_symbol(account_value: float) -> AssetRotationStrategy:
+def _stub_buy_portfolio_symbol(account_value: float, crypto_enabled: bool = True) -> AssetRotationStrategy:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy._rotation_lock = threading.Lock()
     strategy.CASH_BUFFER_FRACTION = AssetRotationStrategy.CASH_BUFFER_FRACTION
@@ -438,6 +438,7 @@ def _stub_buy_portfolio_symbol(account_value: float) -> AssetRotationStrategy:
         "portfolio_cash_reserve_dollars": 0.0,
         "portfolio_min_order_dollars": 5.0,
         "fractional_shares": False,
+        "crypto_enabled": crypto_enabled,
     }
     strategy._has_active_order = lambda symbol, side: False
     strategy.get_cash = lambda: 100.0
@@ -449,10 +450,10 @@ def _stub_buy_portfolio_symbol(account_value: float) -> AssetRotationStrategy:
 
 
 def test_buy_portfolio_symbol_treats_the_crypto_allocation_as_untouchable() -> None:
-    # $100 cash, 1% buffer, no equity reserve, $180 total account value ->
-    # crypto's dynamic 50% share is $90, reserved: only ~$9 is spendable, so
-    # a $5 share buys just 1 share instead of the ~19 it would without the
-    # crypto-share subtraction.
+    # $100 cash, 1% buffer, no equity reserve, crypto enabled, $180 total
+    # account value -> crypto's dynamic 50% share is $90, reserved: only ~$9
+    # is spendable, so a $5 share buys just 1 share instead of the ~19 it
+    # would without the crypto-share subtraction.
     strategy = _stub_buy_portfolio_symbol(account_value=180.0)
     assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "submitted"
 
@@ -462,18 +463,82 @@ def test_buy_portfolio_symbol_is_blocked_once_the_crypto_reserve_exhausts_cash()
     assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "insufficient"
 
 
-def test_account_half_value_dollars_uses_portfolio_value_when_available() -> None:
+def test_buy_portfolio_symbol_uses_full_cash_when_crypto_is_disabled() -> None:
+    # Same $200 total account value that blocked the buy above once crypto's
+    # reserve applies -- with crypto disabled (CRYPTO_ENABLED default false,
+    # the shipped default), there is nothing to reserve, so the full $100
+    # cash (minus the 1% buffer) is spendable and the buy goes through.
+    strategy = _stub_buy_portfolio_symbol(account_value=200.0, crypto_enabled=False)
+    assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "submitted"
+
+
+def test_account_total_value_dollars_uses_portfolio_value_when_available() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.get_portfolio_value = lambda: 300.0
     strategy.get_cash = lambda: 999.0
-    assert strategy._account_half_value_dollars() == 150.0
+    assert strategy._account_total_value_dollars() == 300.0
 
 
-def test_account_half_value_dollars_falls_back_to_cash() -> None:
+def test_account_total_value_dollars_falls_back_to_cash() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.get_portfolio_value = lambda: None
     strategy.get_cash = lambda: 80.0
-    assert strategy._account_half_value_dollars() == 40.0
+    assert strategy._account_total_value_dollars() == 80.0
+
+
+def test_account_total_value_dollars_treats_nan_portfolio_value_as_unusable() -> None:
+    # A NaN broker read must fall back to cash, not propagate -- NaN
+    # comparisons are always False, so a naive `<= 0` guard alone would miss
+    # this and let NaN reach the Decimal-based share-quantity math downstream.
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_portfolio_value = lambda: float("nan")
+    strategy.get_cash = lambda: 50.0
+    assert strategy._account_total_value_dollars() == 50.0
+
+
+def test_account_total_value_dollars_treats_negative_cash_fallback_as_zero() -> None:
+    # A negative cash fallback (e.g. a margin debit) must never produce a
+    # negative "total value" -- that would later get subtracted as a
+    # reserve, increasing spendable cash instead of reserving any of it.
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_portfolio_value = lambda: None
+    strategy.get_cash = lambda: -500.0
+    assert strategy._account_total_value_dollars() == 0.0
+
+
+def test_account_total_value_dollars_is_cached_briefly() -> None:
+    # Lumibot's get_portfolio_value()/get_cash() each force their own fresh
+    # broker round-trip on every call -- without a short cache, every buy
+    # attempt in a multi-candidate pass would pay for its own redundant
+    # network round-trip for a total that barely moves within one iteration.
+    calls = {"count": 0}
+
+    def _get_portfolio_value() -> float:
+        calls["count"] += 1
+        return 300.0
+
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_portfolio_value = _get_portfolio_value
+    strategy.get_cash = lambda: 999.0
+    assert strategy._account_total_value_dollars() == 300.0
+    assert strategy._account_total_value_dollars() == 300.0
+    assert calls["count"] == 1
+
+
+def test_crypto_reserve_dollars_is_zero_when_crypto_disabled() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"crypto_enabled": False}
+    strategy.get_portfolio_value = lambda: 300.0
+    strategy.get_cash = lambda: 999.0
+    assert strategy._crypto_reserve_dollars() == 0.0
+
+
+def test_crypto_reserve_dollars_is_half_the_account_when_crypto_enabled() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"crypto_enabled": True}
+    strategy.get_portfolio_value = lambda: 300.0
+    strategy.get_cash = lambda: 999.0
+    assert strategy._crypto_reserve_dollars() == 150.0
 
 
 def test_crypto_account_half_value_dollars_falls_back_to_cash() -> None:
@@ -481,6 +546,51 @@ def test_crypto_account_half_value_dollars_falls_back_to_cash() -> None:
     strategy.get_portfolio_value = lambda: 0.0
     strategy.get_cash = lambda: 60.0
     assert strategy._account_half_value_dollars() == 30.0
+
+
+def test_crypto_account_half_value_dollars_treats_nan_as_unusable() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.get_portfolio_value = lambda: float("nan")
+    strategy.get_cash = lambda: 40.0
+    assert strategy._account_half_value_dollars() == 20.0
+
+
+def test_crypto_account_half_value_dollars_treats_negative_cash_as_zero() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.get_portfolio_value = lambda: None
+    strategy.get_cash = lambda: -10.0
+    assert strategy._account_half_value_dollars() == 0.0
+
+
+def test_crypto_account_half_value_dollars_is_cached_briefly() -> None:
+    calls = {"count": 0}
+
+    def _get_portfolio_value() -> float:
+        calls["count"] += 1
+        return 60.0
+
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.get_portfolio_value = _get_portfolio_value
+    strategy.get_cash = lambda: 999.0
+    assert strategy._account_half_value_dollars() == 30.0
+    assert strategy._account_half_value_dollars() == 30.0
+    assert calls["count"] == 1
+
+
+def test_crypto_cash_allocation_display_shows_unavailable_when_absent() -> None:
+    # crypto_cash_allocation_dollars is only set partway through
+    # _run_crypto_iteration -- an early return or a caught exception must
+    # not render a misleading "$0.00" in the email in its place.
+    assert CryptoRotationStrategy._crypto_cash_allocation_display({}) == "unavailable"
+
+
+def test_crypto_cash_allocation_display_formats_a_real_value() -> None:
+    assert (
+        CryptoRotationStrategy._crypto_cash_allocation_display(
+            {"crypto_cash_allocation_dollars": 1234.5}
+        )
+        == "$1234.50"
+    )
 
 
 def test_crypto_held_positions_only_counts_managed_crypto_symbols() -> None:

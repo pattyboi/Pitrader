@@ -1196,7 +1196,11 @@ crypto), and targets half of that as its own dynamic cash cap — the equity
 service treats the other half as an untouchable reserve it will never spend
 into, and the crypto service sizes its own buys against that same half. Both
 sides converge on the same 50/50 split without talking to each other,
-because they're reading the same underlying account value. This is enforced
+because they're reading the same underlying account value. If `CRYPTO_ENABLED`
+is false (the shipped default), the equity service has nothing to reserve —
+there's no other pipeline competing for the account's cash — so it uses the
+full account instead of an unexplained half; only turning crypto on actually
+splits the account. This is enforced
 in software, not by the broker: each service reads the account's real-time
 balance independently, so there is a small window (well under a second, in
 practice) where both could act on a slightly stale balance. This is the same

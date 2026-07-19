@@ -24,6 +24,7 @@ import re
 import smtplib
 import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -969,22 +970,44 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Buying --------------------------------------------------------------
 
+    _ACCOUNT_VALUE_CACHE_SECONDS = 30.0
+
     def _account_half_value_dollars(self) -> float:
         """Half of the shared Alpaca account's total value (cash + net equity).
 
-        Mirrors AssetRotationStrategy._account_half_value_dollars (strategy.py)
-        exactly: equity and crypto run as separate processes against the same
-        account and each independently targets a 50/50 split of it, rather
-        than a fixed configured dollar figure, so the two sides converge on
-        the same split without any direct coordination between the two
-        processes. Falls back to cash alone if a fresh broker equity read
-        fails, which can only push this pipeline's share more conservative,
-        never let it overspend.
+        Conceptually mirrors AssetRotationStrategy._crypto_reserve_dollars
+        (strategy.py): equity and crypto run as separate processes against
+        the same account and each independently targets a 50/50 split of
+        it, rather than a fixed configured dollar figure, so the two sides
+        converge on the same split without any direct coordination between
+        the two processes. Unlike equity's reserve, this always halves --
+        there is no "is the other side enabled" check here, since portfolio
+        (equity) mode is not optional and always runs. Falls back to cash
+        alone if a fresh broker equity read fails, and treats a non-finite
+        (NaN/inf) or negative reading as zero available value -- all three
+        failure modes can only push this pipeline's share more
+        conservative, never let it overspend. Cached briefly
+        (_ACCOUNT_VALUE_CACHE_SECONDS) since Lumibot's
+        get_portfolio_value()/get_cash() each force their own fresh broker
+        round-trip on every call with no caching between them.
         """
+        cached = getattr(self, "_account_value_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self._ACCOUNT_VALUE_CACHE_SECONDS:
+            return cached[1]
         total_value = self.get_portfolio_value()
-        if total_value is None or float(total_value) <= 0:
+        if (
+            total_value is None
+            or not math.isfinite(float(total_value))
+            or float(total_value) <= 0
+        ):
             total_value = self.get_cash()
-        return float(total_value or 0.0) * 0.5
+        total_value = float(total_value or 0.0)
+        if not math.isfinite(total_value) or total_value < 0:
+            total_value = 0.0
+        half_value = total_value * 0.5
+        self._account_value_cache = (now, half_value)
+        return half_value
 
     def _buy_crypto_symbol(self, symbol: str, price: float, budget: float) -> str:
         """Buy a fractional quantity within a stated crypto budget.
@@ -1274,6 +1297,18 @@ class CryptoRotationStrategy(Strategy):
     # strategy.py at a smaller scale -- no news/LLM/discovery sections since
     # crypto doesn't have those yet) -----------------------------------------
 
+    @staticmethod
+    def _crypto_cash_allocation_display(report: dict[str, Any]) -> str:
+        """Formats the dynamic cash allocation for the email, matching the
+        'unavailable' convention every other report field in this email
+        already uses -- crypto_cash_allocation_dollars is only set partway
+        through _run_crypto_iteration, so an early return (no symbols
+        configured, positions unavailable) or a caught exception leaves it
+        absent from report; defaulting to 0.0 there would render a
+        misleading '$0.00' instead of disclosing the value is unknown."""
+        allocation = report.get("crypto_cash_allocation_dollars")
+        return f"${float(allocation):.2f}" if allocation is not None else "unavailable"
+
     def _send_crypto_email(self, report: dict[str, Any]) -> None:
         """Send at most one crypto summary email per calendar day."""
         if not bool(self.parameters.get("crypto_email_report_enabled", False)):
@@ -1298,7 +1333,7 @@ class CryptoRotationStrategy(Strategy):
                 f"Signal candidates: {report.get('crypto_candidates', 'unavailable')}",
                 f"Effective max positions today: {report.get('crypto_effective_max_positions', 'unavailable')} "
                 f"(configured ceiling {self.parameters.get('crypto_max_positions', 'unavailable')})",
-                f"Cash allocation: ${float(report.get('crypto_cash_allocation_dollars', 0.0)):.2f}",
+                f"Cash allocation: {self._crypto_cash_allocation_display(report)}",
                 f"Deployed: {report.get('crypto_deployed_dollars', 'unavailable')}",
                 f"Discovered symbols: {report.get('discovered_crypto_symbols', 'none')}",
                 f"Discovery status: {report.get('discovery_status', 'ok')}",
@@ -1343,7 +1378,7 @@ class CryptoRotationStrategy(Strategy):
                 f"{report.get('crypto_effective_max_positions', 'unavailable')} "
                 f"(configured ceiling {self.parameters.get('crypto_max_positions', 'unavailable')})",
             ),
-            ("Cash allocation", f"${float(report.get('crypto_cash_allocation_dollars', 0.0)):.2f}"),
+            ("Cash allocation", self._crypto_cash_allocation_display(report)),
             ("Deployed", report.get("crypto_deployed_dollars", "unavailable")),
             ("Discovered symbols", report.get("discovered_crypto_symbols", "none")),
             ("Discovery status", report.get("discovery_status", "ok")),

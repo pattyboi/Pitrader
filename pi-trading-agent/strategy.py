@@ -7,6 +7,7 @@ import os
 import smtplib
 import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -1394,22 +1395,52 @@ class AssetRotationStrategy(Strategy):
             )
         return None
 
-    def _account_half_value_dollars(self) -> float:
-        """Half of the shared Alpaca account's total value (cash + net equity).
+    _ACCOUNT_VALUE_CACHE_SECONDS = 30.0
 
-        Equity and crypto run as separate processes against the same account
-        and each independently targets a 50/50 split of it, rather than a
-        fixed configured dollar figure -- see _account_half_value_dollars on
-        CryptoRotationStrategy (crypto_strategy.py), which computes the exact
-        same thing so the two sides converge on the same split without any
-        direct coordination between the two processes. Falls back to cash
-        alone if a fresh broker equity read fails, which can only push this
-        pipeline's share more conservative, never let it overspend.
+    def _account_total_value_dollars(self) -> float:
+        """The shared Alpaca account's total value (cash + net equity).
+
+        Falls back to cash alone if a fresh broker equity read fails, and
+        treats a non-finite (NaN/inf) or negative reading as zero available
+        value -- all three failure modes can only push downstream
+        calculations more conservative, never let them overspend, matching
+        this codebase's fail-open convention for a bad broker read. Cached
+        briefly (_ACCOUNT_VALUE_CACHE_SECONDS) since Lumibot's
+        get_portfolio_value()/get_cash() each force their own fresh broker
+        round-trip on every call with no caching between them -- without
+        this, every buy attempt in a multi-candidate pass would pay for its
+        own redundant network round-trip for a total that barely moves
+        within one iteration.
         """
+        cached = getattr(self, "_account_value_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self._ACCOUNT_VALUE_CACHE_SECONDS:
+            return cached[1]
         total_value = self.get_portfolio_value()
-        if total_value is None or float(total_value) <= 0:
+        if (
+            total_value is None
+            or not math.isfinite(float(total_value))
+            or float(total_value) <= 0
+        ):
             total_value = self.get_cash()
-        return float(total_value or 0.0) * 0.5
+        total_value = float(total_value or 0.0)
+        if not math.isfinite(total_value) or total_value < 0:
+            total_value = 0.0
+        self._account_value_cache = (now, total_value)
+        return total_value
+
+    def _crypto_reserve_dollars(self) -> float:
+        """Cash held back for the separate crypto process (main_crypto.py)
+        sharing this Alpaca account: half the account's total value if
+        crypto is actually enabled, else zero -- there is nothing to
+        reserve for a pipeline that never trades. Mirrors
+        CryptoRotationStrategy._account_half_value_dollars
+        (crypto_strategy.py), which has no symmetric "is equity enabled"
+        check since portfolio mode always runs (it is not optional).
+        """
+        if not bool(self.parameters.get("crypto_enabled", False)):
+            return 0.0
+        return self._account_total_value_dollars() * 0.5
 
     def _buy_portfolio_symbol(self, symbol: str, price: float, budget: float) -> str:
         """Buy a whole or fractional quantity within a stated portfolio budget."""
@@ -1418,7 +1449,7 @@ class AssetRotationStrategy(Strategy):
                 return "working"
             spendable = min(float(self.get_cash()), budget) * (1.0 - self.CASH_BUFFER_FRACTION)
             spendable -= float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0))
-            spendable -= self._account_half_value_dollars()
+            spendable -= self._crypto_reserve_dollars()
             if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
                 return "insufficient"
             if bool(self.parameters.get("fractional_shares", False)):
@@ -2853,11 +2884,12 @@ class AssetRotationStrategy(Strategy):
                 signal for signal in eligible if str(signal["symbol"]) not in claimed_symbols
             ]
             # Narrow the configured ceiling to what today's capital (this
-            # pipeline's own 50% share of the shared account, existing
+            # pipeline's own share of the shared account -- the full account
+            # if crypto is disabled, half of it otherwise -- existing
             # holdings plus spendable cash) and candidate quality actually
-            # support -- see _optimal_position_count and
-            # _account_half_value_dollars.
-            total_capital = self._account_half_value_dollars()
+            # support -- see _optimal_position_count, _account_total_value_dollars,
+            # and _crypto_reserve_dollars.
+            total_capital = self._account_total_value_dollars() - self._crypto_reserve_dollars()
             min_order_dollars = float(self.parameters.get("portfolio_min_order_dollars", 1.0))
             candidate_edges = [
                 (float(signal["expected_profit"]), float(signal.get("return_stdev") or 0.0))

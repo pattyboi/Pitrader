@@ -716,6 +716,12 @@ def build_strategy(
         parameters={
             "asset_a": config["ASSET_A"],
             "asset_b": config["ASSET_B"],
+            # So _crypto_reserve_dollars (strategy.py) knows whether there is
+            # another pipeline actually competing for this shared account's
+            # cash -- a crypto-disabled deployment (the shipped default)
+            # should not have its capital halved for a pipeline that never
+            # trades.
+            "crypto_enabled": config["CRYPTO_ENABLED"],
             "dip_threshold_percent": config["DIP_THRESHOLD_PERCENT"],
             "recent_high_lookback_days": config["RECENT_HIGH_LOOKBACK_DAYS"],
             "email_report_enabled": config["EMAIL_REPORT_ENABLED"],
