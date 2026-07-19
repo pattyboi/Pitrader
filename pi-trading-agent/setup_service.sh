@@ -213,7 +213,13 @@ WorkingDirectory=${PROJECT_DIR}
 ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/main_crypto.py
 Restart=always
 RestartSec=30
-TimeoutStopSec=15
+# 30s, not equity's 15s: once this process has run its first iteration (Alpaca
+# websocket connect, per-symbol historical-bar fetches), a SIGINT stop
+# reliably needs a few extra seconds before the process actually exits --
+# py-spy showed every thread idle throughout that stall, so it isn't a slow
+# iteration blocking shutdown, just the signal being noticed late. 30s gives
+# it room to exit cleanly instead of always falling through to SIGKILL.
+TimeoutStopSec=30
 KillSignal=SIGINT
 # Same rationale as trading-agent.service's KillMode -- process (not the
 # default control-group) lets Python's own SIGINT handling exit this
