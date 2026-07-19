@@ -80,6 +80,26 @@ def historical_dip_returns(
     return dips, next_returns
 
 
+def historical_dips(
+    highs: np.ndarray,
+    closes: np.ndarray,
+    lookback: int,
+) -> np.ndarray:
+    """Return each bar's dip from the preceding rolling high.
+
+    Unlike :func:`historical_dip_returns`, this includes the final bar because
+    memory backfills retain that last observation for later settlement.
+    """
+    count = min(highs.size, closes.size)
+    if lookback < 1 or count <= lookback:
+        return np.empty(0, dtype=np.float64)
+    highs = np.asarray(highs[:count], dtype=np.float64)
+    closes = np.asarray(closes[:count], dtype=np.float64)
+    prior_windows = np.lib.stride_tricks.sliding_window_view(highs, lookback)
+    prior_highs = prior_windows[: count - lookback].max(axis=1)
+    return ((prior_highs - closes[lookback:]) / prior_highs) * 100.0
+
+
 def posture_adjusted_edge(
     signal: dict[str, float | int | str | None],
     posture: str,

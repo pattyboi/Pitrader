@@ -14,6 +14,7 @@ already-collected news-to-symbol association is trustworthy enough to use.
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ import duckdb
 import requests
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SYMBOL_REFRESH_WORKERS = 4
 # Same per-mode host split as autonomous_universe.py: paper keys are
 # rejected by the live host and vice versa.
 ALPACA_ASSETS_URL_PAPER = "https://paper-api.alpaca.markets/v2/assets"
@@ -136,36 +138,43 @@ class SymbolReference:
 
         headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
         today = date.today().isoformat()
-        records: list[tuple[str, Any, Any, bool, str]] = []
-        alpaca_source_succeeded = False
-        for symbol in refresh_symbols:
+        def fetch_symbol(symbol: str) -> tuple[bool, tuple[str, Any, Any, bool, str] | None]:
             alpaca_name = None
+            alpaca_succeeded = False
             try:
                 asset = self._alpaca_fetcher(f"{self.assets_url}/{symbol}", headers)
-                alpaca_source_succeeded = True
+                alpaca_succeeded = True
                 if isinstance(asset, dict):
                     alpaca_name = asset.get("name")
             except Exception:
-                alpaca_name = None
+                pass
             sec_name = sec_by_ticker.get(symbol)
             if alpaca_name is None and sec_name is None:
                 # Neither source recognizes this ticker; do not record a bare
                 # entry that would let downstream code trust it.
-                continue
+                return alpaca_succeeded, None
             verified = (
                 alpaca_name is not None
                 and sec_name is not None
                 and self._names_match(alpaca_name, sec_name)
             )
-            records.append((symbol, alpaca_name, sec_name, verified, today))
+            return alpaca_succeeded, (symbol, alpaca_name, sec_name, verified, today)
+
+        with ThreadPoolExecutor(
+            max_workers=min(SYMBOL_REFRESH_WORKERS, len(refresh_symbols)),
+            thread_name_prefix="symbol-reference",
+        ) as executor:
+            fetched = list(executor.map(fetch_symbol, refresh_symbols))
+        alpaca_source_succeeded = any(succeeded for succeeded, _ in fetched)
+        records = [record for _, record in fetched if record is not None]
 
         source_succeeded = sec_source_succeeded or alpaca_source_succeeded
         if not source_succeeded:
             return False
 
         with self._open() as conn:
-            for record in records:
-                conn.execute(
+            if records:
+                conn.executemany(
                     """
                     INSERT INTO symbols (ticker, alpaca_name, sec_name, verified, refreshed_date)
                     VALUES (?, ?, ?, ?, ?)
@@ -175,7 +184,7 @@ class SymbolReference:
                         verified = excluded.verified,
                         refreshed_date = excluded.refreshed_date
                     """,
-                    record,
+                    records,
                 )
             if full_refresh_due:
                 conn.execute(

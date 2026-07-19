@@ -22,6 +22,7 @@ class DuckDBStateStore:
         self.database_path = database_path
         self._schema_initialized = False
         self._lock = RLock()
+        self._connection: duckdb.DuckDBPyConnection | None = None
 
     def get(self, key: str) -> tuple[bool, Any]:
         with self._lock, self._open() as conn:
@@ -58,16 +59,25 @@ class DuckDBStateStore:
     @contextmanager
     def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with duckdb.connect(str(self.database_path)) as conn:
-            if not self._schema_initialized:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS runtime_state (
-                        state_key TEXT PRIMARY KEY,
-                        payload JSON NOT NULL,
-                        updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
-                    )
-                    """
+        if self._connection is None:
+            self._connection = duckdb.connect(str(self.database_path))
+        if not self._schema_initialized:
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_state (
+                    state_key TEXT PRIMARY KEY,
+                    payload JSON NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
                 )
-                self._schema_initialized = True
-            yield conn
+                """
+            )
+            self._schema_initialized = True
+        yield self._connection
+
+    def close(self) -> None:
+        """Release the process-local connection when its owner shuts down."""
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+                self._schema_initialized = False

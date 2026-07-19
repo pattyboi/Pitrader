@@ -1164,18 +1164,19 @@ class AssetRotationStrategy(Strategy):
             ]
             lookback = int(self.parameters["recent_high_lookback_days"])
             threshold = float(self.parameters["dip_threshold_percent"])
+            dips = decision_math.historical_dips(
+                np.asarray([row[2] for row in b_rows], dtype=np.float64),
+                np.asarray([row[1] for row in b_rows], dtype=np.float64),
+                lookback,
+            )
             history = []
-            for position, (date, close_b, high_b) in enumerate(b_rows):
-                # Full windows only, excluding the event day's own high, so
-                # backfilled dips match how the live path measures them.
-                if position < lookback:
-                    continue
+            for (date, close_b, _), dip in zip(b_rows[lookback:], dips):
                 close_a = a_closes.get(date)
                 if close_a is None:
                     continue
-                recent_high = max(row[2] for row in b_rows[position - lookback : position])
-                dip = ((recent_high - close_b) / recent_high) * 100.0
-                history.append((date, close_a, close_b, dip, dip >= threshold))
+                history.append(
+                    (date, close_a, close_b, float(dip), float(dip) >= threshold)
+                )
             inserted = TradeMemory(
                 Path(str(self.parameters["decision_memory_database_file"])),
                 1,
@@ -1634,6 +1635,9 @@ class AssetRotationStrategy(Strategy):
         bid_ask = self._get_bid_ask(symbol)
         if bid_ask is None:
             return None
+        return self._spread_percent_from_bid_ask(bid_ask)
+
+    def _spread_percent_from_bid_ask(self, bid_ask: tuple[float, float]) -> float:
         bid, ask = bid_ask
         mid = (bid + ask) / 2.0
         spread_percent = ((ask - bid) / mid) * 100.0
@@ -1694,7 +1698,7 @@ class AssetRotationStrategy(Strategy):
         return exit_reasons
 
     def _portfolio_signal(
-        self, symbol: str
+        self, symbol: str, bars: Any = None, *, bars_prefetched: bool = False
     ) -> dict[str, Any] | None:
         """Compute today's per-symbol trade context, whether or not it qualifies.
 
@@ -1710,9 +1714,10 @@ class AssetRotationStrategy(Strategy):
         it) -- everything else here is learning context, not a trading signal
         by itself.
         """
-        bars = self.get_historical_prices(
-            symbol, int(self.parameters["portfolio_analysis_days"]), "day"
-        )
+        if not bars_prefetched:
+            bars = self.get_historical_prices(
+                symbol, int(self.parameters["portfolio_analysis_days"]), "day"
+            )
         if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
             # Distinct from the liquidity-floor Nones below: no bars at all
             # means Alpaca has no price history for this symbol, ever -- a
@@ -1733,7 +1738,15 @@ class AssetRotationStrategy(Strategy):
         lookback = int(self.parameters["recent_high_lookback_days"])
         if len(values) <= lookback:
             return None
-        price = self.get_last_price(symbol)
+        # Alpaca's get_last_price() is itself implemented as a quote request.
+        # Reuse that quote for both its midpoint and spread instead of issuing
+        # a second request for the same symbol moments later.
+        bid_ask = self._get_bid_ask(symbol)
+        price = (
+            (bid_ask[0] + bid_ask[1]) / 2.0
+            if bid_ask is not None
+            else self.get_last_price(symbol)
+        )
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
         # A low-priced or thin-volume symbol can still clear the profit/OOS
@@ -1784,7 +1797,11 @@ class AssetRotationStrategy(Strategy):
         # order where the spread is a much larger share of the target edge.
         # Fetched for every symbol reaching this point, not just a qualifying
         # dip, so it becomes one of the daily learning facts too.
-        live_spread = self._live_spread_percent(symbol)
+        live_spread = (
+            self._spread_percent_from_bid_ask(bid_ask)
+            if bid_ask is not None
+            else None
+        )
         round_trip_cost = (
             max(configured_round_trip_cost, live_spread)
             if live_spread is not None
@@ -1855,10 +1872,38 @@ class AssetRotationStrategy(Strategy):
             return []
         with self._unpriceable_symbols_guard():
             self._unpriceable_symbols_this_iteration = set()
+        prefetched: dict[str, Any] | None = None
+        try:
+            batch = self.get_historical_prices_for_assets(
+                symbols,
+                int(self.parameters["portfolio_analysis_days"]),
+                "day",
+                chunk_size=100,
+                max_workers=self._PORTFOLIO_HISTORY_WORKERS,
+            )
+            prefetched = {
+                str(getattr(asset, "symbol", asset)).upper(): bars
+                for asset, bars in batch.items()
+            }
+        except Exception:
+            # Preserve compatibility with alternate/backtesting brokers that
+            # do not implement the multi-asset path.
+            prefetched = None
         with ThreadPoolExecutor(
             max_workers=min(self._PORTFOLIO_HISTORY_WORKERS, len(symbols)),
             thread_name_prefix="portfolio-history",
         ) as executor:
+            if prefetched is not None:
+                return list(
+                    executor.map(
+                        lambda symbol: self._portfolio_signal(
+                            symbol, prefetched[symbol], bars_prefetched=True
+                        )
+                        if symbol in prefetched
+                        else self._portfolio_signal(symbol),
+                        symbols,
+                    )
+                )
             return list(executor.map(self._portfolio_signal, symbols))
 
     def _symbol_news_scores(

@@ -429,6 +429,9 @@ class CryptoRotationStrategy(Strategy):
         bid_ask = self._get_crypto_bid_ask(symbol)
         if bid_ask is None:
             return None
+        return self._crypto_spread_percent_from_bid_ask(bid_ask)
+
+    def _crypto_spread_percent_from_bid_ask(self, bid_ask: tuple[float, float]) -> float:
         bid, ask = bid_ask
         mid = (bid + ask) / 2.0
         spread_percent = ((ask - bid) / mid) * 100.0
@@ -554,15 +557,18 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Signal --------------------------------------------------------------
 
-    def _crypto_signal(self, symbol: str) -> dict[str, Any] | None:
+    def _crypto_signal(
+        self, symbol: str, bars: Any = None, *, bars_prefetched: bool = False
+    ) -> dict[str, Any] | None:
         """Compute today's dip signal for symbol. Mirrors
         AssetRotationStrategy._portfolio_signal (strategy.py), minus the
         discovery-liquidity-floor checks that don't apply to crypto's tiny,
         already-curated Alpaca universe."""
         base = self._crypto_asset(symbol)
-        bars = self.get_historical_prices(
-            base, int(self.parameters["crypto_analysis_days"]), "day", quote=self.quote_asset
-        )
+        if not bars_prefetched:
+            bars = self.get_historical_prices(
+                base, int(self.parameters["crypto_analysis_days"]), "day", quote=self.quote_asset
+            )
         if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
             # No bars at all means Alpaca has no price history for this pair
             # -- a discovery-sourced candidate like this can never qualify,
@@ -581,7 +587,12 @@ class CryptoRotationStrategy(Strategy):
         lookback = int(self.parameters["crypto_recent_high_lookback_days"])
         if len(values) <= lookback:
             return None
-        price = self.get_last_price(base, quote=self.quote_asset)
+        bid_ask = self._get_crypto_bid_ask(symbol)
+        price = (
+            (bid_ask[0] + bid_ask[1]) / 2.0
+            if bid_ask is not None
+            else self.get_last_price(base, quote=self.quote_asset)
+        )
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
         threshold = float(self.parameters["crypto_dip_threshold_percent"])
@@ -603,7 +614,11 @@ class CryptoRotationStrategy(Strategy):
         recent_high = float(values[-lookback:, 0].max())
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         configured_round_trip_cost = float(self.parameters.get("crypto_round_trip_cost_percent", 0.50))
-        live_spread = self._crypto_live_spread_percent(symbol)
+        live_spread = (
+            self._crypto_spread_percent_from_bid_ask(bid_ask)
+            if bid_ask is not None
+            else None
+        )
         round_trip_cost = (
             max(configured_round_trip_cost, live_spread) if live_spread is not None else configured_round_trip_cost
         )
@@ -653,9 +668,38 @@ class CryptoRotationStrategy(Strategy):
             return []
         with self._unpriceable_symbols_lock:
             self._unpriceable_symbols_this_iteration = set()
+        prefetched: dict[str, Any] | None = None
+        try:
+            pairs = [
+                (self._crypto_asset(symbol), self.quote_asset) for symbol in symbols
+            ]
+            batch = self.get_historical_prices_for_assets(
+                pairs,
+                int(self.parameters["crypto_analysis_days"]),
+                "day",
+                chunk_size=100,
+                max_workers=self._CRYPTO_HISTORY_WORKERS,
+            )
+            prefetched = {
+                str(getattr(asset, "symbol", asset)).upper(): bars
+                for asset, bars in batch.items()
+            }
+        except Exception:
+            prefetched = None
         with ThreadPoolExecutor(
             max_workers=min(self._CRYPTO_HISTORY_WORKERS, len(symbols)), thread_name_prefix="crypto-history"
         ) as executor:
+            if prefetched is not None:
+                return list(
+                    executor.map(
+                        lambda symbol: self._crypto_signal(
+                            symbol, prefetched[symbol], bars_prefetched=True
+                        )
+                        if symbol in prefetched
+                        else self._crypto_signal(symbol),
+                        symbols,
+                    )
+                )
             return list(executor.map(self._crypto_signal, symbols))
 
     # -- Pooled cross-symbol memory (mirrors AssetRotationStrategy's
@@ -947,16 +991,19 @@ class CryptoRotationStrategy(Strategy):
             ]
             lookback = int(self.parameters["crypto_recent_high_lookback_days"])
             threshold = float(self.parameters["crypto_dip_threshold_percent"])
+            dips = decision_math.historical_dips(
+                np.asarray([row[2] for row in b_rows], dtype=np.float64),
+                np.asarray([row[1] for row in b_rows], dtype=np.float64),
+                lookback,
+            )
             history = []
-            for position, (date, close_b, high_b) in enumerate(b_rows):
-                if position < lookback:
-                    continue
+            for (date, close_b, _), dip in zip(b_rows[lookback:], dips):
                 close_a = a_closes.get(date)
                 if close_a is None:
                     continue
-                recent_high = max(row[2] for row in b_rows[position - lookback : position])
-                dip = ((recent_high - close_b) / recent_high) * 100.0
-                history.append((date, close_a, close_b, dip, dip >= threshold))
+                history.append(
+                    (date, close_a, close_b, float(dip), float(dip) >= threshold)
+                )
             inserted = self._crypto_decision_memory(
                 int(self.parameters.get("crypto_memory_max_observations", 500))
             ).backfill_history(history)

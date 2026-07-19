@@ -26,6 +26,7 @@ from llm_news import LLMNewsAnalyzer
 from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_is_open
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
+import runtime_state
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
 from symbol_reference import SymbolReference
@@ -346,6 +347,15 @@ def test_historical_dip_returns_excludes_event_day_high_and_final_bar() -> None:
     assert returns == pytest.approx([100.0 / 3.0, 100.0 / 12.0])
 
 
+def test_historical_dips_vectorizes_every_settleable_bar_including_the_final_one() -> None:
+    highs = np.array([10.0, 12.0, 11.0, 15.0, 14.0])
+    closes = np.array([9.0, 11.0, 9.0, 12.0, 13.0])
+
+    dips = decision_math.historical_dips(highs, closes, lookback=2)
+
+    assert dips == pytest.approx([25.0, 0.0, 100.0 / 7.5])
+
+
 def test_duckdb_runtime_state_round_trips_and_deletes_values(tmp_path: Path) -> None:
     store = DuckDBStateStore(tmp_path / "runtime.duckdb")
 
@@ -357,6 +367,31 @@ def test_duckdb_runtime_state_round_trips_and_deletes_values(tmp_path: Path) -> 
     )
     store.delete("portfolio")
     assert store.get("portfolio") == (False, None)
+
+
+def test_duckdb_runtime_state_reuses_its_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_connect = runtime_state.duckdb.connect
+    connections = []
+
+    def counting_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(runtime_state.duckdb, "connect", counting_connect)
+    store = DuckDBStateStore(tmp_path / "runtime.duckdb")
+
+    store.set("one", 1)
+    assert store.get("one") == (True, 1)
+    assert store.get("missing") == (False, None)
+    assert len(connections) == 1
+
+    store.close()
+    assert store.get("one") == (True, 1)
+    assert len(connections) == 2
+    store.close()
 
 
 def test_portfolio_runtime_state_migrates_legacy_json_to_duckdb(tmp_path: Path) -> None:
@@ -1370,6 +1405,25 @@ def test_symbol_reference_refreshes_new_discovery_symbols_within_interval(tmp_pa
     assert reference.verified_symbols() == {"AAPL", "MSFT"}
 
 
+def test_symbol_reference_fetches_symbols_with_bounded_concurrency(tmp_path: Path) -> None:
+    rendezvous = threading.Barrier(2, timeout=2)
+
+    def concurrent_fetcher(url: str, headers: dict) -> dict:
+        rendezvous.wait()
+        symbol = url.rsplit("/", 1)[-1]
+        return {"name": f"{symbol} Corp"}
+
+    reference = SymbolReference(
+        tmp_path / "symbols.duckdb",
+        refresh_days=7,
+        alpaca_fetcher=concurrent_fetcher,
+        sec_fetcher=lambda url, timeout: [],
+    )
+
+    assert reference.refresh(["AAPL", "MSFT"], "key", "secret") is True
+    assert reference.verified_symbols() == {"AAPL", "MSFT"}
+
+
 def test_checked_submission_treats_lumibot_error_status_as_rejection() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     messages: list[str] = []
@@ -1481,6 +1535,50 @@ def test_portfolio_history_requests_use_bounded_concurrency() -> None:
     ]
 
 
+def test_portfolio_history_requests_use_the_multi_asset_path() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"portfolio_analysis_days": 252}
+    bars = {"SPY": object(), "QQQ": object()}
+    calls = []
+    strategy.get_historical_prices_for_assets = lambda assets, *args, **kwargs: (
+        calls.append(list(assets)) or bars
+    )
+    strategy._portfolio_signal = lambda symbol, supplied=None, **kwargs: {
+        "symbol": symbol,
+        "bars": supplied,
+        "prefetched": kwargs.get("bars_prefetched"),
+    }
+
+    results = strategy._portfolio_signals(["SPY", "QQQ"])
+
+    assert calls == [["SPY", "QQQ"]]
+    assert [result["bars"] for result in results] == [bars["SPY"], bars["QQQ"]]
+    assert all(result["prefetched"] for result in results)
+
+
+def test_crypto_history_requests_use_the_multi_asset_path() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_analysis_days": 252}
+    strategy._quote_asset = SimpleNamespace(symbol="USD")
+    strategy._unpriceable_symbols_lock = threading.Lock()
+    bars = {"BTC": object(), "ETH": object()}
+    calls = []
+    strategy.get_historical_prices_for_assets = lambda assets, *args, **kwargs: (
+        calls.append(list(assets)) or bars
+    )
+    strategy._crypto_signal = lambda symbol, supplied=None, **kwargs: {
+        "symbol": symbol,
+        "bars": supplied,
+        "prefetched": kwargs.get("bars_prefetched"),
+    }
+
+    results = strategy._crypto_signals(["BTC", "ETH"])
+
+    assert [[pair[0].symbol for pair in calls[0]]] == [["BTC", "ETH"]]
+    assert [result["bars"] for result in results] == [bars["BTC"], bars["ETH"]]
+    assert all(result["prefetched"] for result in results)
+
+
 def _signal_test_strategy(last_price: float, volume: list[float]) -> AssetRotationStrategy:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {
@@ -1535,6 +1633,19 @@ def test_portfolio_signal_exposes_round_trip_cost_for_memory_blending() -> None:
     result = strategy._portfolio_signal("OK")
 
     assert result["round_trip_cost"] == pytest.approx(0.20)
+
+
+def test_portfolio_signal_reuses_one_quote_for_price_and_spread() -> None:
+    strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
+    strategy.get_last_price = lambda _symbol: pytest.fail(
+        "a valid quote should avoid a second last-price request"
+    )
+    strategy._get_bid_ask = lambda _symbol: (89.0, 91.0)
+
+    result = strategy._portfolio_signal("OK")
+
+    assert result["price"] == pytest.approx(90.0)
+    assert result["live_spread_percent"] == pytest.approx(200.0 / 90.0)
 
 
 def test_portfolio_signal_qualifies_true_when_dip_and_history_both_present() -> None:
