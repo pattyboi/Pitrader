@@ -1,0 +1,9 @@
+# DuckDB-backed runtime state introduced after the repository-level ignore list.
+.runtime_state.duckdb
+.runtime_state.duckdb.*
+.crypto_runtime_state.duckdb
+.crypto_runtime_state.duckdb.*
+.news_learning_state.duckdb
+.news_learning_state.duckdb.*
+.news_learning_state_llm.duckdb
+.news_learning_state_llm.duckdb.*

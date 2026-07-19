@@ -27,6 +27,7 @@ from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
+from runtime_state import DuckDBStateStore
 from symbol_reference import SymbolReference
 from crypto_strategy import CryptoRotationStrategy, _crypto_asset_symbol_filter
 from strategy import AssetRotationStrategy
@@ -343,6 +344,84 @@ def test_historical_dip_returns_excludes_event_day_high_and_final_bar() -> None:
 
     assert dips == pytest.approx([25.0, 0.0])
     assert returns == pytest.approx([100.0 / 3.0, 100.0 / 12.0])
+
+
+def test_duckdb_runtime_state_round_trips_and_deletes_values(tmp_path: Path) -> None:
+    store = DuckDBStateStore(tmp_path / "runtime.duckdb")
+
+    assert store.get("missing") == (False, None)
+    store.set("portfolio", {"symbols": ["SPY", "QQQ"], "ready": True})
+    assert store.get("portfolio") == (
+        True,
+        {"symbols": ["SPY", "QQQ"], "ready": True},
+    )
+    store.delete("portfolio")
+    assert store.get("portfolio") == (False, None)
+
+
+def test_portfolio_runtime_state_migrates_legacy_json_to_duckdb(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "holding_dates.json"
+    legacy_path.write_text('{"spy":"2026-07-18"}\n', encoding="utf-8")
+    database_path = tmp_path / "runtime.duckdb"
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "runtime_state_database_file": str(database_path),
+        "portfolio_holding_state_file": str(legacy_path),
+    }
+
+    assert strategy._load_portfolio_holding_dates() == {"SPY": "2026-07-18"}
+    legacy_path.unlink()
+    assert strategy._load_portfolio_holding_dates() == {"SPY": "2026-07-18"}
+
+
+def test_adaptive_news_state_migrates_legacy_json_to_duckdb(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "learning.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "observations": [{"news_score": -2, "return_percent": 1.5}],
+                "pending": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = AdaptiveNewsModel(
+        tmp_path / "learning.duckdb", minimum_observations=2, maximum_observations=50
+    )
+
+    state = model._load_state()
+
+    assert state["observations"] == [{"news_score": -2, "return_percent": 1.5}]
+    assert (tmp_path / "learning.duckdb").exists()
+
+
+def test_crypto_runtime_state_migrates_rotation_json_to_duckdb(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "crypto_rotation.json"
+    legacy_path.write_text(
+        '{"from":"btc","to":"eth","budget":25.0}\n', encoding="utf-8"
+    )
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "crypto_runtime_state_database_file": str(tmp_path / "crypto_runtime.duckdb"),
+        "crypto_rotation_state_file": str(legacy_path),
+    }
+
+    assert strategy._load_crypto_rotation() == {
+        "from": "BTC",
+        "to": "ETH",
+        "budget": 25.0,
+    }
+    strategy.vars = SimpleNamespace(
+        crypto_pending_rotation={"from": "BTC", "to": "ETH", "budget": 25.0}
+    )
+    strategy._crypto_state_lock = threading.RLock()
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy._set_crypto_rotation(None)
+    legacy_path.write_text(
+        '{"from":"btc","to":"eth","budget":25.0}\n', encoding="utf-8"
+    )
+    assert strategy._load_crypto_rotation() is None
 
 
 def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,6 +27,7 @@ from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
+from runtime_state import DuckDBStateStore
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 from symbol_reference import SymbolReference
 
@@ -163,6 +164,58 @@ class AssetRotationStrategy(Strategy):
         raw = self.parameters.get("portfolio_rotation_state_file")
         return Path(str(raw)) if raw else None
 
+    def _runtime_state(self) -> DuckDBStateStore | None:
+        raw = self.parameters.get("runtime_state_database_file")
+        if not raw:
+            return None
+        path = Path(str(raw))
+        cached = getattr(self, "_runtime_state_store", None)
+        if cached is None or cached.database_path != path:
+            cached = DuckDBStateStore(path)
+            self._runtime_state_store = cached
+        return cached
+
+    def _load_runtime_value(
+        self, key: str, legacy_path: Path | None, *, plain_text: bool = False
+    ) -> tuple[bool, Any]:
+        store = self._runtime_state()
+        if store is not None:
+            found, value = store.get(key)
+            if found:
+                return True, value
+        if legacy_path is None or not legacy_path.exists():
+            return False, None
+        text = legacy_path.read_text(encoding="utf-8")
+        value = text.strip() if plain_text else json.loads(text)
+        if store is not None:
+            store.set(key, value)
+        return True, value
+
+    def _save_runtime_value(
+        self,
+        key: str,
+        value: Any,
+        legacy_path: Path | None,
+        *,
+        delete_empty: bool = False,
+        plain_text: bool = False,
+    ) -> None:
+        store = self._runtime_state()
+        if store is not None:
+            # Persist an explicit empty value as a tombstone. Deleting the key
+            # would make the next restart re-import a stale legacy file.
+            store.set(key, value)
+            return
+        if legacy_path is None:
+            return
+        if delete_empty and not value:
+            legacy_path.unlink(missing_ok=True)
+            return
+        temporary_path = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+        serialized = str(value) if plain_text else json.dumps(value, sort_keys=True)
+        temporary_path.write_text(serialized + "\n", encoding="utf-8")
+        temporary_path.replace(legacy_path)
+
     def _portfolio_state_guard(self) -> threading.RLock:
         """Return the shared lock protecting callback/iteration state swaps."""
         lock = getattr(self, "_portfolio_state_lock", None)
@@ -188,12 +241,13 @@ class AssetRotationStrategy(Strategy):
         keyed shape, defaulting its kind to "replacement" since that format
         couldn't distinguish an Opportunistic Opportunity swap.
         """
-        path = self._portfolio_rotation_state_path()
-        if path is None or not path.exists():
-            return {}
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            found, state = self._load_runtime_value(
+                "portfolio_rotation", self._portfolio_rotation_state_path()
+            )
+            if not found:
+                return {}
+        except Exception:
             return {}
         if isinstance(state, dict) and all(
             isinstance(state.get(key), str) and state[key] for key in ("from", "to")
@@ -229,7 +283,7 @@ class AssetRotationStrategy(Strategy):
         return {"to": target.upper(), "budget": budget, "kind": kind}
 
     def _set_portfolio_rotation(self, state: dict[str, dict[str, Any]]) -> bool:
-        """Persist the whole rotation collection atomically (whole-file swap).
+        """Persist the whole rotation collection in one transaction.
 
         Callers always pass a freshly rebuilt dict rather than mutating the
         live one in place, matching the same discipline already used for
@@ -239,17 +293,14 @@ class AssetRotationStrategy(Strategy):
         with self._portfolio_state_guard():
             previous = self.vars.portfolio_pending_rotation
             self.vars.portfolio_pending_rotation = state
-            path = self._portfolio_rotation_state_path()
-            if path is None:
-                return True
             try:
-                if not state:
-                    path.unlink(missing_ok=True)
-                    return True
-                temporary_path = path.with_suffix(path.suffix + ".tmp")
-                temporary_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
-                temporary_path.replace(path)
-            except OSError as exc:
+                self._save_runtime_value(
+                    "portfolio_rotation",
+                    state,
+                    self._portfolio_rotation_state_path(),
+                    delete_empty=True,
+                )
+            except Exception as exc:
                 self.vars.portfolio_pending_rotation = previous
                 self.log_message(f"Could not persist portfolio rotation state: {exc}", color="red")
                 return False
@@ -292,11 +343,12 @@ class AssetRotationStrategy(Strategy):
 
     def _load_portfolio_holding_dates(self) -> dict[str, str]:
         """Restore broker-confirmed portfolio entry dates after a restart."""
-        path = self._portfolio_holding_state_path()
-        if path is None or not path.exists():
-            return {}
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            found, state = self._load_runtime_value(
+                "portfolio_holding_dates", self._portfolio_holding_state_path()
+            )
+            if not found:
+                return {}
             if not isinstance(state, dict):
                 return {}
             return {
@@ -306,7 +358,7 @@ class AssetRotationStrategy(Strategy):
                 and str(symbol).strip()
                 and self._valid_iso_date(value)
             }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except Exception:
             return {}
 
     @staticmethod
@@ -321,16 +373,11 @@ class AssetRotationStrategy(Strategy):
         with self._portfolio_state_guard():
             previous = self.vars.portfolio_holding_dates
             self.vars.portfolio_holding_dates = dates
-            path = self._portfolio_holding_state_path()
-            if path is None:
-                return
             try:
-                temporary_path = path.with_suffix(path.suffix + ".tmp")
-                temporary_path.write_text(
-                    json.dumps(dates, sort_keys=True) + "\n", encoding="utf-8"
+                self._save_runtime_value(
+                    "portfolio_holding_dates", dates, self._portfolio_holding_state_path()
                 )
-                temporary_path.replace(path)
-            except OSError as exc:
+            except Exception as exc:
                 self.vars.portfolio_holding_dates = previous
                 self.log_message(f"Could not persist portfolio holding dates: {exc}", color="red")
 
@@ -362,11 +409,12 @@ class AssetRotationStrategy(Strategy):
         restart, a crash between the day's two windows would forget the
         first one ran and re-fire it immediately on the next poll.
         """
-        path = self._portfolio_iteration_state_path()
-        if path is None or not path.exists():
-            return self._default_portfolio_iteration_state()
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            found, state = self._load_runtime_value(
+                "portfolio_iteration", self._portfolio_iteration_state_path()
+            )
+            if not found:
+                return self._default_portfolio_iteration_state()
             if not isinstance(state, dict):
                 return self._default_portfolio_iteration_state()
             date_value = str(state.get("date", ""))
@@ -377,21 +425,17 @@ class AssetRotationStrategy(Strategy):
                 "windows_completed": windows,
                 "opportunistic_swap_done": bool(state.get("opportunistic_swap_done", False)),
             }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except Exception:
             return self._default_portfolio_iteration_state()
 
     def _save_portfolio_iteration_state(self) -> None:
-        path = self._portfolio_iteration_state_path()
-        if path is None:
-            return
         try:
-            temporary_path = path.with_suffix(path.suffix + ".tmp")
-            temporary_path.write_text(
-                json.dumps(self.vars.portfolio_iteration_state, sort_keys=True) + "\n",
-                encoding="utf-8",
+            self._save_runtime_value(
+                "portfolio_iteration",
+                self.vars.portfolio_iteration_state,
+                self._portfolio_iteration_state_path(),
             )
-            temporary_path.replace(path)
-        except OSError as exc:
+        except Exception as exc:
             self.log_message(f"Could not persist portfolio iteration state: {exc}", color="red")
 
     def _nightly_preeval_state_path(self) -> Path | None:
@@ -402,34 +446,32 @@ class AssetRotationStrategy(Strategy):
         """Persist the overnight pass's findings so the live iteration's
         email can show what was learned last night (see
         _load_nightly_preeval_learnings). Keyed by date the same way
-        _save_portfolio_iteration_state is, so a stale file from a missed
+        _save_portfolio_iteration_state is, so stale state from a missed
         night is never mistaken for tonight's."""
-        path = self._nightly_preeval_state_path()
-        if path is None:
-            return
         try:
             state = {
                 "date": self.get_datetime().date().isoformat(),
                 "symbol_count": symbol_count,
                 "summary": summary,
             }
-            temporary_path = path.with_suffix(path.suffix + ".tmp")
-            temporary_path.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
-            temporary_path.replace(path)
-        except OSError as exc:
+            self._save_runtime_value(
+                "nightly_preeval", state, self._nightly_preeval_state_path()
+            )
+        except Exception as exc:
             self.log_message(f"Could not persist nightly pre-evaluation state: {exc}", color="red")
 
     def _load_nightly_preeval_learnings(self) -> dict[str, Any]:
         """Today's nightly pre-evaluation summary, or {} if it hasn't run
         yet today (feature disabled, timer hasn't fired, or a stale/corrupt
-        file) -- read once per iteration so the email can show what the
+        record) -- read once per iteration so the email can show what the
         overnight pass found. Fails open like every other state read here.
         """
-        path = self._nightly_preeval_state_path()
-        if path is None or not path.exists():
-            return {}
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            found, state = self._load_runtime_value(
+                "nightly_preeval", self._nightly_preeval_state_path()
+            )
+            if not found:
+                return {}
             if not isinstance(state, dict):
                 return {}
             if state.get("date") != self.get_datetime().date().isoformat():
@@ -438,7 +480,7 @@ class AssetRotationStrategy(Strategy):
                 "summary": str(state.get("summary", "")),
                 "symbol_count": int(state.get("symbol_count", 0)),
             }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except Exception:
             return {}
 
     @staticmethod
@@ -565,8 +607,12 @@ class AssetRotationStrategy(Strategy):
 
         try:
             report_date = self.get_datetime().date().isoformat()
-            state_file = Path(str(self.parameters["email_state_file"]))
-            if state_file.exists() and state_file.read_text(encoding="utf-8").strip() == report_date:
+            raw_state_file = self.parameters.get("email_state_file")
+            state_file = Path(str(raw_state_file)) if raw_state_file else None
+            found, last_report_date = self._load_runtime_value(
+                "last_email_report", state_file, plain_text=True
+            )
+            if found and str(last_report_date) == report_date:
                 return
 
             message = EmailMessage()
@@ -651,7 +697,9 @@ class AssetRotationStrategy(Strategy):
                 smtp.login(str(self.parameters["email_smtp_username"]), password)
                 smtp.send_message(message)
 
-            state_file.write_text(report_date + "\n", encoding="utf-8")
+            self._save_runtime_value(
+                "last_email_report", report_date, state_file, plain_text=True
+            )
             self.log_message(f"Daily email report sent for {report_date}.", color="green")
         except Exception as exc:
             self.log_message(

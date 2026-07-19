@@ -42,6 +42,7 @@ import signal_snapshot
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
+from runtime_state import DuckDBStateStore
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 
 _CRYPTO_BASE_SYMBOL = re.compile(r"^[A-Z0-9]{1,10}$")
@@ -159,6 +160,58 @@ class CryptoRotationStrategy(Strategy):
     def _crypto_state_guard(self) -> threading.RLock:
         return self._crypto_state_lock
 
+    def _runtime_state(self) -> DuckDBStateStore | None:
+        raw = self.parameters.get("crypto_runtime_state_database_file")
+        if not raw:
+            return None
+        path = Path(str(raw))
+        cached = getattr(self, "_runtime_state_store", None)
+        if cached is None or cached.database_path != path:
+            cached = DuckDBStateStore(path)
+            self._runtime_state_store = cached
+        return cached
+
+    def _load_runtime_value(
+        self, key: str, legacy_path: Path | None, *, plain_text: bool = False
+    ) -> tuple[bool, Any]:
+        store = self._runtime_state()
+        if store is not None:
+            found, value = store.get(key)
+            if found:
+                return True, value
+        if legacy_path is None or not legacy_path.exists():
+            return False, None
+        text = legacy_path.read_text(encoding="utf-8")
+        value = text.strip() if plain_text else json.loads(text)
+        if store is not None:
+            store.set(key, value)
+        return True, value
+
+    def _save_runtime_value(
+        self,
+        key: str,
+        value: Any,
+        legacy_path: Path | None,
+        *,
+        delete_empty: bool = False,
+        plain_text: bool = False,
+    ) -> None:
+        store = self._runtime_state()
+        if store is not None:
+            # Persist an explicit null tombstone so a stale legacy rotation
+            # file cannot be imported again after the rotation completes.
+            store.set(key, value)
+            return
+        if legacy_path is None:
+            return
+        if delete_empty and value is None:
+            legacy_path.unlink(missing_ok=True)
+            return
+        temporary_path = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+        serialized = str(value) if plain_text else json.dumps(value, sort_keys=True)
+        temporary_path.write_text(serialized + "\n", encoding="utf-8")
+        temporary_path.replace(legacy_path)
+
     # -- Holding-date state (restart-safe, mirrors AssetRotationStrategy's
     # portfolio_holding_dates in strategy.py) --------------------------------
 
@@ -167,11 +220,12 @@ class CryptoRotationStrategy(Strategy):
         return Path(str(raw)) if raw else None
 
     def _load_crypto_holding_dates(self) -> dict[str, str]:
-        path = self._crypto_holding_state_path()
-        if path is None or not path.exists():
-            return {}
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            found, state = self._load_runtime_value(
+                "crypto_holding_dates", self._crypto_holding_state_path()
+            )
+            if not found:
+                return {}
             if not isinstance(state, dict):
                 return {}
             return {
@@ -179,7 +233,7 @@ class CryptoRotationStrategy(Strategy):
                 for symbol, value in state.items()
                 if isinstance(value, str) and str(symbol).strip() and self._valid_iso_date(value)
             }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except Exception:
             return {}
 
     @staticmethod
@@ -194,14 +248,11 @@ class CryptoRotationStrategy(Strategy):
         with self._crypto_state_guard():
             previous = self.vars.crypto_holding_dates
             self.vars.crypto_holding_dates = dates
-            path = self._crypto_holding_state_path()
-            if path is None:
-                return
             try:
-                temporary_path = path.with_suffix(path.suffix + ".tmp")
-                temporary_path.write_text(json.dumps(dates, sort_keys=True) + "\n", encoding="utf-8")
-                temporary_path.replace(path)
-            except OSError as exc:
+                self._save_runtime_value(
+                    "crypto_holding_dates", dates, self._crypto_holding_state_path()
+                )
+            except Exception as exc:
                 self.vars.crypto_holding_dates = previous
                 self.log_message(f"Could not persist crypto holding dates: {exc}", color="red")
 
@@ -241,12 +292,13 @@ class CryptoRotationStrategy(Strategy):
         return Path(str(raw)) if raw else None
 
     def _load_crypto_rotation(self) -> dict[str, Any] | None:
-        path = self._crypto_rotation_state_path()
-        if path is None or not path.exists():
-            return None
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            found, state = self._load_runtime_value(
+                "crypto_rotation", self._crypto_rotation_state_path()
+            )
+            if not found:
+                return None
+        except Exception:
             return None
         if not isinstance(state, dict):
             return None
@@ -266,17 +318,14 @@ class CryptoRotationStrategy(Strategy):
         with self._crypto_state_guard():
             previous = self.vars.crypto_pending_rotation
             self.vars.crypto_pending_rotation = state
-            path = self._crypto_rotation_state_path()
-            if path is None:
-                return
             try:
-                if state is None:
-                    path.unlink(missing_ok=True)
-                    return
-                temporary_path = path.with_suffix(path.suffix + ".tmp")
-                temporary_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
-                temporary_path.replace(path)
-            except OSError as exc:
+                self._save_runtime_value(
+                    "crypto_rotation",
+                    state,
+                    self._crypto_rotation_state_path(),
+                    delete_empty=True,
+                )
+            except Exception as exc:
                 self.vars.crypto_pending_rotation = previous
                 self.log_message(f"Could not persist crypto rotation state: {exc}", color="red")
 
@@ -290,22 +339,26 @@ class CryptoRotationStrategy(Strategy):
         Persisted (not just in self.vars) so a restart between two crypto
         iterations on the same NYSE-closed day can't allow a second swap.
         """
-        path = self._crypto_opportunistic_swap_state_path()
-        if path is None or not path.exists():
-            return ""
         try:
-            return path.read_text(encoding="utf-8").strip()
-        except OSError:
+            found, value = self._load_runtime_value(
+                "crypto_opportunistic_swap_date",
+                self._crypto_opportunistic_swap_state_path(),
+                plain_text=True,
+            )
+            return str(value) if found else ""
+        except Exception:
             return ""
 
     def _mark_crypto_opportunistic_swap_done(self, today: date_type) -> None:
         self.vars.crypto_opportunistic_swap_date = today.isoformat()
-        path = self._crypto_opportunistic_swap_state_path()
-        if path is None:
-            return
         try:
-            path.write_text(today.isoformat() + "\n", encoding="utf-8")
-        except OSError as exc:
+            self._save_runtime_value(
+                "crypto_opportunistic_swap_date",
+                today.isoformat(),
+                self._crypto_opportunistic_swap_state_path(),
+                plain_text=True,
+            )
+        except Exception as exc:
             self.log_message(f"Could not persist crypto opportunistic-swap state: {exc}", color="red")
 
     # -- Order helpers (broker-generic; mirrors AssetRotationStrategy's
@@ -1390,8 +1443,12 @@ class CryptoRotationStrategy(Strategy):
             return
         try:
             report_date = datetime.now(timezone.utc).date().isoformat()
-            state_file = Path(str(self.parameters["crypto_email_state_file"]))
-            if state_file.exists() and state_file.read_text(encoding="utf-8").strip() == report_date:
+            raw_state_file = self.parameters.get("crypto_email_state_file")
+            state_file = Path(str(raw_state_file)) if raw_state_file else None
+            found, last_report_date = self._load_runtime_value(
+                "crypto_last_email_report", state_file, plain_text=True
+            )
+            if found and str(last_report_date) == report_date:
                 return
 
             message = EmailMessage()
@@ -1437,7 +1494,9 @@ class CryptoRotationStrategy(Strategy):
                 smtp.login(str(self.parameters["email_smtp_username"]), password)
                 smtp.send_message(message)
 
-            state_file.write_text(report_date + "\n", encoding="utf-8")
+            self._save_runtime_value(
+                "crypto_last_email_report", report_date, state_file, plain_text=True
+            )
             self.log_message(f"Crypto daily email report sent for {report_date}.", color="green")
         except Exception as exc:
             self.log_message(f"Crypto daily email report failed safely: {type(exc).__name__}: {exc}", color="red")

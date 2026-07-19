@@ -225,6 +225,7 @@ pi-trading-agent/
 ├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
 ├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
+├── runtime_state.py    Transactional DuckDB store for restart-critical process state
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── rss_news.py         Optional free RSS headline ingestion (no API key)
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
@@ -239,10 +240,12 @@ pi-trading-agent/
 ```
 
 The installer later creates `.venv/`, which contains an isolated Python
-environment. Do not edit that directory. When email reporting is enabled, the
-agent also creates `.last_email_report`. That small file contains only the date
-of the most recently sent report and prevents duplicates after a restart. The
-adaptive model creates `.news_learning_state.json` to preserve its observations.
+environment. Do not edit that directory. Restart-critical equity state,
+including the most recently sent report date, holding dates, pending rotations,
+iteration windows, and nightly pre-evaluation results, is stored transactionally
+in `.runtime_state.duckdb`. The adaptive models create
+`.news_learning_state.duckdb` and `.news_learning_state_llm.duckdb` to preserve
+their observations.
 Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances). Portfolio
 memory keeps its own DuckDB database, `.portfolio_memory.duckdb`, of every
@@ -250,9 +253,9 @@ evaluated symbol's daily context and settled next-session returns (see
 "Portfolio memory: learning across the whole watchlist" below). The local
 symbol cross-reference keeps its own small DuckDB database,
 `.symbol_reference.duckdb`.
-`.portfolio_rotation_state.json` remembers a staged replacement (sold one
-symbol, not yet bought its replacement) so restarts cannot strand the cash,
-and autonomous discovery keeps its own small DuckDB database,
+The runtime-state database remembers a staged replacement (sold one symbol,
+not yet bought its replacement) so restarts cannot strand the cash, and
+autonomous discovery keeps its own small DuckDB database,
 `.autonomous_universe.duckdb`, tracking the discovery cursor and learned
 watchlist.
 
@@ -621,10 +624,10 @@ Look for `Daily email report sent`. The agent does not send a test message at
 startup; it sends after the next scheduled daily evaluation. Check the spam or
 junk folder if the log reports success but the message is not in the inbox.
 
-The `.last_email_report` file is updated only after SMTP reports successful
-delivery. If sending fails, the error is logged and trading continues. The agent
-can try again on another iteration. It will not intentionally send another
-summary for a date already stored in that file.
+The `last_email_report` entry in `.runtime_state.duckdb` is updated only after
+SMTP reports successful delivery. If sending fails, the error is logged and
+trading continues. The agent can try again on another iteration. It will not
+intentionally send another summary for a date already stored there.
 
 To disable reports, set this value and restart the service:
 
@@ -1011,7 +1014,7 @@ Learning safely: 7/20 required completed observations collected.
 During warm-up, the adaptive forecast cannot block a trade. At roughly one
 observation per trading day, 20 observations usually require about four market
 weeks. Restarts do not erase progress because observations are stored in
-`.news_learning_state.json`.
+`.news_learning_state.duckdb`.
 
 #### Learned risk veto
 
@@ -1040,7 +1043,7 @@ state is preserved and becomes available again if learning is re-enabled.
 
 When `LLM_NEWS_ENABLED` is on, the agent trains a second copy of this same
 regression against the LLM assessment's score instead of the keyword score,
-in its own state file (`.news_learning_state_llm.json`) so the two never mix.
+in its own database (`.news_learning_state_llm.duckdb`) so the two never mix.
 It appears in logs and the email as the "LLM-score" learned forecast,
 alongside the keyword-based one above. This second model is purely
 observational for now — it does not veto trades — so over time the two
@@ -1112,18 +1115,18 @@ produce misleading training data. Its daily warm-up therefore remains intact.
 
 #### Resetting learned history
 
-Normally, do not edit the learning-state file. To deliberately start learning
+Normally, do not edit the learning database. To deliberately start learning
 from zero, stop the service, preserve a backup, and restart:
 
 ```bash
 sudo systemctl stop trading-agent.service
-cp .news_learning_state.json .news_learning_state.json.backup
-rm .news_learning_state.json
+cp .news_learning_state.duckdb .news_learning_state.duckdb.backup
+rm .news_learning_state.duckdb
 sudo systemctl start trading-agent.service
 ```
 
-If the state file becomes invalid JSON, the model moves it to a `.corrupt` file
-and starts clean rather than trusting damaged observations.
+Older `.news_learning_state.json` files are imported automatically the first
+time the DuckDB-backed model starts.
 
 ### Portfolio memory: learning across the whole watchlist
 
@@ -1246,12 +1249,11 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 
 ### State files
 
-The crypto service writes only its own files, entirely separate from the
-equity service's `.portfolio_*` files: `.crypto_holding_state.json`,
-`.crypto_rotation_state.json`, `.crypto_opportunistic_swap_state.json`,
-`.crypto_portfolio_memory.duckdb`, `.crypto_trade_memory.duckdb`,
-`.crypto_universe.duckdb` (autonomous discovery), and
-`.crypto_last_email_report`. It also writes `.crypto_signal_snapshot.json`
+The crypto service writes only its own databases, entirely separate from the
+equity service: `.crypto_runtime_state.duckdb`,
+`.crypto_portfolio_memory.duckdb`, `.crypto_trade_memory.duckdb`, and
+`.crypto_universe.duckdb` (autonomous discovery). It also writes
+`.crypto_signal_snapshot.json`
 (equity's counterpart is `.portfolio_signal_snapshot.json`) — see "Viewing
 the agent's current per-symbol opinions" below.
 
@@ -1520,7 +1522,7 @@ Review the logs and Alpaca order activity first. A connection failure or missing
 price immediately after the sale can delay the purchase until the next strategy
 cycle. Insufficient settled cash for the replacement's minimum order size also
 prevents a purchase. The pending rotation is stored in
-`.portfolio_rotation_state.json` (this covers both an ordinary portfolio
+`.runtime_state.duckdb` (this covers both an ordinary portfolio
 replacement and the Opportunistic Opportunity's Asset A → Asset B swap) and
 retried automatically on the next evaluation, including after a rejected
 order or a reboot. Do not manually create a duplicate order until you have
@@ -1561,14 +1563,15 @@ Then check:
 - The recipient's spam or junk folder does not contain the message.
 - The Pi can reach the internet and its clock is correct.
 
-If `.last_email_report` already contains today's date, the report was accepted
-previously and duplicates are being suppressed. Display the date with:
+If the `last_email_report` runtime-state entry already contains today's date,
+the report was accepted previously and duplicates are being suppressed. Inspect
+it with:
 
 ```bash
-cat .last_email_report
+.venv/bin/python -c "import duckdb; print(duckdb.connect('.runtime_state.duckdb').execute(\"SELECT payload FROM runtime_state WHERE state_key='last_email_report'\").fetchone())"
 ```
 
-Do not delete or alter that file merely to force repeated production emails.
+Do not alter that entry merely to force repeated production emails.
 
 ### News is always unavailable
 

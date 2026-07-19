@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from market_sessions import is_next_trading_session
+from runtime_state import DuckDBStateStore
 
 
 @dataclass
@@ -29,6 +30,9 @@ class AdaptiveNewsModel:
         self.state_path = state_path
         self.minimum_observations = minimum_observations
         self.maximum_observations = maximum_observations
+        self._state_store = (
+            DuckDBStateStore(state_path) if state_path.suffix.lower() == ".duckdb" else None
+        )
 
     def update(
         self,
@@ -144,45 +148,68 @@ class AdaptiveNewsModel:
         )
 
     def _load_state(self) -> dict[str, Any]:
+        default = {"version": 1, "observations": [], "pending": None}
+        if self._state_store is not None:
+            found, raw_state = self._state_store.get("adaptive_news_model")
+            if found:
+                try:
+                    return self._validate_state(raw_state)
+                except (ValueError, TypeError):
+                    self._state_store.set("adaptive_news_model", default)
+                    return default
+            # Transparently import the previous JSON file on first use.
+            legacy_path = self.state_path.with_suffix(".json")
+            if legacy_path.exists():
+                state = self._load_json_state(legacy_path)
+                self._state_store.set("adaptive_news_model", state)
+                return state
+            return default
         if not self.state_path.exists():
-            return {"version": 1, "observations": [], "pending": None}
+            return default
+        return self._load_json_state(self.state_path)
+
+    def _load_json_state(self, path: Path) -> dict[str, Any]:
         try:
-            state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            observations = state.get("observations", [])
-            if not isinstance(observations, list):
-                raise ValueError("observations must be a list")
-            # Drop malformed entries so one bad record cannot permanently
-            # break every future fit (valid JSON never reaches the corrupt-file
-            # quarantine below).
-            numeric = (int, float)
-            observations = [
-                item
-                for item in observations
-                if isinstance(item, dict)
-                and isinstance(item.get("news_score"), numeric)
-                and isinstance(item.get("return_percent"), numeric)
-            ]
-            pending = state.get("pending")
-            if not (
-                isinstance(pending, dict)
-                and isinstance(pending.get("date"), str)
-                and isinstance(pending.get("price"), numeric)
-                and isinstance(pending.get("news_score"), numeric)
-            ):
-                pending = None
-            return {
-                "version": 1,
-                "observations": observations[-self.maximum_observations :],
-                "pending": pending,
-            }
+            return self._validate_state(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             # Preserve a corrupt file for diagnosis instead of trusting its data.
-            corrupt_path = self.state_path.with_suffix(self.state_path.suffix + ".corrupt")
+            corrupt_path = path.with_suffix(path.suffix + ".corrupt")
             with suppress(OSError):
-                self.state_path.replace(corrupt_path)
+                path.replace(corrupt_path)
             return {"version": 1, "observations": [], "pending": None}
 
+    def _validate_state(self, state: Any) -> dict[str, Any]:
+        if not isinstance(state, dict):
+            raise ValueError("state must be an object")
+        observations = state.get("observations", [])
+        if not isinstance(observations, list):
+            raise ValueError("observations must be a list")
+        numeric = (int, float)
+        observations = [
+            item
+            for item in observations
+            if isinstance(item, dict)
+            and isinstance(item.get("news_score"), numeric)
+            and isinstance(item.get("return_percent"), numeric)
+        ]
+        pending = state.get("pending")
+        if not (
+            isinstance(pending, dict)
+            and isinstance(pending.get("date"), str)
+            and isinstance(pending.get("price"), numeric)
+            and isinstance(pending.get("news_score"), numeric)
+        ):
+            pending = None
+        return {
+            "version": 1,
+            "observations": observations[-self.maximum_observations :],
+            "pending": pending,
+        }
+
     def _save_state(self, state: dict[str, Any]) -> None:
+        if self._state_store is not None:
+            self._state_store.set("adaptive_news_model", state)
+            return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         temporary_path.write_text(

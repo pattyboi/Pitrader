@@ -61,6 +61,7 @@ def build_crypto_strategy(
             "crypto_iteration_interval_minutes": config["CRYPTO_ITERATION_INTERVAL_MINUTES"],
             "crypto_risk_posture": config["CRYPTO_RISK_POSTURE"],
             "crypto_holding_state_file": str(base_dir / ".crypto_holding_state.json"),
+            "crypto_runtime_state_database_file": str(base_dir / ".crypto_runtime_state.duckdb"),
             "crypto_signal_snapshot_file": str(base_dir / ".crypto_signal_snapshot.json"),
             "crypto_memory_enabled": config["CRYPTO_MEMORY_ENABLED"],
             "crypto_memory_min_observations": config["CRYPTO_MEMORY_MIN_OBSERVATIONS"],

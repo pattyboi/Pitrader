@@ -786,6 +786,7 @@ def build_strategy(
             "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
             "portfolio_holding_state_file": str(base_dir / ".portfolio_holding_state.json"),
             "portfolio_rotation_state_file": str(base_dir / ".portfolio_rotation_state.json"),
+            "runtime_state_database_file": str(base_dir / ".runtime_state.duckdb"),
             "portfolio_signal_snapshot_file": str(base_dir / ".portfolio_signal_snapshot.json"),
             "portfolio_iteration_state_file": str(base_dir / ".portfolio_iteration_state.json"),
             "portfolio_second_iteration_offset_minutes": config[
@@ -829,8 +830,8 @@ def build_strategy(
             "news_predicted_return_block_percent": config[
                 "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
             ],
-            "news_learning_state_file": str(base_dir / ".news_learning_state.json"),
-            "news_learning_llm_state_file": str(base_dir / ".news_learning_state_llm.json"),
+            "news_learning_state_file": str(base_dir / ".news_learning_state.duckdb"),
+            "news_learning_llm_state_file": str(base_dir / ".news_learning_state_llm.duckdb"),
             "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
             "news_rss_enabled": config["NEWS_RSS_ENABLED"],
             "news_rss_feed_urls": config["NEWS_RSS_FEED_URLS"],
