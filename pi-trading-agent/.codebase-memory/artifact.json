@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "e9b3b400fc0c55c83222e4075bb30df8c2c01876",
-    "indexed_at": "2026-07-19T15:08:28Z",
+    "commit": "02c27deb73ebb188e941e22c8de6e07c4aaebfc5",
+    "indexed_at": "2026-07-19T15:21:29Z",
     "project": "pi-trading-agent",
-    "nodes": 992,
-    "edges": 4233,
+    "nodes": 997,
+    "edges": 4237,
     "original_size": 5701632,
-    "compressed_size": 1075548,
+    "compressed_size": 1075387,
     "compression_level": 3
 }
