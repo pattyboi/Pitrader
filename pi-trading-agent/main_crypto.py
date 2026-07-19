@@ -57,7 +57,6 @@ def build_crypto_strategy(
             "crypto_take_profit_percent": config["CRYPTO_TAKE_PROFIT_PERCENT"],
             "crypto_stop_loss_percent": config["CRYPTO_STOP_LOSS_PERCENT"],
             "crypto_holding_horizon_max_days": config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"],
-            "crypto_cash_allocation_dollars": config["CRYPTO_CASH_ALLOCATION_DOLLARS"],
             "crypto_min_order_dollars": config["CRYPTO_MIN_ORDER_DOLLARS"],
             "crypto_iteration_interval_minutes": config["CRYPTO_ITERATION_INTERVAL_MINUTES"],
             "crypto_risk_posture": config["CRYPTO_RISK_POSTURE"],

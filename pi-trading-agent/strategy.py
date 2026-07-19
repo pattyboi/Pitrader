@@ -1393,6 +1393,23 @@ class AssetRotationStrategy(Strategy):
             )
         return None
 
+    def _account_half_value_dollars(self) -> float:
+        """Half of the shared Alpaca account's total value (cash + net equity).
+
+        Equity and crypto run as separate processes against the same account
+        and each independently targets a 50/50 split of it, rather than a
+        fixed configured dollar figure -- see _account_half_value_dollars on
+        CryptoRotationStrategy (crypto_strategy.py), which computes the exact
+        same thing so the two sides converge on the same split without any
+        direct coordination between the two processes. Falls back to cash
+        alone if a fresh broker equity read fails, which can only push this
+        pipeline's share more conservative, never let it overspend.
+        """
+        total_value = self.get_portfolio_value()
+        if total_value is None or float(total_value) <= 0:
+            total_value = self.get_cash()
+        return float(total_value or 0.0) * 0.5
+
     def _buy_portfolio_symbol(self, symbol: str, price: float, budget: float) -> str:
         """Buy a whole or fractional quantity within a stated portfolio budget."""
         with self._rotation_lock:
@@ -1400,7 +1417,7 @@ class AssetRotationStrategy(Strategy):
                 return "working"
             spendable = min(float(self.get_cash()), budget) * (1.0 - self.CASH_BUFFER_FRACTION)
             spendable -= float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0))
-            spendable -= float(self.parameters.get("portfolio_crypto_reserve_dollars", 0.0))
+            spendable -= self._account_half_value_dollars()
             if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
                 return "insufficient"
             if bool(self.parameters.get("fractional_shares", False)):
@@ -2828,14 +2845,12 @@ class AssetRotationStrategy(Strategy):
             remaining_candidates = [
                 signal for signal in eligible if str(signal["symbol"]) not in claimed_symbols
             ]
-            # Narrow the configured ceiling to what today's total capital
-            # (existing holdings plus spendable cash) and candidate quality
-            # actually support -- see _optimal_position_count. Falls back to
-            # cash alone if a fresh broker equity read fails, which can only
-            # push the result more conservative, never past the configured cap.
-            total_capital = self.get_portfolio_value()
-            if total_capital is None or float(total_capital) <= 0:
-                total_capital = float(self.get_cash())
+            # Narrow the configured ceiling to what today's capital (this
+            # pipeline's own 50% share of the shared account, existing
+            # holdings plus spendable cash) and candidate quality actually
+            # support -- see _optimal_position_count and
+            # _account_half_value_dollars.
+            total_capital = self._account_half_value_dollars()
             min_order_dollars = float(self.parameters.get("portfolio_min_order_dollars", 1.0))
             candidate_edges = [
                 (float(signal["expected_profit"]), float(signal.get("return_stdev") or 0.0))

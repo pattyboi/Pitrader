@@ -429,18 +429,18 @@ def test_portfolio_ignores_unmanaged_account_positions() -> None:
     assert entry_prices == {"SPY": 400.0}
 
 
-def _stub_buy_portfolio_symbol(crypto_reserve_dollars: float) -> AssetRotationStrategy:
+def _stub_buy_portfolio_symbol(account_value: float) -> AssetRotationStrategy:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy._rotation_lock = threading.Lock()
     strategy.CASH_BUFFER_FRACTION = AssetRotationStrategy.CASH_BUFFER_FRACTION
     strategy.parameters = {
         "portfolio_cash_reserve_dollars": 0.0,
-        "portfolio_crypto_reserve_dollars": crypto_reserve_dollars,
         "portfolio_min_order_dollars": 5.0,
         "fractional_shares": False,
     }
     strategy._has_active_order = lambda symbol, side: False
     strategy.get_cash = lambda: 100.0
+    strategy.get_portfolio_value = lambda: account_value
     strategy.create_order = lambda symbol, quantity, side, order_type, time_in_force: SimpleNamespace(quantity=quantity)
     strategy._submit_order_checked = lambda order, description: True
     strategy.log_message = lambda *args, **kwargs: None
@@ -448,16 +448,38 @@ def _stub_buy_portfolio_symbol(crypto_reserve_dollars: float) -> AssetRotationSt
 
 
 def test_buy_portfolio_symbol_treats_the_crypto_allocation_as_untouchable() -> None:
-    # $100 cash, 1% buffer, no equity reserve, $90 reserved for the separate
-    # crypto process: only ~$9 is spendable, so a $5 share buys just 1 share
-    # instead of the ~19 it would without the crypto reserve subtraction.
-    strategy = _stub_buy_portfolio_symbol(crypto_reserve_dollars=90.0)
+    # $100 cash, 1% buffer, no equity reserve, $180 total account value ->
+    # crypto's dynamic 50% share is $90, reserved: only ~$9 is spendable, so
+    # a $5 share buys just 1 share instead of the ~19 it would without the
+    # crypto-share subtraction.
+    strategy = _stub_buy_portfolio_symbol(account_value=180.0)
     assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "submitted"
 
 
 def test_buy_portfolio_symbol_is_blocked_once_the_crypto_reserve_exhausts_cash() -> None:
-    strategy = _stub_buy_portfolio_symbol(crypto_reserve_dollars=100.0)
+    strategy = _stub_buy_portfolio_symbol(account_value=200.0)
     assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "insufficient"
+
+
+def test_account_half_value_dollars_uses_portfolio_value_when_available() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_portfolio_value = lambda: 300.0
+    strategy.get_cash = lambda: 999.0
+    assert strategy._account_half_value_dollars() == 150.0
+
+
+def test_account_half_value_dollars_falls_back_to_cash() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_portfolio_value = lambda: None
+    strategy.get_cash = lambda: 80.0
+    assert strategy._account_half_value_dollars() == 40.0
+
+
+def test_crypto_account_half_value_dollars_falls_back_to_cash() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.get_portfolio_value = lambda: 0.0
+    strategy.get_cash = lambda: 60.0
+    assert strategy._account_half_value_dollars() == 30.0
 
 
 def test_crypto_held_positions_only_counts_managed_crypto_symbols() -> None:

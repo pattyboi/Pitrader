@@ -345,9 +345,12 @@ def load_config(path: Path) -> dict[str, Any]:
 
     # Crypto trading runs as a separate process (main_crypto.py, its own
     # systemd service) only while NYSE is closed, but validated here in the
-    # same load_config both processes share, so the equity process can also
-    # see CRYPTO_CASH_ALLOCATION_DOLLARS and treat it as an untouchable
-    # reserve (see portfolio_crypto_reserve_dollars in build_strategy below).
+    # same load_config both processes share so the two can never silently
+    # disagree about a CRYPTO_* value's meaning. Each process independently
+    # targets 50% of the shared account's total value as its own dynamic
+    # cash cap -- see AssetRotationStrategy._account_half_value_dollars
+    # (strategy.py) and CryptoRotationStrategy._account_half_value_dollars
+    # (crypto_strategy.py) -- rather than a fixed configured dollar figure.
     crypto_defaults = {
         "CRYPTO_ENABLED": False,
         "CRYPTO_SYMBOLS": ["BTC", "ETH"],
@@ -367,7 +370,6 @@ def load_config(path: Path) -> dict[str, Any]:
         "CRYPTO_TAKE_PROFIT_PERCENT": 1.5,
         "CRYPTO_STOP_LOSS_PERCENT": 1.0,
         "CRYPTO_HOLDING_HORIZON_MAX_DAYS": 15,
-        "CRYPTO_CASH_ALLOCATION_DOLLARS": 0.0,
         "CRYPTO_MIN_ORDER_DOLLARS": 5.0,
         "CRYPTO_ITERATION_INTERVAL_MINUTES": 15,
         "CRYPTO_AUTONOMOUS_DISCOVERY": False,
@@ -408,7 +410,6 @@ def load_config(path: Path) -> dict[str, Any]:
     crypto_take_profit_percent = float(config["CRYPTO_TAKE_PROFIT_PERCENT"])
     crypto_stop_loss_percent = float(config["CRYPTO_STOP_LOSS_PERCENT"])
     crypto_holding_horizon_max_days = int(config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"])
-    crypto_cash_allocation = float(config["CRYPTO_CASH_ALLOCATION_DOLLARS"])
     crypto_min_order = float(config["CRYPTO_MIN_ORDER_DOLLARS"])
     crypto_iteration_interval_minutes = int(config["CRYPTO_ITERATION_INTERVAL_MINUTES"])
     crypto_discovery_batch_size = int(config["CRYPTO_DISCOVERY_BATCH_SIZE"])
@@ -430,11 +431,6 @@ def load_config(path: Path) -> dict[str, Any]:
         ("CRYPTO_TAKE_PROFIT_PERCENT", crypto_take_profit_percent, 0.05, 100),
         ("CRYPTO_STOP_LOSS_PERCENT", crypto_stop_loss_percent, 0.05, 100),
         ("CRYPTO_HOLDING_HORIZON_MAX_DAYS", crypto_holding_horizon_max_days, 1, 60),
-        # Unlike PORTFOLIO_CASH_RESERVE_DOLLARS (a small held-back safety
-        # margin), this is crypto's entire spendable budget -- up to and
-        # including the whole account -- so it is not capped at the same
-        # small ceiling as that reserve buffer.
-        ("CRYPTO_CASH_ALLOCATION_DOLLARS", crypto_cash_allocation, 0, 10_000_000),
         ("CRYPTO_MIN_ORDER_DOLLARS", crypto_min_order, 1, 1000),
         ("CRYPTO_ITERATION_INTERVAL_MINUTES", crypto_iteration_interval_minutes, 5, 120),
         ("CRYPTO_DISCOVERY_BATCH_SIZE", crypto_discovery_batch_size, 1, 30),
@@ -459,7 +455,6 @@ def load_config(path: Path) -> dict[str, Any]:
     config["CRYPTO_TAKE_PROFIT_PERCENT"] = crypto_take_profit_percent
     config["CRYPTO_STOP_LOSS_PERCENT"] = crypto_stop_loss_percent
     config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"] = crypto_holding_horizon_max_days
-    config["CRYPTO_CASH_ALLOCATION_DOLLARS"] = crypto_cash_allocation
     config["CRYPTO_MIN_ORDER_DOLLARS"] = crypto_min_order
     config["CRYPTO_ITERATION_INTERVAL_MINUTES"] = crypto_iteration_interval_minutes
     config["CRYPTO_DISCOVERY_BATCH_SIZE"] = crypto_discovery_batch_size
@@ -759,11 +754,6 @@ def build_strategy(
             "portfolio_universe_database_file": str(base_dir / ".autonomous_universe.duckdb"),
             "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
             "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
-            # Untouchable reserve for the separate crypto process (main_crypto.py)
-            # sharing this Alpaca account -- see _buy_portfolio_symbol's spendable
-            # calc in strategy.py, which subtracts this the same way it already
-            # subtracts portfolio_cash_reserve_dollars.
-            "portfolio_crypto_reserve_dollars": config["CRYPTO_CASH_ALLOCATION_DOLLARS"],
             "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
             "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
             "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],

@@ -1185,21 +1185,23 @@ of other Alpaca-tradable pairs (if `CRYPTO_AUTONOMOUS_DISCOVERY` is enabled),
 pooled cross-symbol memory, and an equivalent of the Opportunistic Opportunity
 BTC-to-ETH swap (capped at one swap per day, same as the equity version).
 
-### Cash allocation is a soft, shared-account limit
+### Cash allocation is a dynamic 50/50 split of the shared account
 
 Alpaca does not give a single brokerage account a separate crypto wallet —
-stock and crypto trades draw from the same cash balance. `config.json`'s
-`CRYPTO_CASH_ALLOCATION_DOLLARS` (default 0, meaning crypto never buys
-anything until you raise it) caps how much of that shared balance the crypto
-service is allowed to deploy, and the equity service treats that same amount
-as an untouchable reserve it will never spend into. This is enforced in
-software, not by the broker: each service reads the account's real-time cash
+stock and crypto trades draw from the same cash balance. Rather than a fixed
+dollar figure you configure once, each service independently computes its own
+share fresh on every iteration: it asks the broker for the account's total
+value (cash plus the market value of everything held, both stocks and
+crypto), and targets half of that as its own dynamic cash cap — the equity
+service treats the other half as an untouchable reserve it will never spend
+into, and the crypto service sizes its own buys against that same half. Both
+sides converge on the same 50/50 split without talking to each other,
+because they're reading the same underlying account value. This is enforced
+in software, not by the broker: each service reads the account's real-time
 balance independently, so there is a small window (well under a second, in
 practice) where both could act on a slightly stale balance. This is the same
 kind of risk the equity strategy already accepts when sizing several buys
-within one iteration, and is not a reason to avoid crypto mode — just
-something to keep in mind if you set the allocation close to your entire
-account balance.
+within one iteration, and is not a reason to avoid crypto mode.
 
 ### Configuration reference
 
@@ -1209,7 +1211,6 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 | --- | --- | --- |
 | `CRYPTO_ENABLED` | `false` | Master on/off switch. The service runs either way; this just decides whether it ever evaluates or trades. |
 | `CRYPTO_SYMBOLS` | `["BTC", "ETH"]` | Static watchlist, base symbols only (no `/USD` suffix). |
-| `CRYPTO_CASH_ALLOCATION_DOLLARS` | `0.0` | Soft cap on crypto's share of the account's cash (see above). |
 | `CRYPTO_MAX_POSITIONS` | `1` | Ceiling on simultaneous crypto holdings. |
 | `CRYPTO_DIP_THRESHOLD_PERCENT` | `5.0` | Dip size (from the recent high) required to consider buying. |
 | `CRYPTO_TAKE_PROFIT_PERCENT` / `CRYPTO_STOP_LOSS_PERCENT` | `1.5` / `1.0` | Exit thresholds, wider than the equity defaults since crypto moves more. |
@@ -1242,9 +1243,10 @@ equity service's `.portfolio_*` files: `.crypto_holding_state.json`,
 
 1. Stop both services before editing configuration:
    `sudo systemctl stop trading-agent.service trading-agent-crypto.service`
-2. Edit `config.json`: set `CRYPTO_ENABLED: true` and a
-   `CRYPTO_CASH_ALLOCATION_DOLLARS` you're comfortable risking in paper mode
-   first.
+2. Edit `config.json`: set `CRYPTO_ENABLED: true`. There's no separate dollar
+   figure to configure — crypto automatically targets 50% of the account's
+   total value (see "Cash allocation is a dynamic 50/50 split" above) — so
+   confirm you're comfortable risking half the account in paper mode first.
 3. Restart both services:
    `sudo systemctl start trading-agent.service trading-agent-crypto.service`
 4. Follow crypto-specific logs with

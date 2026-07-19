@@ -83,7 +83,6 @@ class CryptoRotationStrategy(Strategy):
         "crypto_take_profit_percent": 1.5,
         "crypto_stop_loss_percent": 1.0,
         "crypto_holding_horizon_max_days": 15,
-        "crypto_cash_allocation_dollars": 0.0,
         "crypto_min_order_dollars": 5.0,
         "crypto_iteration_interval_minutes": 15,
         "crypto_risk_posture": "conservative",
@@ -969,6 +968,23 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Buying --------------------------------------------------------------
 
+    def _account_half_value_dollars(self) -> float:
+        """Half of the shared Alpaca account's total value (cash + net equity).
+
+        Mirrors AssetRotationStrategy._account_half_value_dollars (strategy.py)
+        exactly: equity and crypto run as separate processes against the same
+        account and each independently targets a 50/50 split of it, rather
+        than a fixed configured dollar figure, so the two sides converge on
+        the same split without any direct coordination between the two
+        processes. Falls back to cash alone if a fresh broker equity read
+        fails, which can only push this pipeline's share more conservative,
+        never let it overspend.
+        """
+        total_value = self.get_portfolio_value()
+        if total_value is None or float(total_value) <= 0:
+            total_value = self.get_cash()
+        return float(total_value or 0.0) * 0.5
+
     def _buy_crypto_symbol(self, symbol: str, price: float, budget: float) -> str:
         """Buy a fractional quantity within a stated crypto budget.
 
@@ -1182,7 +1198,8 @@ class CryptoRotationStrategy(Strategy):
             (float(signal["posture_adjusted_edge"]), float(signal.get("return_stdev") or 0.0))
             for signal in eligible
         ]
-        crypto_allocation = float(self.parameters.get("crypto_cash_allocation_dollars", 0.0))
+        crypto_allocation = self._account_half_value_dollars()
+        report["crypto_cash_allocation_dollars"] = crypto_allocation
         min_order_dollars = float(self.parameters.get("crypto_min_order_dollars", 5.0))
         effective_max_positions = decision_math.optimal_position_count(
             crypto_allocation, min_order_dollars, candidate_edges, configured_max_positions
@@ -1274,7 +1291,7 @@ class CryptoRotationStrategy(Strategy):
                 f"Signal candidates: {report.get('crypto_candidates', 'unavailable')}",
                 f"Effective max positions today: {report.get('crypto_effective_max_positions', 'unavailable')} "
                 f"(configured ceiling {self.parameters.get('crypto_max_positions', 'unavailable')})",
-                f"Cash allocation: ${float(self.parameters.get('crypto_cash_allocation_dollars', 0.0)):.2f}",
+                f"Cash allocation: ${float(report.get('crypto_cash_allocation_dollars', 0.0)):.2f}",
                 f"Deployed: {report.get('crypto_deployed_dollars', 'unavailable')}",
                 f"Discovered symbols: {report.get('discovered_crypto_symbols', 'none')}",
                 f"Discovery status: {report.get('discovery_status', 'ok')}",
@@ -1319,7 +1336,7 @@ class CryptoRotationStrategy(Strategy):
                 f"{report.get('crypto_effective_max_positions', 'unavailable')} "
                 f"(configured ceiling {self.parameters.get('crypto_max_positions', 'unavailable')})",
             ),
-            ("Cash allocation", f"${float(self.parameters.get('crypto_cash_allocation_dollars', 0.0)):.2f}"),
+            ("Cash allocation", f"${float(report.get('crypto_cash_allocation_dollars', 0.0)):.2f}"),
             ("Deployed", report.get("crypto_deployed_dollars", "unavailable")),
             ("Discovered symbols", report.get("discovered_crypto_symbols", "none")),
             ("Discovery status", report.get("discovery_status", "ok")),
