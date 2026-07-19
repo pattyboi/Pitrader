@@ -39,6 +39,7 @@ import numpy as np
 import decision_math
 import email_render
 import signal_snapshot
+import trade_counter
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
@@ -400,6 +401,10 @@ class CryptoRotationStrategy(Strategy):
             suffix = f": {error}" if error else ""
             self.log_message(f"Broker rejected {description}{suffix}.", color="red")
             return False
+        trade_counter.record_trade(
+            str(self.parameters.get("crypto_trade_count_file", "")),
+            self.get_datetime().date().isoformat(),
+        )
         return True
 
     # -- Pricing helpers (Asset-wrapped so the quote resolves for crypto,

@@ -63,6 +63,7 @@ def build_crypto_strategy(
             "crypto_holding_state_file": str(base_dir / ".crypto_holding_state.json"),
             "crypto_runtime_state_database_file": str(base_dir / ".crypto_runtime_state.duckdb"),
             "crypto_signal_snapshot_file": str(base_dir / ".crypto_signal_snapshot.json"),
+            "crypto_trade_count_file": str(base_dir / ".crypto_trade_count.json"),
             "crypto_memory_enabled": config["CRYPTO_MEMORY_ENABLED"],
             "crypto_memory_min_observations": config["CRYPTO_MEMORY_MIN_OBSERVATIONS"],
             "crypto_memory_max_observations": config["CRYPTO_MEMORY_MAX_OBSERVATIONS"],

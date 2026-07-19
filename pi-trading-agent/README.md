@@ -1302,6 +1302,28 @@ completed an iteration since the snapshot file was last written — equity only
 evaluates twice a trading day (see `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES`
 above), so it can take a while to appear even right after the service starts.
 
+### Viewing the same thing in a browser
+
+`setup_service.sh` also installs and starts `trading-agent-dashboard.service`,
+a small always-on browser dashboard showing the same per-symbol opinions plus
+a running count of trades placed today. It's read-only, stdlib-only Python
+(`scripts/web_dashboard.py`, no new pip dependency), reads the same two
+snapshot files as `view_signals.py` above, and never touches the broker.
+Browse to `http://<this Pi's LAN IP>:8765` from any device on the same
+network — the service binds `0.0.0.0:8765` by default, so it has **no login
+and is reachable by anyone on that network**. If that's not acceptable for
+your setup, edit `/etc/systemd/system/trading-agent-dashboard.service` and
+change `Environment=DASHBOARD_HOST=0.0.0.0` to `127.0.0.1` (only reachable
+via SSH tunnel or on the Pi itself), then
+`sudo systemctl daemon-reload && sudo systemctl restart trading-agent-dashboard.service`.
+Follow its logs with `sudo journalctl -u trading-agent-dashboard.service -f`;
+check status/stop/start it like any other service in this project.
+
+The "trades today" figure comes from `trade_counter.py`, a side channel each
+strategy calls from its own order-submission code (never the reverse) —
+`.portfolio_trade_count.json`/`.crypto_trade_count.json` — and resets when the
+strategy's clock rolls to a new calendar day.
+
 ### Understanding common log messages
 
 `Starting paper portfolio trading (proxy assets SPY/QQQ)`
@@ -1660,9 +1682,11 @@ files in place:
 ```bash
 sudo systemctl disable --now trading-agent.service
 sudo systemctl disable --now trading-agent-cpu-watchdog.timer
+sudo systemctl disable --now trading-agent-dashboard.service
 sudo rm /etc/systemd/system/trading-agent.service
 sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.service
 sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.timer
+sudo rm /etc/systemd/system/trading-agent-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 ```

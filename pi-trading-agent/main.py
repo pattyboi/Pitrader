@@ -788,6 +788,7 @@ def build_strategy(
             "portfolio_rotation_state_file": str(base_dir / ".portfolio_rotation_state.json"),
             "runtime_state_database_file": str(base_dir / ".runtime_state.duckdb"),
             "portfolio_signal_snapshot_file": str(base_dir / ".portfolio_signal_snapshot.json"),
+            "portfolio_trade_count_file": str(base_dir / ".portfolio_trade_count.json"),
             "portfolio_iteration_state_file": str(base_dir / ".portfolio_iteration_state.json"),
             "portfolio_second_iteration_offset_minutes": config[
                 "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"

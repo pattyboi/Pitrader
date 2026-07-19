@@ -22,6 +22,7 @@ import article_filter
 import decision_math
 import email_render
 import signal_snapshot
+import trade_counter
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
@@ -567,6 +568,10 @@ class AssetRotationStrategy(Strategy):
                 color="red",
             )
             return False
+        trade_counter.record_trade(
+            str(self.parameters.get("portfolio_trade_count_file", "")),
+            self.get_datetime().date().isoformat(),
+        )
         return True
 
     def _submit_portfolio_rotation_sell(
