@@ -51,6 +51,7 @@ class TradeMemory:
         # market_sessions.is_next_calendar_day instead, since crypto trades
         # every calendar day rather than skipping weekends/holidays.
         self._next_session_predicate = next_session_predicate
+        self._schema_initialized = False
 
     def update_and_forecast(
         self,
@@ -251,10 +252,15 @@ class TradeMemory:
     @contextmanager
     def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
         """Ensure the directory/schema exist, then hand back a ready
-        connection -- shared prologue for every public method below."""
+        connection -- shared prologue for every public method below. Schema
+        creation only runs once per instance (mirrors DuckDBStateStore),
+        so callers should hold onto one instance across a process's calls
+        rather than constructing a fresh one each time."""
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            self._create_schema(conn)
+            if not self._schema_initialized:
+                self._create_schema(conn)
+                self._schema_initialized = True
             yield conn
 
     @staticmethod

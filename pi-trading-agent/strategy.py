@@ -517,10 +517,24 @@ class AssetRotationStrategy(Strategy):
         except ValueError:
             return False
 
+    def _cached_orders(self) -> list[Any]:
+        """Fetch open orders once per iteration; _has_active_order is called
+        from several loop sites per iteration and they all describe the same
+        broker-side order book, so refetching per call is a pure waste of a
+        network round-trip. Cleared by _invalidate_orders_cache()."""
+        cached = getattr(self, "_orders_cache", None)
+        if cached is None:
+            cached = self.get_orders() or []
+            self._orders_cache = cached
+        return cached
+
+    def _invalidate_orders_cache(self) -> None:
+        self._orders_cache = None
+
     def _has_active_order(self, symbol: str, side: str) -> bool:
         """Best-effort check for a working order; unknown states count as active."""
         try:
-            orders = self.get_orders() or []
+            orders = self._cached_orders()
         except Exception as exc:
             self.log_message(
                 f"Could not read orders ({type(exc).__name__}: {exc}); "
@@ -572,6 +586,7 @@ class AssetRotationStrategy(Strategy):
             str(self.parameters.get("portfolio_trade_count_file", "")),
             self.get_datetime().date().isoformat(),
         )
+        self._invalidate_orders_cache()
         return True
 
     def _submit_portfolio_rotation_sell(
@@ -1050,16 +1065,9 @@ class AssetRotationStrategy(Strategy):
             )
 
         try:
-            memory = TradeMemory(
-                database_path=Path(
-                    str(self.parameters["decision_memory_database_file"])
-                ),
-                minimum_observations=int(
-                    self.parameters["decision_memory_min_observations"]
-                ),
-                maximum_observations=int(
-                    self.parameters["decision_memory_max_observations"]
-                ),
+            memory = self._decision_memory(
+                int(self.parameters["decision_memory_min_observations"]),
+                int(self.parameters["decision_memory_max_observations"]),
             )
             result = memory.update_and_forecast(
                 evaluation_date=self.get_datetime().date().isoformat(),
@@ -1111,9 +1119,7 @@ class AssetRotationStrategy(Strategy):
         self._backfill_decision_memory(asset_a, asset_b)
         forecast = self._update_decision_memory(float(price_a), float(price_b), dip, news_context)
         try:
-            probability = TradeMemory(
-                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
-            ).opportunity_probability()
+            probability = self._decision_memory(1, 1).opportunity_probability()
         except Exception as exc:
             self.log_message(
                 f"Opportunity probability lookup failed safely: {type(exc).__name__}: {exc}",
@@ -1182,10 +1188,8 @@ class AssetRotationStrategy(Strategy):
                 history.append(
                     (date, close_a, close_b, float(dip), float(dip) >= threshold)
                 )
-            inserted = TradeMemory(
-                Path(str(self.parameters["decision_memory_database_file"])),
-                1,
-                int(self.parameters["decision_memory_max_observations"]),
+            inserted = self._decision_memory(
+                1, int(self.parameters["decision_memory_max_observations"])
             ).backfill_history(history)
             self.log_message(
                 f"Decision-memory historical backfill added {inserted} settled daily observations.",
@@ -1197,6 +1201,28 @@ class AssetRotationStrategy(Strategy):
                 f"Decision-memory historical backfill failed safely: {type(exc).__name__}: {exc}",
                 color="yellow",
             )
+
+    def _decision_memory(self, minimum_observations: int, maximum_observations: int) -> TradeMemory:
+        """Instance-cached like _portfolio_memory(). Call sites intentionally
+        use different (min, max) windows (e.g. the opportunity-probability
+        lookup wants only the most recent observation), so each distinct
+        pairing keeps its own cached instance rather than sharing a single
+        slot -- this still gets every call site off a fresh DuckDB connection
+        and schema-creation pass per invocation."""
+        key = (
+            str(self.parameters["decision_memory_database_file"]),
+            int(minimum_observations),
+            int(maximum_observations),
+        )
+        cache = getattr(self, "_decision_memory_instances", None)
+        if cache is None:
+            cache = {}
+            self._decision_memory_instances = cache
+        cached = cache.get(key)
+        if cached is None:
+            cached = TradeMemory(Path(key[0]), key[1], key[2])
+            cache[key] = cached
+        return cached
 
     def _portfolio_memory(self) -> PortfolioMemory:
         key = (
@@ -1374,9 +1400,7 @@ class AssetRotationStrategy(Strategy):
         if not report.get("decision_memory_recorded"):
             return
         try:
-            TradeMemory(
-                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
-            ).record_decision(
+            self._decision_memory(1, 1).record_decision(
                 self.get_datetime().date().isoformat(),
                 str(report.get("status", "unknown")),
                 str(report.get("decision_reason", report.get("status", ""))),
@@ -1618,7 +1642,26 @@ class AssetRotationStrategy(Strategy):
     def _get_quote_price_and_bid_ask(
         self, symbol: str
     ) -> tuple[float | None, tuple[float, float] | None]:
-        """Read Alpaca's signal price and spread inputs from one quote."""
+        """Read Alpaca's signal price and spread inputs from one quote.
+
+        Cached per iteration: exit-reason evaluation and signal computation
+        both quote every held symbol within the same pass, moments apart, and
+        a quote a few seconds stale is no less valid for either decision than
+        refetching it would be.
+        """
+        cache = getattr(self, "_quote_cache", None)
+        if cache is None:
+            cache = {}
+            self._quote_cache = cache
+        if symbol in cache:
+            return cache[symbol]
+        result = self._fetch_quote_price_and_bid_ask(symbol)
+        cache[symbol] = result
+        return result
+
+    def _fetch_quote_price_and_bid_ask(
+        self, symbol: str
+    ) -> tuple[float | None, tuple[float, float] | None]:
         try:
             quote = self.get_quote(symbol)
         except Exception:
@@ -2386,19 +2429,36 @@ class AssetRotationStrategy(Strategy):
     _optimal_position_count = staticmethod(decision_math.optimal_position_count)
 
     def _autonomous_universe(self) -> AutonomousUniverse:
-        return AutonomousUniverse(
-            Path(str(self.parameters["portfolio_universe_database_file"])),
+        """Instance-cached like _portfolio_memory(): called up to 4x/iteration
+        and each fresh instance used to reopen its own DuckDB connection."""
+        key = (
+            str(self.parameters["portfolio_universe_database_file"]),
             int(self.parameters["portfolio_discovery_refresh_days"]),
             int(self.parameters["portfolio_discovery_batch_size"]),
-            paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
+            os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
         )
+        cached = getattr(self, "_autonomous_universe_instance", None)
+        if cached is None or getattr(self, "_autonomous_universe_key", None) != key:
+            cached = AutonomousUniverse(
+                Path(key[0]), key[1], key[2], paper=key[3]
+            )
+            self._autonomous_universe_instance = cached
+            self._autonomous_universe_key = key
+        return cached
 
     def _symbol_reference(self) -> SymbolReference:
-        return SymbolReference(
-            Path(str(self.parameters["symbol_reference_database_file"])),
+        """Instance-cached like _portfolio_memory(); see _autonomous_universe()."""
+        key = (
+            str(self.parameters["symbol_reference_database_file"]),
             int(self.parameters["symbol_reference_refresh_days"]),
-            paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
+            os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
         )
+        cached = getattr(self, "_symbol_reference_instance", None)
+        if cached is None or getattr(self, "_symbol_reference_key", None) != key:
+            cached = SymbolReference(Path(key[0]), key[1], paper=key[2])
+            self._symbol_reference_instance = cached
+            self._symbol_reference_key = key
+        return cached
 
     def _refresh_symbol_reference(self, symbols: list[str]) -> None:
         """Queue a daemon refresh without delaying the trading iteration.
@@ -2767,6 +2827,8 @@ class AssetRotationStrategy(Strategy):
 
     def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
         """Build or rotate a bounded portfolio from the explicit symbol list."""
+        self._invalidate_orders_cache()
+        self._quote_cache = {}
         minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
         minimum_profit = float(self.parameters["portfolio_min_expected_profit_percent"])
         oos_minimum_observations = int(
@@ -2886,9 +2948,12 @@ class AssetRotationStrategy(Strategy):
         asset_b = str(self.parameters["asset_b"]).upper()
         # proxy_price is this same asset_b, fetched moments ago for learning;
         # reusing it keeps the forecast and the learning update on one price
-        # snapshot instead of two reads that could straddle a tick.
+        # snapshot instead of two reads that could straddle a tick. Same
+        # reasoning for asset_a_price: it's reused below for swap sizing if
+        # the opportunity is eligible, instead of a second read.
+        asset_a_price = self.get_last_price(asset_a)
         opportunity = self._opportunistic_opportunity(
-            asset_a, asset_b, self.get_last_price(asset_a), proxy_price, news_context
+            asset_a, asset_b, asset_a_price, proxy_price, news_context
         )
         probability = opportunity.get("probability")
         report.update(
@@ -3076,7 +3141,7 @@ class AssetRotationStrategy(Strategy):
             if self._has_active_order(asset_a, "sell"):
                 actions.append("Opportunistic Opportunity pending: waiting for Asset A sale")
             else:
-                source_price = self.get_last_price(asset_a)
+                source_price = asset_a_price
                 if source_price is None or float(source_price) <= 0:
                     actions.append("No Opportunistic Opportunity: Asset A price was unavailable")
                 else:
@@ -3284,9 +3349,7 @@ class AssetRotationStrategy(Strategy):
             color="green",
         )
         try:
-            TradeMemory(
-                Path(str(self.parameters["decision_memory_database_file"])), 1, 1
-            ).record_execution(
+            self._decision_memory(1, 1).record_execution(
                 self.get_datetime().date().isoformat(),
                 str(symbol),
                 str(side),

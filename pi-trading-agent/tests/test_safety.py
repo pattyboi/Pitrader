@@ -2485,7 +2485,7 @@ def test_crypto_symbols_combines_managed_held_and_one_discovery_batch() -> None:
     )
     report: dict = {}
 
-    symbols = strategy._crypto_symbols(report, held={"ETH": Decimal("1")})
+    symbols = strategy._crypto_symbols(report, held={"ETH": Decimal("1")}, managed={"BTC"})
 
     assert symbols == ["BTC", "ETH", "SOL"]
     assert report["discovered_crypto_symbols"] == "SOL"
@@ -3194,3 +3194,90 @@ def test_write_snapshot_swallows_a_write_failure(tmp_path: Path) -> None:
     bad_path = tmp_path / "missing-dir" / "snapshot.json"
     signal_snapshot.write_snapshot(str(bad_path), "2026-07-19T09:00:00+00:00", "risky", [])
     assert not bad_path.exists()
+
+
+# -- Per-iteration call-count regressions: _has_active_order and the quote
+# helpers fan out to several loop sites per iteration; a normal correctness
+# test can't tell "correct and fetched once" apart from "correct and fetched
+# five times," so these assert the broker mock's call count directly. -------
+
+def _order(symbol: str, side: str, status: str = "new") -> SimpleNamespace:
+    return SimpleNamespace(asset=SimpleNamespace(symbol=symbol), side=side, status=status)
+
+
+def test_has_active_order_fetches_orders_once_per_iteration() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    calls = []
+    strategy.get_orders = lambda: calls.append(1) or [_order("AAAA", "buy")]
+    strategy.log_message = lambda *args, **kwargs: None
+
+    assert strategy._has_active_order("AAAA", "buy") is True
+    assert strategy._has_active_order("BBBB", "sell") is False
+    assert strategy._has_active_order("AAAA", "buy") is True
+    assert len(calls) == 1
+
+    strategy._invalidate_orders_cache()
+    strategy._has_active_order("AAAA", "buy")
+    assert len(calls) == 2
+
+
+def test_crypto_has_active_order_fetches_orders_once_per_iteration() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    calls = []
+    strategy.get_orders = lambda: calls.append(1) or [_order("BTC", "sell")]
+    strategy.log_message = lambda *args, **kwargs: None
+
+    assert strategy._has_active_order("BTC", "sell") is True
+    assert strategy._has_active_order("ETH", "buy") is False
+    assert len(calls) == 1
+
+    strategy._invalidate_orders_cache()
+    strategy._has_active_order("BTC", "sell")
+    assert len(calls) == 2
+
+
+def _quote(price: float, bid: float, ask: float) -> SimpleNamespace:
+    return SimpleNamespace(price=price, bid=bid, ask=ask)
+
+
+def test_get_quote_price_and_bid_ask_fetches_once_per_symbol_per_iteration() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    calls = []
+    strategy.get_quote = lambda symbol: calls.append(symbol) or _quote(100.0, 99.5, 100.5)
+
+    strategy._get_quote_price_and_bid_ask("AAAA")
+    strategy._get_quote_price_and_bid_ask("AAAA")
+    strategy._get_quote_price_and_bid_ask("BBBB")
+
+    assert calls == ["AAAA", "BBBB"]
+
+    strategy._quote_cache = {}
+    strategy._get_quote_price_and_bid_ask("AAAA")
+    assert calls == ["AAAA", "BBBB", "AAAA"]
+
+
+def test_crypto_get_quote_price_and_bid_ask_fetches_once_per_symbol_per_iteration() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    calls = []
+    strategy.get_quote = lambda asset, quote=None: calls.append(asset.symbol) or _quote(
+        100.0, 99.5, 100.5
+    )
+    strategy._quote_asset = None  # bypass the quote_asset property setter, which touches self.broker
+
+    strategy._get_crypto_quote_price_and_bid_ask("BTC")
+    strategy._get_crypto_quote_price_and_bid_ask("BTC")
+    strategy._get_crypto_quote_price_and_bid_ask("ETH")
+
+    assert calls == ["BTC", "ETH"]
+
+
+def test_decision_memory_reuses_one_instance_per_key(tmp_path: Path) -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"decision_memory_database_file": str(tmp_path / "decision.duckdb")}
+
+    same_a = strategy._decision_memory(5, 200)
+    same_b = strategy._decision_memory(5, 200)
+    different = strategy._decision_memory(1, 1)
+
+    assert same_a is same_b
+    assert different is not same_a

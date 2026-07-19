@@ -65,6 +65,7 @@ class SymbolReference:
         self.assets_url = ALPACA_ASSETS_URL_PAPER if paper else ALPACA_ASSETS_URL_LIVE
         self._alpaca_fetcher = alpaca_fetcher or self._fetch_alpaca_asset
         self._sec_fetcher = sec_fetcher or self._fetch_sec_tickers
+        self._schema_initialized = False
 
     @staticmethod
     def _fetch_alpaca_asset(url: str, headers: dict) -> Any:
@@ -297,10 +298,15 @@ class SymbolReference:
     @contextmanager
     def _open(self) -> Iterator[duckdb.DuckDBPyConnection]:
         """Ensure the directory/schema exist, then hand back a ready
-        connection -- shared prologue for every call site above."""
+        connection -- shared prologue for every call site above. Schema
+        creation only runs once per instance (mirrors DuckDBStateStore),
+        so callers should hold onto one instance across a process's calls
+        rather than constructing a fresh one each time."""
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            self._create_schema(conn)
+            if not self._schema_initialized:
+                self._create_schema(conn)
+                self._schema_initialized = True
             yield conn
 
     @staticmethod

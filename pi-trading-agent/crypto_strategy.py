@@ -365,9 +365,21 @@ class CryptoRotationStrategy(Strategy):
     # -- Order helpers (broker-generic; mirrors AssetRotationStrategy's
     # methods of the same name in strategy.py) -------------------------------
 
+    def _cached_orders(self) -> list[Any]:
+        """Fetch open orders once per iteration; see strategy.py's identical
+        helper for why this is shared across every _has_active_order call site."""
+        cached = getattr(self, "_orders_cache", None)
+        if cached is None:
+            cached = self.get_orders() or []
+            self._orders_cache = cached
+        return cached
+
+    def _invalidate_orders_cache(self) -> None:
+        self._orders_cache = None
+
     def _has_active_order(self, symbol: str, side: str) -> bool:
         try:
-            orders = self.get_orders() or []
+            orders = self._cached_orders()
         except Exception as exc:
             self.log_message(
                 f"Could not read orders ({type(exc).__name__}: {exc}); assuming one may still be working.",
@@ -405,6 +417,7 @@ class CryptoRotationStrategy(Strategy):
             str(self.parameters.get("crypto_trade_count_file", "")),
             self.get_datetime().date().isoformat(),
         )
+        self._invalidate_orders_cache()
         return True
 
     # -- Pricing helpers (Asset-wrapped so the quote resolves for crypto,
@@ -419,6 +432,20 @@ class CryptoRotationStrategy(Strategy):
         return str(source).upper() == "ALPACA"
 
     def _get_crypto_quote_price_and_bid_ask(
+        self, symbol: str
+    ) -> tuple[float | None, tuple[float, float] | None]:
+        """Cached per iteration: see strategy.py's identical helper for why."""
+        cache = getattr(self, "_quote_cache", None)
+        if cache is None:
+            cache = {}
+            self._quote_cache = cache
+        if symbol in cache:
+            return cache[symbol]
+        result = self._fetch_crypto_quote_price_and_bid_ask(symbol)
+        cache[symbol] = result
+        return result
+
+    def _fetch_crypto_quote_price_and_bid_ask(
         self, symbol: str
     ) -> tuple[float | None, tuple[float, float] | None]:
         try:
@@ -900,14 +927,28 @@ class CryptoRotationStrategy(Strategy):
     # _crypto_asset_symbol_filter instead of the equity defaults) -----------
 
     def _crypto_autonomous_universe(self) -> AutonomousUniverse:
-        return AutonomousUniverse(
-            Path(str(self.parameters["crypto_universe_database_file"])),
+        """Instance-cached like strategy.py's _autonomous_universe(): this is
+        called from 6 sites per iteration and each fresh instance used to
+        reopen its own DuckDB connection and rerun schema creation."""
+        key = (
+            str(self.parameters["crypto_universe_database_file"]),
             int(self.parameters["crypto_discovery_refresh_days"]),
             int(self.parameters["crypto_discovery_batch_size"]),
-            paper=os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
-            asset_class="crypto",
-            symbol_filter=_crypto_asset_symbol_filter,
+            os.environ.get("ALPACA_IS_PAPER", "true").strip().lower() != "false",
         )
+        cached = getattr(self, "_crypto_autonomous_universe_instance", None)
+        if cached is None or getattr(self, "_crypto_autonomous_universe_key", None) != key:
+            cached = AutonomousUniverse(
+                Path(key[0]),
+                key[1],
+                key[2],
+                paper=key[3],
+                asset_class="crypto",
+                symbol_filter=_crypto_asset_symbol_filter,
+            )
+            self._crypto_autonomous_universe_instance = cached
+            self._crypto_autonomous_universe_key = key
+        return cached
 
     def _managed_crypto_symbols(self) -> set[str]:
         """Symbols this strategy is permitted to count or sell.
@@ -932,9 +973,16 @@ class CryptoRotationStrategy(Strategy):
                 )
         return symbols
 
-    def _crypto_symbols(self, report: dict[str, Any], held: dict[str, Decimal]) -> list[str]:
-        """Combine the static watchlist, current holdings, and one discovery batch."""
-        managed = self._managed_crypto_symbols()
+    def _crypto_symbols(
+        self, report: dict[str, Any], held: dict[str, Decimal], managed: set[str]
+    ) -> list[str]:
+        """Combine the static watchlist, current holdings, and one discovery batch.
+
+        Takes `managed` from the caller (mirrors AssetRotationStrategy's
+        _portfolio_symbols) instead of recomputing it -- _managed_crypto_symbols
+        re-reads discovery-owned symbols from DuckDB, and _run_crypto_iteration
+        already computed it once at the top of the iteration.
+        """
         symbols = list(dict.fromkeys(sorted(managed) + sorted(held)))
         if not bool(self.parameters.get("crypto_autonomous_discovery", False)):
             return symbols
@@ -991,12 +1039,25 @@ class CryptoRotationStrategy(Strategy):
     # instead of TradeMemory's NYSE-session default. -----------------------
 
     def _crypto_decision_memory(self, maximum_observations: int = 1) -> TradeMemory:
-        return TradeMemory(
-            Path(str(self.parameters["crypto_trade_memory_database_file"])),
+        """Instance-cached like strategy.py's _decision_memory(): each distinct
+        maximum_observations value keeps its own cached instance so repeat
+        calls skip DuckDB connect + schema-creation overhead."""
+        key = (
+            str(self.parameters["crypto_trade_memory_database_file"]),
             1,
-            maximum_observations,
-            next_session_predicate=is_next_calendar_day,
+            int(maximum_observations),
         )
+        cache = getattr(self, "_crypto_decision_memory_instances", None)
+        if cache is None:
+            cache = {}
+            self._crypto_decision_memory_instances = cache
+        cached = cache.get(key)
+        if cached is None:
+            cached = TradeMemory(
+                Path(key[0]), key[1], key[2], next_session_predicate=is_next_calendar_day
+            )
+            cache[key] = cached
+        return cached
 
     def _backfill_crypto_decision_memory(self, asset_a: str, asset_b: str) -> None:
         """Seed crypto decision memory from settled daily bars, once per process start."""
@@ -1251,6 +1312,8 @@ class CryptoRotationStrategy(Strategy):
     # -- Iteration -------------------------------------------------------
 
     def _run_crypto_iteration(self, report: dict[str, Any]) -> None:
+        self._invalidate_orders_cache()
+        self._quote_cache = {}
         actions: list[str] = []
         report["crypto_actions"] = actions
         managed = self._managed_crypto_symbols()
@@ -1306,7 +1369,7 @@ class CryptoRotationStrategy(Strategy):
                 held_working.pop(source, None)
                 exited_this_pass.add(source)
 
-        symbols = self._crypto_symbols(report, held)
+        symbols = self._crypto_symbols(report, held, managed)
         signals = self._crypto_signals(symbols)
         # Only a discovery-sourced candidate is safe to permanently exclude --
         # a config-listed CRYPTO_SYMBOLS entry hitting a transient data outage
@@ -1629,9 +1692,7 @@ class CryptoRotationStrategy(Strategy):
         fill_price = getattr(order, "get_fill_price", lambda: None)() or price
         self.log_message(f"Filled crypto {side} order: {total_quantity} {symbol} at ${fill_price}.", color="green")
         try:
-            TradeMemory(
-                Path(str(self.parameters["crypto_trade_memory_database_file"])), 1, 1
-            ).record_execution(
+            self._crypto_decision_memory().record_execution(
                 datetime.now(timezone.utc).date().isoformat(),
                 symbol,
                 side,
