@@ -20,6 +20,31 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 EASTERN_TIME = ZoneInfo("America/New_York")
+LIVE_TRADING_ACK_ENV = "PI_TRADING_LIVE_ACK"
+LIVE_TRADING_ACK_VALUE = "I_ACCEPT_LIVE_TRADING_RISK"
+
+
+def _apply_secret_environment_overrides(config: dict[str, Any]) -> None:
+    """Prefer process-injected secrets over values stored in config.json."""
+    for config_key, environment_key in (
+        ("ALPACA_API_KEY", "ALPACA_API_KEY"),
+        ("ALPACA_SECRET_KEY", "ALPACA_API_SECRET"),
+        ("EMAIL_SMTP_PASSWORD", "EMAIL_SMTP_PASSWORD"),
+    ):
+        value = os.environ.get(environment_key, "").strip()
+        if value:
+            config[config_key] = value
+
+
+def _require_live_trading_acknowledgement(config: dict[str, Any]) -> None:
+    """Require a second, out-of-file interlock before enabling real orders."""
+    if config["IS_PAPER_TRADING"]:
+        return
+    if os.environ.get(LIVE_TRADING_ACK_ENV) != LIVE_TRADING_ACK_VALUE:
+        raise ValueError(
+            "Live trading requires the independent environment acknowledgement "
+            f"{LIVE_TRADING_ACK_ENV}={LIVE_TRADING_ACK_VALUE}"
+        )
 
 
 def format_market_open_time(open_time: datetime) -> str:
@@ -168,6 +193,8 @@ def load_config(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Unable to read valid JSON from {path}: {exc}") from exc
 
+    _apply_secret_environment_overrides(config)
+
     required = {
         "ALPACA_API_KEY",
         "ALPACA_SECRET_KEY",
@@ -210,6 +237,7 @@ def load_config(path: Path) -> dict[str, Any]:
     ].startswith("REPLACE_WITH_"):
         raise ValueError("Replace the Alpaca credential placeholders in config.json")
     _require_booleans(config, "IS_PAPER_TRADING")
+    _require_live_trading_acknowledgement(config)
 
     asset_a = str(config["ASSET_A"]).strip().upper()
     asset_b = str(config["ASSET_B"]).strip().upper()
@@ -499,7 +527,13 @@ def load_config(path: Path) -> dict[str, Any]:
                 + ", ".join(invalid_email_fields)
             )
 
-    _require_booleans(config, "NEWS_CONTEXT_ENABLED", "NEWS_BLOCK_ON_HIGH_RISK")
+    config.setdefault("NEWS_FAIL_CLOSED_ON_UNAVAILABLE", True)
+    _require_booleans(
+        config,
+        "NEWS_CONTEXT_ENABLED",
+        "NEWS_BLOCK_ON_HIGH_RISK",
+        "NEWS_FAIL_CLOSED_ON_UNAVAILABLE",
+    )
     news_lookback = int(config["NEWS_LOOKBACK_HOURS"])
     news_limit = int(config["NEWS_MAX_ARTICLES"])
     news_block_score = int(config["NEWS_HIGH_RISK_SCORE"])
@@ -524,7 +558,13 @@ def load_config(path: Path) -> dict[str, Any]:
     )
     _require_range("NEWS_LEARNING_MIN_CORRELATION", minimum_correlation, 0, 1)
 
-    _require_booleans(config, "LLM_NEWS_ENABLED", "LLM_NEWS_BLOCK_ON_HIGH_RISK")
+    config.setdefault("LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE", True)
+    _require_booleans(
+        config,
+        "LLM_NEWS_ENABLED",
+        "LLM_NEWS_BLOCK_ON_HIGH_RISK",
+        "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE",
+    )
     llm_block_score = int(config["LLM_NEWS_BLOCK_SCORE"])
     _require_range("LLM_NEWS_BLOCK_SCORE", llm_block_score, -10, -1)
     llm_model = str(config["LLM_NEWS_MODEL"]).strip()
@@ -769,6 +809,9 @@ def build_strategy(
             "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
             "news_max_articles": config["NEWS_MAX_ARTICLES"],
             "news_block_on_high_risk": config["NEWS_BLOCK_ON_HIGH_RISK"],
+            "news_fail_closed_on_unavailable": config[
+                "NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
+            ],
             "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
             "news_learning_enabled": config["NEWS_LEARNING_ENABLED"],
             "news_learning_block_enabled": config[
@@ -810,6 +853,9 @@ def build_strategy(
             "llm_news_model": config["LLM_NEWS_MODEL"],
             "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
             "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
+            "llm_news_fail_closed_on_unavailable": config[
+                "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
+            ],
             "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
         },
     )

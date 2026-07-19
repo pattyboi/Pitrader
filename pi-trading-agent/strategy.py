@@ -762,7 +762,7 @@ class AssetRotationStrategy(Strategy):
         )
 
     def _get_news_context(self) -> NewsContext:
-        """Return recent headline context, failing open on data problems."""
+        """Return recent headline context; callers enforce configured outage policy."""
         if not bool(self.parameters.get("news_context_enabled", True)):
             return NewsContext(
                 available=False,
@@ -790,7 +790,7 @@ class AssetRotationStrategy(Strategy):
             return context
         except Exception as exc:
             self.log_message(
-                f"News context unavailable; price strategy will continue: "
+                f"News context unavailable; configured safety policy will decide: "
                 f"{type(exc).__name__}: {exc}",
                 color="red",
             )
@@ -1366,15 +1366,33 @@ class AssetRotationStrategy(Strategy):
         Used by the portfolio path so it honors the same configured guards as
         the A/B path. Completing an in-flight rotation is never vetoed.
         """
+        news_blocking_enabled = bool(
+            self.parameters.get("news_context_enabled", True)
+        ) and bool(self.parameters["news_block_on_high_risk"])
+        if (
+            news_blocking_enabled
+            and bool(self.parameters.get("news_fail_closed_on_unavailable", True))
+            and not news_context.available
+        ):
+            return "Trade blocked: world-event risk context is unavailable"
         if (
             news_context.available
-            and bool(self.parameters["news_block_on_high_risk"])
+            and news_blocking_enabled
             and news_context.score <= int(self.parameters["news_high_risk_score"])
         ):
             return f"Trade blocked: high world-event risk score {news_context.score}"
+        llm_blocking_enabled = bool(
+            self.parameters.get("llm_news_enabled", False)
+        ) and bool(self.parameters["llm_news_block_on_high_risk"])
+        if (
+            llm_blocking_enabled
+            and bool(self.parameters.get("llm_news_fail_closed_on_unavailable", True))
+            and not llm_assessment.available
+        ):
+            return "Trade blocked: LLM news assessment is unavailable"
         if (
             llm_assessment.available
-            and bool(self.parameters["llm_news_block_on_high_risk"])
+            and llm_blocking_enabled
             and llm_assessment.score <= int(self.parameters["llm_news_block_score"])
         ):
             return f"Trade blocked: LLM news assessment score {llm_assessment.score:+d}"
@@ -2987,11 +3005,15 @@ class AssetRotationStrategy(Strategy):
                 color="yellow",
             )
             return None
-        if window is None:
-            return None
+        return window
+
+    def _mark_iteration_window_completed(self, window: str) -> None:
+        """Persist a window only after its trading pipeline returns successfully."""
+        state = self.vars.portfolio_iteration_state
+        if window in state["windows_completed"]:
+            return
         state["windows_completed"] = [*state["windows_completed"], window]
         self._save_portfolio_iteration_state()
-        return window
 
     def on_trading_iteration(self) -> None:
         """Evaluate today's portfolio dip signals up to twice a trading day.
@@ -3010,10 +3032,12 @@ class AssetRotationStrategy(Strategy):
         }
         try:
             self._run_portfolio_iteration(report)
+            self._mark_iteration_window_completed(window)
         except Exception as exc:
             report["status"] = f"Evaluation error: {type(exc).__name__}: {exc}"
-            # Network and broker failures are logged and retried on the next
-            # scheduled iteration instead of terminating the service.
+            # Active-order checks and persisted rotation intent make the
+            # pipeline retry-safe. Do not consume this window: a transient
+            # network or broker failure should retry on the next poll.
             self.log_message(
                 f"Trading iteration failed safely: {type(exc).__name__}: {exc}",
                 color="red",

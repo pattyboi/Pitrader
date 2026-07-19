@@ -323,9 +323,12 @@ class WorldEventAnalyzer:
 
         if not fetched_articles:
             return NewsContext(
-                available=True,
-                risk_level="normal",
-                explanation="No recent news articles were available from any configured source.",
+                available=False,
+                risk_level="unavailable",
+                explanation=(
+                    "No recent news articles were returned by any configured source; "
+                    "risk could not be assessed."
+                ),
             )
 
         scoring = self.score_articles(

@@ -341,6 +341,7 @@ The initial file is:
   "NEWS_LOOKBACK_HOURS": 24,
   "NEWS_MAX_ARTICLES": 50,
   "NEWS_BLOCK_ON_HIGH_RISK": true,
+  "NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
   "NEWS_HIGH_RISK_SCORE": -6,
   "NEWS_LEARNING_ENABLED": true,
   "NEWS_LEARNING_BLOCK_ENABLED": true,
@@ -362,6 +363,7 @@ The initial file is:
   "LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
   "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
   "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
+  "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
   "LLM_NEWS_BLOCK_SCORE": -6
 }
 ```
@@ -383,6 +385,12 @@ Protect the file so only its owner can read and write it:
 ```bash
 chmod 600 config.json
 ```
+
+For stronger secret isolation, leave the credential placeholders in JSON and
+inject `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `EMAIL_SMTP_PASSWORD` into
+the service environment. Non-empty environment values override the matching
+JSON settings before validation. Keep any environment or systemd credential
+source owner-readable only; never place secrets in command-line arguments.
 
 #### Configuration reference
 
@@ -429,6 +437,7 @@ chmod 600 config.json
 | `NEWS_LOOKBACK_HOURS` | Age window for news articles | `24` |
 | `NEWS_MAX_ARTICLES` | Maximum articles checked daily | `50` |
 | `NEWS_BLOCK_ON_HIGH_RISK` | Allows severe news context to block a rotation | `true` |
+| `NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | Blocks opening trades when enabled news protection cannot obtain evidence | `true` |
 | `NEWS_HIGH_RISK_SCORE` | Score at or below which a trade is blocked | `-6` |
 | `NEWS_LEARNING_ENABLED` | Learns news-score/next-return relationships | `true` |
 | `NEWS_LEARNING_BLOCK_ENABLED` | Allows a mature learned forecast to block rotation | `true` |
@@ -455,6 +464,7 @@ chmod 600 config.json
 | `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"` |
 | `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
 | `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
+| `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | When LLM blocking is enabled, blocks opening trades if the assessment fails | `true` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
 
 JSON is strict:
@@ -1432,7 +1442,16 @@ from live trading in fills, slippage, liquidity, and delays.
 
 Setting `IS_PAPER_TRADING` to `false` can submit real-money orders when used with
 live credentials. Do not make that change merely to test whether the service
-works. Use paper mode for testing.
+works. Use paper mode for testing. Live startup also requires an independent
+process-environment acknowledgement:
+
+```text
+PI_TRADING_LIVE_ACK=I_ACCEPT_LIVE_TRADING_RISK
+```
+
+The service refuses to start in live mode without that exact value. Configure
+it in the service manager only after completing the live-readiness checklist;
+do not store it in `config.json`.
 
 If you eventually choose live mode:
 
@@ -1441,8 +1460,9 @@ If you eventually choose live mode:
 3. Back up the existing configuration securely.
 4. Enter the live account credentials.
 5. Change `IS_PAPER_TRADING` to `false`.
-6. Recheck the symbols, positions, threshold, and account balance.
-7. Start the service while actively watching both the logs and broker dashboard.
+6. Configure the independent `PI_TRADING_LIVE_ACK` environment interlock.
+7. Recheck the symbols, positions, threshold, and account balance.
+8. Start the service while actively watching both the logs and broker dashboard.
 
 The software cannot determine whether a symbol is suitable for you or whether
 the configured trade size matches your risk tolerance.
@@ -1588,6 +1608,7 @@ after an unexpected interruption.
 ## Security guidance
 
 - Keep `config.json` at permission mode `600`.
+- Prefer environment- or service-manager-injected credentials over plaintext JSON values.
 - Do not commit credentials to Git.
 - Do not paste journal output publicly without checking it for private data.
 - Treat the SMTP password as carefully as the Alpaca API secret.
