@@ -442,7 +442,9 @@ class CryptoRotationStrategy(Strategy):
         if symbol in cache:
             return cache[symbol]
         result = self._fetch_crypto_quote_price_and_bid_ask(symbol)
-        cache[symbol] = result
+        # Only cache a usable price -- see strategy.py's identical helper.
+        if result[0] is not None:
+            cache[symbol] = result
         return result
 
     def _fetch_crypto_quote_price_and_bid_ask(
@@ -1686,6 +1688,11 @@ class CryptoRotationStrategy(Strategy):
         )
 
     def on_filled_order(self, position: Any, order: Any, price: float, quantity: float, multiplier: float) -> None:
+        # See AssetRotationStrategy.on_filled_order's comment (strategy.py):
+        # this runs on the broker's event thread, independent of
+        # _run_crypto_iteration's cadence, so any orders-cache snapshot from
+        # a prior iteration must not be trusted here.
+        self._invalidate_orders_cache()
         symbol = str(getattr(getattr(order, "asset", None), "symbol", "unknown")).upper()
         side = str(getattr(order, "side", "unknown")).lower()
         total_quantity = getattr(order, "quantity", None) or quantity
@@ -1748,6 +1755,7 @@ class CryptoRotationStrategy(Strategy):
                     )
 
     def on_canceled_order(self, order: Any) -> None:
+        self._invalidate_orders_cache()  # see on_filled_order's comment
         symbol = str(getattr(getattr(order, "asset", None), "symbol", "unknown")).upper()
         side = str(getattr(order, "side", "unknown")).lower()
         self.log_message(f"Crypto order canceled or rejected by the broker: {side} {symbol}.", color="red")

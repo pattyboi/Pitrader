@@ -17,7 +17,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -39,14 +38,6 @@ _SUFFIXES = re.compile(
     re.IGNORECASE,
 )
 _NON_WORD = re.compile(r"[^a-z0-9\s]")
-
-
-@dataclass
-class SymbolRecord:
-    ticker: str
-    alpaca_name: str | None
-    sec_name: str | None
-    verified: bool
 
 
 class SymbolReference:
@@ -149,6 +140,13 @@ class SymbolReference:
                     alpaca_name = asset.get("name")
             except Exception:
                 pass
+            if not alpaca_succeeded:
+                # A transient Alpaca error for this one symbol -- not a
+                # confirmed "asset not found" -- must not upsert a record
+                # with alpaca_name=None, which would erase or downgrade an
+                # already-verified row. Leave it untouched this cycle,
+                # matching this method's documented fail-open contract.
+                return False, None
             sec_name = sec_by_ticker.get(symbol)
             if alpaca_name is None and sec_name is None:
                 # Neither source recognizes this ticker; do not record a bare

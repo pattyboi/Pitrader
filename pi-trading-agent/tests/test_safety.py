@@ -3281,3 +3281,139 @@ def test_decision_memory_reuses_one_instance_per_key(tmp_path: Path) -> None:
 
     assert same_a is same_b
     assert different is not same_a
+
+
+# -- Bugfix regressions found in the follow-up correctness audit of the
+# caching commit above, plus a few pre-existing issues surfaced alongside it.
+
+def test_on_filled_order_invalidates_orders_cache(tmp_path: Path) -> None:
+    # on_filled_order runs on the broker's own callback thread, independent
+    # of _run_portfolio_iteration's cadence -- a snapshot left over from a
+    # prior iteration must not survive into this callback's own order checks.
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy._orders_cache = ["stale"]
+    strategy.parameters = {"decision_memory_database_file": str(tmp_path / "decision.duckdb")}
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.get_datetime = lambda: datetime(2026, 7, 19, tzinfo=timezone.utc)
+    strategy.vars = SimpleNamespace(portfolio_pending_rotation={})
+    strategy._record_portfolio_entry = lambda symbol: None
+    strategy._remember_confirmed_portfolio_symbol = lambda symbol: None
+    order = SimpleNamespace(
+        asset=SimpleNamespace(symbol="AAAA"), side="buy", quantity=1.0, get_fill_price=lambda: 10.0
+    )
+
+    strategy.on_filled_order(None, order, 10.0, 1.0, 1.0)
+
+    assert strategy._orders_cache is None
+
+
+def test_crypto_on_filled_order_invalidates_orders_cache(tmp_path: Path) -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy._orders_cache = ["stale"]
+    strategy.parameters = {"crypto_trade_memory_database_file": str(tmp_path / "crypto_decision.duckdb")}
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.vars = SimpleNamespace(crypto_pending_rotation=None)
+    strategy._record_crypto_entry = lambda symbol: None
+    strategy._remember_confirmed_crypto_symbol = lambda symbol: None
+    order = SimpleNamespace(
+        asset=SimpleNamespace(symbol="BTC"), side="buy", quantity=1.0, get_fill_price=lambda: 10.0
+    )
+
+    strategy.on_filled_order(None, order, 10.0, 1.0, 1.0)
+
+    assert strategy._orders_cache is None
+
+
+def test_on_canceled_order_invalidates_orders_cache() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy._orders_cache = ["stale"]
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.vars = SimpleNamespace(portfolio_pending_rotation={})
+
+    strategy.on_canceled_order(SimpleNamespace(asset=SimpleNamespace(symbol="AAAA"), side="sell"))
+
+    assert strategy._orders_cache is None
+
+
+def test_get_quote_price_and_bid_ask_does_not_cache_a_failed_lookup() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    calls = {"count": 0}
+
+    def flaky_get_quote(symbol: str):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise ConnectionError("transient")
+        return _quote(100.0, 99.5, 100.5)
+
+    strategy.get_quote = flaky_get_quote
+
+    price, _ = strategy._get_quote_price_and_bid_ask("AAAA")
+    assert price is None
+    price, _ = strategy._get_quote_price_and_bid_ask("AAAA")
+    assert price == 100.0
+    assert calls["count"] == 2  # the failed lookup was not cached and retried
+
+
+def test_backfill_history_skips_non_adjacent_session_pairs(tmp_path: Path) -> None:
+    # 2026-01-02 is a Friday and 2026-01-08 is the following Thursday --
+    # list-adjacent but not trading-session-adjacent (three sessions between
+    # them). Pairing them would record a multi-day move as a single session's
+    # edge under the default is_next_trading_session predicate.
+    memory = TradeMemory(tmp_path / "memory.duckdb", 1, 10)
+
+    inserted = memory.backfill_history(
+        [
+            ("2026-01-02", 100.0, 100.0, 5.0, True),
+            ("2026-01-08", 110.0, 90.0, 5.0, True),
+        ]
+    )
+
+    assert inserted == 0
+
+
+def test_backfill_history_still_pairs_adjacent_sessions(tmp_path: Path) -> None:
+    memory = TradeMemory(tmp_path / "memory.duckdb", 1, 10)
+
+    inserted = memory.backfill_history(
+        [
+            ("2026-01-02", 100.0, 100.0, 5.0, True),
+            ("2026-01-05", 101.0, 102.0, 5.0, True),
+        ]
+    )
+
+    assert inserted == 1
+
+
+def test_symbol_reference_refresh_failure_does_not_erase_verified_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "symbols.duckdb"
+    reference = SymbolReference(
+        db_path,
+        refresh_days=0,
+        alpaca_fetcher=lambda url, headers: {"symbol": "AAPL", "name": "Apple Inc."},
+        sec_fetcher=lambda url, timeout: [{"ticker": "AAPL", "title": "Apple Inc."}],
+    )
+    assert reference.refresh(["AAPL"], "key", "secret") is True
+
+    def fail(*args, **kwargs):
+        raise OSError("timeout")
+
+    reference._alpaca_fetcher = fail
+    reference.refresh(["AAPL"], "key", "secret")
+
+    with duckdb.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT alpaca_name, verified FROM symbols WHERE ticker = 'AAPL'"
+        ).fetchone()
+    assert row == ("Apple Inc.", True)
+
+
+def test_build_snapshot_entries_skips_a_malformed_entry_instead_of_raising() -> None:
+    entries = signal_snapshot.build_snapshot_entries(
+        [
+            {"symbol": "AAAA", "posture_adjusted_edge": 1.5, "dip": 3.0, "qualifies": True},
+            {"posture_adjusted_edge": "not-a-number"},  # missing "symbol" entirely
+        ],
+        held=set(),
+    )
+
+    assert [entry["symbol"] for entry in entries] == ["AAAA"]

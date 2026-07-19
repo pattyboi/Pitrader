@@ -37,9 +37,14 @@ PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 
 def _load_snapshot(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    # A writer always produces a JSON object; anything else (a foreign or
+    # corrupted file) must not be trusted as one -- callers rely on this
+    # return type actually being a dict (or None) and call .get() on it
+    # unguarded.
+    return data if isinstance(data, dict) else None
 
 
 def _load_trade_count(path: Path) -> int:

@@ -1656,7 +1656,11 @@ class AssetRotationStrategy(Strategy):
         if symbol in cache:
             return cache[symbol]
         result = self._fetch_quote_price_and_bid_ask(symbol)
-        cache[symbol] = result
+        # Only cache a usable price. A transient fetch failure (result[0] is
+        # None) must not poison every later call site for this symbol this
+        # iteration -- each of those deserves its own chance at a fresh quote.
+        if result[0] is not None:
+            cache[symbol] = result
         return result
 
     def _fetch_quote_price_and_bid_ask(
@@ -3331,6 +3335,12 @@ class AssetRotationStrategy(Strategy):
         multiplier: float,
     ) -> None:
         """Record broker-confirmed executions in the Lumibot log."""
+        # This callback runs on the broker's own event thread, independent of
+        # _run_portfolio_iteration's cadence -- it can fire long after the
+        # iteration that populated self._orders_cache returned. A fill or
+        # cancellation is itself proof the order book just changed, so any
+        # snapshot from a prior iteration must not be trusted here.
+        self._invalidate_orders_cache()
         symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
         side = getattr(order, "side", "unknown")
         # `quantity`/`price` here are the broker trade-update event's own fields,
@@ -3437,6 +3447,7 @@ class AssetRotationStrategy(Strategy):
 
     def on_canceled_order(self, order: Any) -> None:
         """Keep the rotation state truthful when the broker kills an order."""
+        self._invalidate_orders_cache()  # see on_filled_order's comment
         symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
         side = str(getattr(order, "side", "unknown")).lower()
         self.log_message(

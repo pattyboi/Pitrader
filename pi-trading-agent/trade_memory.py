@@ -109,9 +109,16 @@ class TradeMemory:
         inserted = 0
         with self._open() as conn:
             before = self._observation_count(conn)
-            for (date, price_a, price_b, dip, signal), (_, next_a, next_b, _, _) in zip(
+            for (date, price_a, price_b, dip, signal), (next_date, next_a, next_b, _, _) in zip(
                 rows, rows[1:]
             ):
+                # List-adjacency isn't session-adjacency: a source data gap
+                # for just one of the two assets (a halt, delisting, missing
+                # bar) can silently skip a date out of `rows` upstream, which
+                # would otherwise pair two non-consecutive sessions here and
+                # record a multi-day return as if it were a single session's.
+                if not self._next_session_predicate(str(date), str(next_date)):
+                    continue
                 if min(price_a, price_b, next_a, next_b) <= 0:
                     continue
                 edge = ((next_b - price_b) / price_b - (next_a - price_a) / price_a) * 100.0

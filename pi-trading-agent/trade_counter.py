@@ -32,9 +32,15 @@ def record_trade(path: str, today: str) -> None:
             data = json.loads(file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = {}
-        if data.get("date") != today:
+        if not isinstance(data, dict) or data.get("date") != today:
             data = {"date": today, "count": 0}
         data["count"] = int(data.get("count", 0)) + 1
-        file.write_text(json.dumps(data), encoding="utf-8")
+        # Atomic write (temp file + replace) -- scripts/web_dashboard.py polls
+        # this file continuously, and a process kill mid-write (a real risk on
+        # a Pi) would otherwise leave it truncated instead of at the last good
+        # count, matching this codebase's other state files.
+        temporary_path = file.with_suffix(file.suffix + ".tmp")
+        temporary_path.write_text(json.dumps(data), encoding="utf-8")
+        temporary_path.replace(file)
     except Exception:
         pass

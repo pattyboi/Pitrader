@@ -19,7 +19,7 @@ import pandas as pd
 
 from trade_memory import RotationForecast
 from market_sessions import is_next_trading_session
-from ridge_regression import fit_two_feature_ridge, fit_two_feature_ridge_model
+from ridge_regression import fit_two_feature_ridge_model
 
 
 @dataclass(frozen=True)
@@ -294,24 +294,6 @@ class PortfolioMemory:
     @staticmethod
     def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
-
-    def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:
-        count = len(rows)
-        if count < self.minimum_observations:
-            return RotationForecast(
-                count, False, None, None,
-                f"Portfolio memory is warming up: {count}/{self.minimum_observations} pooled dip signals settled.",
-            )
-        # Same two-feature, ridge-stabilized regression as TradeMemory._fit,
-        # pooled across every symbol's history rather than one A/B pair.
-        fit = fit_two_feature_ridge(rows, dip, score)
-        if fit is None:
-            return RotationForecast(count, False, None, None, "Portfolio memory lacks enough feature variation for a trustworthy forecast.")
-        predicted, correlation = fit
-        return RotationForecast(
-            count, True, predicted, correlation,
-            f"Portfolio memory used {count} pooled dip signals; predicted next-session return {predicted:+.2f}% (fit correlation {correlation:+.2f}).",
-        )
 
     def _fit_many(
         self,

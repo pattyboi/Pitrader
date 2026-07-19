@@ -37,21 +37,30 @@ def build_snapshot_entries(
     held_symbols = set(held)
     entries: list[dict[str, Any]] = []
     for signal in signals:
-        symbol = str(signal["symbol"])
-        edge = signal.get("posture_adjusted_edge")
-        if edge is None:
-            edge = signal.get("expected_profit")
-        edge_percent = float(edge) if edge is not None else 0.0
-        entries.append(
-            {
-                "symbol": symbol,
-                "held": symbol in held_symbols,
-                "qualifies": bool(signal.get("qualifies")),
-                "dip_percent": float(signal.get("dip") or 0.0),
-                "edge_percent": edge_percent,
-                "opinion": "+" if edge_percent >= 0 else "-",
-            }
-        )
+        # This function itself must never raise -- it's called inline as an
+        # argument expression at the call site (before write_snapshot's own
+        # try/except is even entered), and the module docstring promises
+        # writing this snapshot can never affect a trading decision. A
+        # malformed entry (missing/non-numeric field) is skipped rather than
+        # aborting the rest of the trading iteration.
+        try:
+            symbol = str(signal["symbol"])
+            edge = signal.get("posture_adjusted_edge")
+            if edge is None:
+                edge = signal.get("expected_profit")
+            edge_percent = float(edge) if edge is not None else 0.0
+            entries.append(
+                {
+                    "symbol": symbol,
+                    "held": symbol in held_symbols,
+                    "qualifies": bool(signal.get("qualifies")),
+                    "dip_percent": float(signal.get("dip") or 0.0),
+                    "edge_percent": edge_percent,
+                    "opinion": "+" if edge_percent >= 0 else "-",
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
     entries.sort(key=lambda entry: str(entry["symbol"]))
     return entries
 
@@ -66,7 +75,14 @@ def write_snapshot(
     if not path:
         return
     try:
-        Path(path).write_text(
+        target = Path(path)
+        # Atomic write (temp file + replace), matching this codebase's other
+        # state files (e.g. adaptive_news_model.py) -- scripts/web_dashboard.py
+        # polls this file continuously, and a truncate-then-write left
+        # half-written by a mid-write process kill (a real risk on a Pi) would
+        # otherwise show as a momentary "no data" instead of the last good read.
+        temporary_path = target.with_suffix(target.suffix + ".tmp")
+        temporary_path.write_text(
             json.dumps(
                 {
                     "generated_at": generated_at,
@@ -77,5 +93,6 @@ def write_snapshot(
             ),
             encoding="utf-8",
         )
+        temporary_path.replace(target)
     except Exception:
         pass
