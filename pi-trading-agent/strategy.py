@@ -1,7 +1,6 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
 import faulthandler
-import html
 import json
 import math
 import os
@@ -18,6 +17,8 @@ from typing import Any, Callable
 from lumibot.strategies import Strategy
 
 import article_filter
+import decision_math
+import email_render
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
@@ -54,24 +55,15 @@ class AssetRotationStrategy(Strategy):
     # rejected (or filled into a deficit) if the price moves before execution.
     CASH_BUFFER_FRACTION = 0.01
 
-    # How strongly the risky/conservative reasoning pattern reshapes a
-    # symbol's historical edge in _posture_adjusted_edge: conservative leans
-    # on consistency (penalizing variance and bad-news days harder), risky
-    # leans on raw edge (barely discounting variance or negative news).
-    # These never change PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself, only
-    # which already-qualifying candidate looks best and which holding looks
-    # weakest.
-    _POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
-    _POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
-    _POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
-    # How much weight a ready PortfolioMemory forecast gets when it disagrees
-    # with a symbol's raw historical expected_profit: risky leans into the
-    # pooled, cross-symbol learned edge more; conservative trusts the
-    # unadjusted historical backtest more until the learned edge has proven
-    # itself. Same never-changes-eligibility invariant as the other posture
-    # weights above.
-    _POSTURE_LEARNED_EDGE_WEIGHT = {"conservative": 0.25, "risky": 0.6}
-    _POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
+    # These constants and the three methods aliased below live in
+    # decision_math.py -- pure, asset-class-agnostic math shared with
+    # CryptoRotationStrategy. Kept as class attributes here so existing call
+    # sites (self._posture_adjusted_edge(...), etc.) and tests are unaffected.
+    _POSTURE_VARIANCE_PENALTY = decision_math.POSTURE_VARIANCE_PENALTY
+    _POSTURE_CONSISTENCY_WEIGHT = decision_math.POSTURE_CONSISTENCY_WEIGHT
+    _POSTURE_NEWS_DISCOUNT_PER_POINT = decision_math.POSTURE_NEWS_DISCOUNT_PER_POINT
+    _POSTURE_LEARNED_EDGE_WEIGHT = decision_math.POSTURE_LEARNED_EDGE_WEIGHT
+    _POSTURE_MAX_ADJUSTMENT_PERCENT = decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
 
     # Order statuses that mean an order can no longer fill. Anything else is
     # treated as still working so the agent never submits a duplicate.
@@ -664,78 +656,18 @@ class AssetRotationStrategy(Strategy):
                 color="red",
             )
 
-    @staticmethod
-    def _email_status_theme(status: str) -> tuple[str, str]:
-        """Map a free-text status line to a (background, text) banner color."""
-        lowered = status.lower()
-        if "block" in lowered or "error" in lowered or "failed" in lowered:
-            return "#fdecea", "#b3261e"
-        if "pending" in lowered or "waiting" in lowered:
-            return "#fff4e5", "#8a5300"
-        if any(term in lowered for term in ("submitted", "complete", "filled", "finished", "top-up", "build")):
-            return "#e6f4ea", "#1e7e34"
-        return "#eceff1", "#455a64"
-
-    @staticmethod
-    def _email_value(value: Any, *, money: bool = False) -> str:
-        if value is None:
-            return "unavailable"
-        if money and isinstance(value, (int, float)) and not isinstance(value, bool):
-            return f"${float(value):,.2f}"
-        return str(value)
-
-    @classmethod
-    def _email_kv_section(cls, title: str, rows: list[tuple[str, Any]]) -> str:
-        """Render a titled two-column table of label/value rows."""
-        body_rows = []
-        for index, (label, value) in enumerate(rows):
-            shade = "#ffffff" if index % 2 == 0 else "#f8f9fb"
-            body_rows.append(
-                '<tr style="background-color:{shade};">'
-                '<td style="padding:8px 12px;font-size:13px;color:#5f6368;width:44%;'
-                'border-bottom:1px solid #eceff1;vertical-align:top;">{label}</td>'
-                '<td style="padding:8px 12px;font-size:13px;color:#1a1a2e;font-weight:500;'
-                'border-bottom:1px solid #eceff1;vertical-align:top;">{value}</td>'
-                "</tr>".format(
-                    shade=shade,
-                    label=html.escape(label),
-                    value=html.escape(cls._email_value(value)),
-                )
-            )
-        return (
-            '<div style="font-size:12px;font-weight:700;color:#8a8f98;'
-            'text-transform:uppercase;letter-spacing:0.05em;margin:20px 0 6px;">'
-            f"{html.escape(title)}</div>"
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-            'style="border-collapse:collapse;">' + "".join(body_rows) + "</table>"
-        )
-
-    @classmethod
-    def _email_bullet_section(cls, title: str, items: list[str]) -> str:
-        """Render a titled bullet list, or a muted placeholder when empty."""
-        heading = (
-            '<div style="font-size:12px;font-weight:700;color:#8a8f98;'
-            'text-transform:uppercase;letter-spacing:0.05em;margin:20px 0 6px;">'
-            f"{html.escape(title)}</div>"
-        )
-        if not items:
-            return heading + (
-                '<div style="font-size:13px;color:#8a8f98;font-style:italic;">'
-                "None reported</div>"
-            )
-        list_items = "".join(
-            f'<li style="margin-bottom:4px;">{html.escape(str(item))}</li>' for item in items
-        )
-        return heading + (
-            '<ul style="margin:0;padding-left:18px;color:#333333;font-size:13px;line-height:1.6;">'
-            + list_items
-            + "</ul>"
-        )
+    # These render helpers live in email_render.py -- generic HTML-table
+    # builders with no report-shape or equity-specific coupling, shared with
+    # CryptoRotationStrategy's own email report. Aliased under their old
+    # names so existing call sites in _render_email_html below are unaffected.
+    _email_status_theme = staticmethod(email_render.email_status_theme)
+    _email_value = staticmethod(email_render.email_value)
+    _email_kv_section = staticmethod(email_render.email_kv_section)
+    _email_bullet_section = staticmethod(email_render.email_bullet_section)
 
     def _render_email_html(self, report: dict[str, Any], report_date: str) -> str:
         """Build a styled HTML alternative body mirroring the plain-text report."""
         status = str(report["status"])
-        badge_bg, badge_fg = self._email_status_theme(status)
         mode_label = "Portfolio mode"
 
         snapshot_rows = [
@@ -819,44 +751,13 @@ class AssetRotationStrategy(Strategy):
             ]
         )
 
-        narrative = str(report.get("daily_narrative") or "").strip()
-        narrative_block = (
-            '<tr><td style="padding:14px 24px 0;color:#333333;font-size:13px;'
-            f'line-height:1.6;font-style:italic;">{html.escape(narrative)}</td></tr>'
-            if narrative
-            else ""
+        return email_render.render_email_shell(
+            report_date=report_date,
+            mode_label=mode_label,
+            status=status,
+            narrative=str(report.get("daily_narrative") or ""),
+            sections_html=sections,
         )
-
-        return f"""\
-<!doctype html>
-<html>
-<body style="margin:0;padding:0;background-color:#f2f4f6;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f2f4f6;">
-<tr><td align="center" style="padding:24px 12px;">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-<tr><td style="background-color:#1a1a2e;padding:20px 24px;">
-<div style="color:#ffffff;font-size:18px;font-weight:600;">Raspberry Pi Trading Agent</div>
-<div style="color:#b8bcc8;font-size:13px;margin-top:4px;">Daily Summary &middot; {html.escape(report_date)} &middot; {html.escape(mode_label)}</div>
-</td></tr>
-<tr><td style="padding:20px 24px 0;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{badge_bg};border-radius:6px;">
-<tr><td style="padding:14px 16px;color:{badge_fg};font-size:14px;font-weight:600;">{html.escape(status)}</td></tr>
-</table>
-</td></tr>
-{narrative_block}
-<tr><td style="padding:0 24px 8px;">
-{sections}
-</td></tr>
-<tr><td style="padding:16px 24px 20px;color:#8a8f98;font-size:12px;line-height:1.5;border-top:1px solid #eceff1;">
-Review all orders and positions in the Alpaca dashboard.<br>
-This automated message is not financial advice.
-</td></tr>
-</table>
-</td></tr>
-</table>
-</body>
-</html>
-"""
 
     def _get_news_context(self) -> NewsContext:
         """Return recent headline context, failing open on data problems."""
@@ -1499,6 +1400,7 @@ This automated message is not financial advice.
                 return "working"
             spendable = min(float(self.get_cash()), budget) * (1.0 - self.CASH_BUFFER_FRACTION)
             spendable -= float(self.parameters.get("portfolio_cash_reserve_dollars", 0.0))
+            spendable -= float(self.parameters.get("portfolio_crypto_reserve_dollars", 0.0))
             if spendable < float(self.parameters.get("portfolio_min_order_dollars", 1.0)):
                 return "insufficient"
             if bool(self.parameters.get("fractional_shares", False)):
@@ -1524,28 +1426,7 @@ This automated message is not financial advice.
             )
             return "submitted"
 
-    @staticmethod
-    def _walk_forward_net_returns(
-        returns: list[float],
-        round_trip_cost_percent: float,
-        minimum_observations: int,
-        entry_threshold_percent: float,
-    ) -> list[float]:
-        """Evaluate only trades selected from information available beforehand.
-
-        Each validation result uses a historical mean formed strictly before
-        that event.  This prevents a candidate's realised return from helping
-        select itself, unlike an in-sample average.
-        """
-        outcomes: list[float] = []
-        for index in range(minimum_observations, len(returns)):
-            prior_net_mean = (
-                sum(value - round_trip_cost_percent for value in returns[:index])
-                / index
-            )
-            if prior_net_mean >= entry_threshold_percent:
-                outcomes.append(returns[index] - round_trip_cost_percent)
-        return outcomes
+    _walk_forward_net_returns = staticmethod(decision_math.walk_forward_net_returns)
 
     def _get_bid_ask(self, symbol: str) -> tuple[float, float] | None:
         """Live (bid, ask) for symbol, or None on any missing/invalid/one-sided quote.
@@ -2238,85 +2119,8 @@ This automated message is not financial advice.
         )
         return report
 
-    @staticmethod
-    def _posture_adjusted_edge(
-        signal: dict[str, float | int | str | None],
-        posture: str,
-        news_score: float | int | None,
-    ) -> float:
-        """Reshape a symbol's historical edge through a risky or conservative lens.
-
-        Conservative leans on consistency: it penalizes return variance and a
-        negative news day harder. Risky leans on raw edge: it barely
-        discounts variance or bad news. This never changes
-        PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT itself; it only reweights which
-        already-qualifying candidate looks best and which current holding
-        looks weakest.
-        """
-        posture = posture if posture in ("conservative", "risky") else "conservative"
-        expected_profit = float(signal["expected_profit"])
-        stdev = float(signal.get("return_stdev") or 0.0)
-        win_probability = float(signal.get("win_probability") or 0.5)
-        adjustment = -AssetRotationStrategy._POSTURE_VARIANCE_PENALTY[posture] * stdev
-        adjustment += (
-            (win_probability - 0.5) * 2.0 * AssetRotationStrategy._POSTURE_CONSISTENCY_WEIGHT[posture]
-        )
-        if news_score is not None:
-            capped_score = max(-10.0, min(10.0, float(news_score)))
-            adjustment -= max(0.0, -capped_score) * AssetRotationStrategy._POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
-        if signal.get("learned_edge_ready") and signal.get("learned_edge") is not None:
-            learned_edge = float(signal["learned_edge"])
-            adjustment += (
-                (learned_edge - expected_profit)
-                * AssetRotationStrategy._POSTURE_LEARNED_EDGE_WEIGHT[posture]
-            )
-        max_adjustment = AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
-        adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
-        return expected_profit + adjustment
-
-    @staticmethod
-    def _optimal_position_count(
-        total_capital: float,
-        min_order_dollars: float,
-        candidate_edges: list[tuple[float, float]],
-        configured_max_positions: int,
-    ) -> int:
-        """How many of today's ranked candidates are worth splitting capital across.
-
-        `candidate_edges` is `(expected_profit_percent, return_stdev_percent)`
-        per eligible candidate, in the caller's posture-adjusted ranking order
-        -- the order buys actually happen in, so each prefix scored below is
-        exactly the basket that many buys would create. Scores each
-        feasible position count n by the Sharpe-like ratio of an equal-weighted,
-        n-position basket -- mean edge divided by portfolio risk, where risk
-        assumes zero correlation between candidates (equal-weighted variance of
-        n independent bets falls off as 1/n). That independence assumption is
-        an optimistic upper bound: symbols sharing a market factor (broad index
-        ETFs moving together in a dip, for instance) diversify less than this
-        in practice, so the result is a ceiling suggestion, not a promise.
-        n never exceeds configured_max_positions -- this narrows that
-        configured ceiling to what today's capital and candidate quality
-        actually support; it never widens it.
-        """
-        if configured_max_positions < 1:
-            return 1
-        if not candidate_edges or total_capital <= 0 or min_order_dollars <= 0:
-            return 1
-        feasible_cap = max(1, int(total_capital // min_order_dollars))
-        ceiling = max(1, min(configured_max_positions, feasible_cap, len(candidate_edges)))
-
-        best_n = 1
-        best_score = float("-inf")
-        for n in range(1, ceiling + 1):
-            top = candidate_edges[:n]
-            mean_edge = sum(edge for edge, _ in top) / n
-            mean_variance = sum(stdev * stdev for _, stdev in top) / n
-            portfolio_stdev = math.sqrt(mean_variance / n)
-            score = mean_edge / portfolio_stdev if portfolio_stdev > 0 else mean_edge * 1e6
-            if score > best_score:
-                best_score = score
-                best_n = n
-        return best_n
+    _posture_adjusted_edge = staticmethod(decision_math.posture_adjusted_edge)
+    _optimal_position_count = staticmethod(decision_math.optimal_position_count)
 
     def _autonomous_universe(self) -> AutonomousUniverse:
         return AutonomousUniverse(

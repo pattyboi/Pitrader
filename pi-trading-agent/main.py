@@ -343,10 +343,148 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
     config["PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"] = second_iteration_offset_minutes
 
+    # Crypto trading runs as a separate process (main_crypto.py, its own
+    # systemd service) only while NYSE is closed, but validated here in the
+    # same load_config both processes share, so the equity process can also
+    # see CRYPTO_CASH_ALLOCATION_DOLLARS and treat it as an untouchable
+    # reserve (see portfolio_crypto_reserve_dollars in build_strategy below).
+    crypto_defaults = {
+        "CRYPTO_ENABLED": False,
+        "CRYPTO_SYMBOLS": ["BTC", "ETH"],
+        "CRYPTO_MAX_POSITIONS": 1,
+        "CRYPTO_ANALYSIS_DAYS": 252,
+        "CRYPTO_RECENT_HIGH_LOOKBACK_DAYS": 20,
+        "CRYPTO_MIN_SIGNAL_OBSERVATIONS": 20,
+        "CRYPTO_DIP_THRESHOLD_PERCENT": 5.0,
+        "CRYPTO_MIN_EXPECTED_PROFIT_PERCENT": 1.0,
+        "CRYPTO_OOS_MIN_OBSERVATIONS": 10,
+        "CRYPTO_OOS_MIN_NET_PROFIT_PERCENT": 0.0,
+        # Crypto trades on spread rather than commission, and spreads run
+        # structurally wider than large-cap equity ETFs -- this default is
+        # not just PORTFOLIO_ROUND_TRIP_COST_PERCENT copy-pasted, and should
+        # be revisited against actual paper-trading fills before going live.
+        "CRYPTO_ROUND_TRIP_COST_PERCENT": 0.50,
+        "CRYPTO_TAKE_PROFIT_PERCENT": 1.5,
+        "CRYPTO_STOP_LOSS_PERCENT": 1.0,
+        "CRYPTO_HOLDING_HORIZON_MAX_DAYS": 15,
+        "CRYPTO_CASH_ALLOCATION_DOLLARS": 0.0,
+        "CRYPTO_MIN_ORDER_DOLLARS": 5.0,
+        "CRYPTO_ITERATION_INTERVAL_MINUTES": 15,
+        "CRYPTO_AUTONOMOUS_DISCOVERY": False,
+        "CRYPTO_DISCOVERY_BATCH_SIZE": 6,
+        "CRYPTO_DISCOVERY_REFRESH_DAYS": 7,
+        "CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
+        "CRYPTO_ASSET_A": "BTC",
+        "CRYPTO_ASSET_B": "ETH",
+        "CRYPTO_RISK_POSTURE": "conservative",
+        "CRYPTO_MEMORY_ENABLED": True,
+        "CRYPTO_MEMORY_MIN_OBSERVATIONS": 20,
+        "CRYPTO_MEMORY_MAX_OBSERVATIONS": 500,
+        "CRYPTO_EMAIL_REPORT_ENABLED": False,
+    }
+    for key, default in crypto_defaults.items():
+        config.setdefault(key, default)
+    _require_booleans(config, "CRYPTO_ENABLED", "CRYPTO_AUTONOMOUS_DISCOVERY")
+    raw_crypto_symbols = config["CRYPTO_SYMBOLS"]
+    if not isinstance(raw_crypto_symbols, list):
+        raise TypeError("CRYPTO_SYMBOLS must be a JSON array of base symbols (e.g. \"BTC\")")
+    crypto_symbols = list(
+        dict.fromkeys(str(symbol).strip().upper() for symbol in raw_crypto_symbols if str(symbol).strip())
+    )
+    if config["CRYPTO_ENABLED"] and not crypto_symbols:
+        raise ValueError("CRYPTO_SYMBOLS must contain at least one symbol when CRYPTO_ENABLED is true")
+    if len(crypto_symbols) > 30:
+        raise ValueError("CRYPTO_SYMBOLS may contain at most 30 symbols")
+    config["CRYPTO_SYMBOLS"] = crypto_symbols
+    crypto_max_positions = int(config["CRYPTO_MAX_POSITIONS"])
+    crypto_analysis_days = int(config["CRYPTO_ANALYSIS_DAYS"])
+    crypto_lookback_days = int(config["CRYPTO_RECENT_HIGH_LOOKBACK_DAYS"])
+    crypto_min_observations = int(config["CRYPTO_MIN_SIGNAL_OBSERVATIONS"])
+    crypto_dip_threshold = float(config["CRYPTO_DIP_THRESHOLD_PERCENT"])
+    crypto_min_profit = float(config["CRYPTO_MIN_EXPECTED_PROFIT_PERCENT"])
+    crypto_oos_min_observations = int(config["CRYPTO_OOS_MIN_OBSERVATIONS"])
+    crypto_oos_min_profit = float(config["CRYPTO_OOS_MIN_NET_PROFIT_PERCENT"])
+    crypto_round_trip_cost = float(config["CRYPTO_ROUND_TRIP_COST_PERCENT"])
+    crypto_take_profit_percent = float(config["CRYPTO_TAKE_PROFIT_PERCENT"])
+    crypto_stop_loss_percent = float(config["CRYPTO_STOP_LOSS_PERCENT"])
+    crypto_holding_horizon_max_days = int(config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"])
+    crypto_cash_allocation = float(config["CRYPTO_CASH_ALLOCATION_DOLLARS"])
+    crypto_min_order = float(config["CRYPTO_MIN_ORDER_DOLLARS"])
+    crypto_iteration_interval_minutes = int(config["CRYPTO_ITERATION_INTERVAL_MINUTES"])
+    crypto_discovery_batch_size = int(config["CRYPTO_DISCOVERY_BATCH_SIZE"])
+    crypto_discovery_refresh_days = int(config["CRYPTO_DISCOVERY_REFRESH_DAYS"])
+    crypto_opportunity_min_probability = float(config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"])
+    crypto_max_positions_ceiling = (
+        30 if config["CRYPTO_AUTONOMOUS_DISCOVERY"] else max(1, len(crypto_symbols))
+    )
+    crypto_range_checks = (
+        ("CRYPTO_MAX_POSITIONS", crypto_max_positions, 1, crypto_max_positions_ceiling),
+        ("CRYPTO_ANALYSIS_DAYS", crypto_analysis_days, 30, 2000),
+        ("CRYPTO_RECENT_HIGH_LOOKBACK_DAYS", crypto_lookback_days, 2, float("inf")),
+        ("CRYPTO_MIN_SIGNAL_OBSERVATIONS", crypto_min_observations, 5, 500),
+        ("CRYPTO_DIP_THRESHOLD_PERCENT", crypto_dip_threshold, 0.0, 100.0),
+        ("CRYPTO_MIN_EXPECTED_PROFIT_PERCENT", crypto_min_profit, 0, 100),
+        ("CRYPTO_OOS_MIN_OBSERVATIONS", crypto_oos_min_observations, 5, 500),
+        ("CRYPTO_OOS_MIN_NET_PROFIT_PERCENT", crypto_oos_min_profit, 0, 100),
+        ("CRYPTO_ROUND_TRIP_COST_PERCENT", crypto_round_trip_cost, 0, 10),
+        ("CRYPTO_TAKE_PROFIT_PERCENT", crypto_take_profit_percent, 0.05, 100),
+        ("CRYPTO_STOP_LOSS_PERCENT", crypto_stop_loss_percent, 0.05, 100),
+        ("CRYPTO_HOLDING_HORIZON_MAX_DAYS", crypto_holding_horizon_max_days, 1, 60),
+        # Unlike PORTFOLIO_CASH_RESERVE_DOLLARS (a small held-back safety
+        # margin), this is crypto's entire spendable budget -- up to and
+        # including the whole account -- so it is not capped at the same
+        # small ceiling as that reserve buffer.
+        ("CRYPTO_CASH_ALLOCATION_DOLLARS", crypto_cash_allocation, 0, 10_000_000),
+        ("CRYPTO_MIN_ORDER_DOLLARS", crypto_min_order, 1, 1000),
+        ("CRYPTO_ITERATION_INTERVAL_MINUTES", crypto_iteration_interval_minutes, 5, 120),
+        ("CRYPTO_DISCOVERY_BATCH_SIZE", crypto_discovery_batch_size, 1, 30),
+        ("CRYPTO_DISCOVERY_REFRESH_DAYS", crypto_discovery_refresh_days, 1, 90),
+        ("CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY", crypto_opportunity_min_probability, 0.5, 0.95),
+    )
+    for name, value, minimum, maximum in crypto_range_checks:
+        _require_range(name, value, minimum, maximum)
+    crypto_asset_a = str(config["CRYPTO_ASSET_A"]).strip().upper()
+    crypto_asset_b = str(config["CRYPTO_ASSET_B"]).strip().upper()
+    if config["CRYPTO_ENABLED"] and (not crypto_asset_a or not crypto_asset_b or crypto_asset_a == crypto_asset_b):
+        raise ValueError("CRYPTO_ASSET_A and CRYPTO_ASSET_B must be different, non-empty symbols")
+    config["CRYPTO_MAX_POSITIONS"] = crypto_max_positions
+    config["CRYPTO_ANALYSIS_DAYS"] = crypto_analysis_days
+    config["CRYPTO_RECENT_HIGH_LOOKBACK_DAYS"] = crypto_lookback_days
+    config["CRYPTO_MIN_SIGNAL_OBSERVATIONS"] = crypto_min_observations
+    config["CRYPTO_DIP_THRESHOLD_PERCENT"] = crypto_dip_threshold
+    config["CRYPTO_MIN_EXPECTED_PROFIT_PERCENT"] = crypto_min_profit
+    config["CRYPTO_OOS_MIN_OBSERVATIONS"] = crypto_oos_min_observations
+    config["CRYPTO_OOS_MIN_NET_PROFIT_PERCENT"] = crypto_oos_min_profit
+    config["CRYPTO_ROUND_TRIP_COST_PERCENT"] = crypto_round_trip_cost
+    config["CRYPTO_TAKE_PROFIT_PERCENT"] = crypto_take_profit_percent
+    config["CRYPTO_STOP_LOSS_PERCENT"] = crypto_stop_loss_percent
+    config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"] = crypto_holding_horizon_max_days
+    config["CRYPTO_CASH_ALLOCATION_DOLLARS"] = crypto_cash_allocation
+    config["CRYPTO_MIN_ORDER_DOLLARS"] = crypto_min_order
+    config["CRYPTO_ITERATION_INTERVAL_MINUTES"] = crypto_iteration_interval_minutes
+    config["CRYPTO_DISCOVERY_BATCH_SIZE"] = crypto_discovery_batch_size
+    config["CRYPTO_DISCOVERY_REFRESH_DAYS"] = crypto_discovery_refresh_days
+    config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"] = crypto_opportunity_min_probability
+    config["CRYPTO_ASSET_A"] = crypto_asset_a
+    config["CRYPTO_ASSET_B"] = crypto_asset_b
+    crypto_risk_posture = str(config["CRYPTO_RISK_POSTURE"]).strip().lower()
+    if crypto_risk_posture not in ("conservative", "risky"):
+        raise ValueError("CRYPTO_RISK_POSTURE must be conservative or risky")
+    config["CRYPTO_RISK_POSTURE"] = crypto_risk_posture
+    _require_booleans(config, "CRYPTO_MEMORY_ENABLED", "CRYPTO_EMAIL_REPORT_ENABLED")
+    crypto_memory_minimum = int(config["CRYPTO_MEMORY_MIN_OBSERVATIONS"])
+    crypto_memory_maximum = int(config["CRYPTO_MEMORY_MAX_OBSERVATIONS"])
+    _require_range("CRYPTO_MEMORY_MIN_OBSERVATIONS", crypto_memory_minimum, 20, 500)
+    _require_range(
+        "CRYPTO_MEMORY_MAX_OBSERVATIONS", crypto_memory_maximum, crypto_memory_minimum, 5000
+    )
+    config["CRYPTO_MEMORY_MIN_OBSERVATIONS"] = crypto_memory_minimum
+    config["CRYPTO_MEMORY_MAX_OBSERVATIONS"] = crypto_memory_maximum
+
     _require_booleans(config, "EMAIL_REPORT_ENABLED", "EMAIL_USE_TLS")
     email_port = int(config["EMAIL_SMTP_PORT"])
     _require_range("EMAIL_SMTP_PORT", email_port, 1, 65535)
-    if config["EMAIL_REPORT_ENABLED"]:
+    if config["EMAIL_REPORT_ENABLED"] or config["CRYPTO_EMAIL_REPORT_ENABLED"]:
         email_fields = (
             "EMAIL_SMTP_HOST",
             "EMAIL_SMTP_USERNAME",
@@ -621,6 +759,11 @@ def build_strategy(
             "portfolio_universe_database_file": str(base_dir / ".autonomous_universe.duckdb"),
             "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
             "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
+            # Untouchable reserve for the separate crypto process (main_crypto.py)
+            # sharing this Alpaca account -- see _buy_portfolio_symbol's spendable
+            # calc in strategy.py, which subtracts this the same way it already
+            # subtracts portfolio_cash_reserve_dollars.
+            "portfolio_crypto_reserve_dollars": config["CRYPTO_CASH_ALLOCATION_DOLLARS"],
             "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
             "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
             "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],

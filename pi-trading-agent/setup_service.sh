@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SERVICE_NAME="trading-agent.service"
+CRYPTO_SERVICE_NAME="trading-agent-crypto.service"
 WATCHDOG_SERVICE_NAME="trading-agent-cpu-watchdog.service"
 WATCHDOG_TIMER_NAME="trading-agent-cpu-watchdog.timer"
 OLLAMA_SERVICE_NAME="ollama.service"
@@ -12,6 +13,7 @@ NIGHTLY_PREEVAL_TIMER_NAME="trading-agent-nightly-preeval.timer"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+CRYPTO_SERVICE_FILE="/etc/systemd/system/${CRYPTO_SERVICE_NAME}"
 WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_SERVICE_NAME}"
 WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_TIMER_NAME}"
 OLLAMA_SERVICE_FILE="/etc/systemd/system/${OLLAMA_SERVICE_NAME}"
@@ -37,6 +39,7 @@ if [[ ! -f "${PROJECT_DIR}/config.json" && -f "${PROJECT_DIR}/config.example.jso
 fi
 
 if [[ ! -f "${PROJECT_DIR}/main.py" || ! -f "${PROJECT_DIR}/strategy.py" || \
+      ! -f "${PROJECT_DIR}/main_crypto.py" || ! -f "${PROJECT_DIR}/crypto_strategy.py" || \
       ! -f "${PROJECT_DIR}/adaptive_news_model.py" || \
       ! -f "${PROJECT_DIR}/news_context.py" || ! -f "${PROJECT_DIR}/config.json" ]]; then
     echo "Required project files are missing from ${PROJECT_DIR}." >&2
@@ -55,6 +58,7 @@ python3 -m venv "${VENV_DIR}"
 chown -R "${RUN_USER}:${RUN_GROUP}" "${PROJECT_DIR}"
 chmod 600 "${PROJECT_DIR}/config.json"
 chmod 755 "${PROJECT_DIR}/main.py"
+chmod 755 "${PROJECT_DIR}/main_crypto.py"
 chmod 755 "${PROJECT_DIR}/scripts/cpu_watchdog.sh"
 chmod 755 "${PROJECT_DIR}/scripts/ollama_warmup.sh"
 chmod 755 "${PROJECT_DIR}/scripts/nightly_preeval.py"
@@ -194,6 +198,38 @@ ReadWritePaths=${PROJECT_DIR}
 WantedBy=multi-user.target
 EOF
 
+install -o root -g root -m 0644 /dev/null "${CRYPTO_SERVICE_FILE}"
+tee "${CRYPTO_SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Lumibot Alpaca Crypto Trading Agent (active only while NYSE is closed)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/main_crypto.py
+Restart=always
+RestartSec=30
+TimeoutStopSec=15
+KillSignal=SIGINT
+# Same rationale as trading-agent.service's KillMode -- process (not the
+# default control-group) lets Python's own SIGINT handling exit this
+# multi-threaded Lumibot process cleanly instead of needing a SIGKILL.
+KillMode=process
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=${PROJECT_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 install -o root -g root -m 0644 /dev/null "${WATCHDOG_SERVICE_FILE}"
 tee "${WATCHDOG_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
@@ -222,6 +258,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
+systemctl enable --now "${CRYPTO_SERVICE_NAME}"
 systemctl enable --now "${WATCHDOG_TIMER_NAME}"
 systemctl enable --now "${OLLAMA_SERVICE_NAME}"
 systemctl enable --now "${OLLAMA_WARMUP_TIMER_NAME}"
@@ -230,6 +267,8 @@ systemctl enable --now "${NIGHTLY_PREEVAL_TIMER_NAME}"
 echo "${SERVICE_NAME} is installed and running."
 echo "View status with: sudo systemctl status ${SERVICE_NAME}"
 echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
+echo "${CRYPTO_SERVICE_NAME} is also installed and running, but idles until CRYPTO_ENABLED is true in config.json (and only trades while NYSE is closed)."
+echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
     echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"

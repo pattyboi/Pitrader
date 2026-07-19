@@ -5,10 +5,11 @@ and ``symbol_reference.py``.
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import requests
@@ -23,17 +24,37 @@ class AutonomousUniverse:
     ASSETS_URL_LIVE = "https://api.alpaca.markets/v2/assets"
     _SYMBOL = re.compile(r"^[A-Z]{1,5}$")
 
+    @staticmethod
+    def _default_symbol_filter(item: dict[str, Any]) -> str | None:
+        """Equity default: a plain 1-5 letter ticker, tradable and fractionable."""
+        symbol = str(item.get("symbol", "")).upper()
+        if (
+            item.get("tradable") is True
+            and item.get("fractionable") is True
+            and AutonomousUniverse._SYMBOL.fullmatch(symbol)
+        ):
+            return symbol
+        return None
+
     def __init__(
         self,
         database_path: Path,
         refresh_days: int,
         batch_size: int,
         paper: bool = True,
+        asset_class: str = "us_equity",
+        symbol_filter: Callable[[dict[str, Any]], str | None] | None = None,
     ):
         self.database_path = database_path
         self.refresh_days = refresh_days
         self.batch_size = batch_size
         self.assets_url = self.ASSETS_URL_PAPER if paper else self.ASSETS_URL_LIVE
+        # Defaults preserve today's exact equity behavior. CryptoRotationStrategy
+        # passes asset_class="crypto" and its own symbol_filter, since Alpaca's
+        # crypto assets come back as "BASE/QUOTE" pairs (e.g. "BTC/USD") rather
+        # than plain equity tickers, and have no "fractionable" field to check.
+        self.asset_class = asset_class
+        self._symbol_filter = symbol_filter or self._default_symbol_filter
 
     def next_batch(self, api_key: str, secret_key: str) -> list[str]:
         with self._open() as conn:
@@ -51,17 +72,17 @@ class AutonomousUniverse:
         if not symbols or today - refreshed >= timedelta(days=self.refresh_days):
             response = requests.get(
                 self.assets_url,
-                params={"status": "active", "asset_class": "us_equity"},
+                params={"status": "active", "asset_class": self.asset_class},
                 headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key},
                 timeout=20,
             )
             response.raise_for_status()
             symbols = sorted(
-                item["symbol"].upper()
-                for item in response.json()
-                if item.get("tradable") is True
-                and item.get("fractionable") is True
-                and self._SYMBOL.fullmatch(str(item.get("symbol", "")).upper())
+                {
+                    symbol
+                    for symbol in (self._symbol_filter(item) for item in response.json())
+                    if symbol
+                }
             )
             with self._open() as conn:
                 conn.execute("DELETE FROM universe_symbols")

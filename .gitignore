@@ -40,6 +40,19 @@ pi-trading-agent/config.json
 .cpu_watchdog.log.*
 .shutdown_diagnostic.log
 .shutdown_diagnostic.log.*
+.crypto_last_email_report
+.crypto_holding_state.json
+.crypto_holding_state.json.*
+.crypto_rotation_state.json
+.crypto_rotation_state.json.*
+.crypto_opportunistic_swap_state.json
+.crypto_opportunistic_swap_state.json.*
+.crypto_universe.duckdb
+.crypto_universe.duckdb.*
+.crypto_trade_memory.duckdb
+.crypto_trade_memory.duckdb.*
+.crypto_portfolio_memory.duckdb
+.crypto_portfolio_memory.duckdb.*
 
 # Python bytecode
 __pycache__/

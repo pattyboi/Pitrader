@@ -5,7 +5,7 @@ never stores API credentials, account balances, or order identifiers.
 """
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,10 +36,21 @@ class OpportunityProbability:
 class TradeMemory:
     """Record decisions and estimate next-session Asset-B minus Asset-A edge."""
 
-    def __init__(self, database_path: Path, minimum_observations: int, maximum_observations: int):
+    def __init__(
+        self,
+        database_path: Path,
+        minimum_observations: int,
+        maximum_observations: int,
+        next_session_predicate: Callable[[str, str], bool] = is_next_trading_session,
+    ):
         self.database_path = database_path
         self.minimum_observations = minimum_observations
         self.maximum_observations = maximum_observations
+        # Defaults to NYSE-trading-session succession (equity's behavior,
+        # unchanged). CryptoRotationStrategy passes
+        # market_sessions.is_next_calendar_day instead, since crypto trades
+        # every calendar day rather than skipping weekends/holidays.
+        self._next_session_predicate = next_session_predicate
 
     def update_and_forecast(
         self,
@@ -58,7 +69,7 @@ class TradeMemory:
         diluting the decision-specific evidence.
         """
         with self._open() as conn:
-            self._settle_prior_observations(conn, evaluation_date, price_a, price_b)
+            self._settle_prior_observations_with_predicate(conn, evaluation_date, price_a, price_b)
             conn.execute(
                 """
                 INSERT INTO observations
@@ -205,8 +216,9 @@ class TradeMemory:
             """
         )
 
-    @staticmethod
-    def _settle_prior_observations(conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float) -> None:
+    def _settle_prior_observations_with_predicate(
+        self, conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float
+    ) -> None:
         rows = conn.execute(
             """
             SELECT evaluation_date, price_a, price_b FROM observations
@@ -217,7 +229,7 @@ class TradeMemory:
             (date,),
         ).fetchall()
         for prior_date, prior_a, prior_b in rows:
-            if not is_next_trading_session(str(prior_date), date):
+            if not self._next_session_predicate(str(prior_date), date):
                 continue
             if prior_a <= 0 or prior_b <= 0:
                 continue

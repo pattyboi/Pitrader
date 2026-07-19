@@ -40,6 +40,7 @@ understand the risks.
   - [Adaptive news learning](#adaptive-news-learning)
   - [Decision memory: learning from its own rotations](#decision-memory-learning-from-its-own-rotations)
   - [Portfolio memory: learning across the whole watchlist](#portfolio-memory-learning-across-the-whole-watchlist)
+- [Crypto trading mode](#crypto-trading-mode)
 - [Operating the service](#operating-the-service)
   - [Understanding common log messages](#understanding-common-log-messages)
   - [Service commands](#service-commands)
@@ -230,6 +231,10 @@ pi-trading-agent/
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
 ├── llm_news.py         Optional LLM daily news assessment (local Ollama only)
 ├── strategy.py         Daily dip and rotation logic
+├── decision_math.py     Shared position-sizing/ranking math (equity and crypto)
+├── email_render.py      Shared HTML email-report rendering (equity and crypto)
+├── main_crypto.py       Crypto strategy startup (separate process/service, see "Crypto trading mode")
+├── crypto_strategy.py   Crypto dip-buying and rotation logic, active only while NYSE is closed
 └── setup_service.sh    Virtual environment and systemd installer
 ```
 
@@ -1152,6 +1157,104 @@ On first sight of each symbol, its available price history is imported once
 symbol does not start from zero. Delete `.portfolio_memory.duckdb` only if you
 intend to reset this learning history; it is otherwise safe across restarts.
 
+## Crypto trading mode
+
+The agent can optionally also trade crypto (BTC/ETH by default) during the
+hours the stock market is closed — nights, weekends, and holidays — using the
+idle time between stock-trading sessions. It runs as a second, independent
+systemd service, `trading-agent-crypto.service`, started from `main_crypto.py`
+and driven by `crypto_strategy.py`. It is off by default (`CRYPTO_ENABLED:
+false`) and shares `config.json` and your Alpaca credentials with the main
+equity service, but is otherwise a fully separate process with its own state
+files — a crash or restart in one can never affect the other.
+
+Why a second service rather than one program doing both: Lumibot (the
+underlying trading library) cannot run two live strategies in one process, so
+equity and crypto are two separate `main*.py` programs, each with its own
+systemd unit and its own `.crypto_*`/`.portfolio_*` state files.
+
+### How it decides when to trade
+
+Every `CRYPTO_ITERATION_INTERVAL_MINUTES` (default 15), the crypto service
+checks whether the stock market is currently open. If it is, it does nothing
+and waits for the next check. Once the stock market closes, it runs the same
+kind of daily dip-buy evaluation the equity strategy runs, just on your
+configured `CRYPTO_SYMBOLS` (default `["BTC", "ETH"]`) instead of stocks —
+dip signal, take-profit/stop-loss/holding-horizon exits, autonomous discovery
+of other Alpaca-tradable pairs (if `CRYPTO_AUTONOMOUS_DISCOVERY` is enabled),
+pooled cross-symbol memory, and an equivalent of the Opportunistic Opportunity
+BTC-to-ETH swap (capped at one swap per day, same as the equity version).
+
+### Cash allocation is a soft, shared-account limit
+
+Alpaca does not give a single brokerage account a separate crypto wallet —
+stock and crypto trades draw from the same cash balance. `config.json`'s
+`CRYPTO_CASH_ALLOCATION_DOLLARS` (default 0, meaning crypto never buys
+anything until you raise it) caps how much of that shared balance the crypto
+service is allowed to deploy, and the equity service treats that same amount
+as an untouchable reserve it will never spend into. This is enforced in
+software, not by the broker: each service reads the account's real-time cash
+balance independently, so there is a small window (well under a second, in
+practice) where both could act on a slightly stale balance. This is the same
+kind of risk the equity strategy already accepts when sizing several buys
+within one iteration, and is not a reason to avoid crypto mode — just
+something to keep in mind if you set the allocation close to your entire
+account balance.
+
+### Configuration reference
+
+All keys live in the same `config.json`, prefixed `CRYPTO_`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `CRYPTO_ENABLED` | `false` | Master on/off switch. The service runs either way; this just decides whether it ever evaluates or trades. |
+| `CRYPTO_SYMBOLS` | `["BTC", "ETH"]` | Static watchlist, base symbols only (no `/USD` suffix). |
+| `CRYPTO_CASH_ALLOCATION_DOLLARS` | `0.0` | Soft cap on crypto's share of the account's cash (see above). |
+| `CRYPTO_MAX_POSITIONS` | `1` | Ceiling on simultaneous crypto holdings. |
+| `CRYPTO_DIP_THRESHOLD_PERCENT` | `5.0` | Dip size (from the recent high) required to consider buying. |
+| `CRYPTO_TAKE_PROFIT_PERCENT` / `CRYPTO_STOP_LOSS_PERCENT` | `1.5` / `1.0` | Exit thresholds, wider than the equity defaults since crypto moves more. |
+| `CRYPTO_HOLDING_HORIZON_MAX_DAYS` | `15` | Backstop exit if neither take-profit nor stop-loss has triggered. |
+| `CRYPTO_ITERATION_INTERVAL_MINUTES` | `15` | How often the service re-evaluates while the stock market is closed. |
+| `CRYPTO_AUTONOMOUS_DISCOVERY` | `false` | Expand the watchlist with other Alpaca-tradable USD-quoted crypto pairs. |
+| `CRYPTO_RISK_POSTURE` | `conservative` | Same risky/conservative ranking behavior as `PORTFOLIO_RISK_POSTURE`. |
+| `CRYPTO_MEMORY_ENABLED` | `true` | Pooled cross-symbol learning, same concept as portfolio memory. |
+| `CRYPTO_ASSET_A` / `CRYPTO_ASSET_B` | `BTC` / `ETH` | The Opportunistic Opportunity swap pair. |
+| `CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY` | `0.55` | Minimum historical win probability required before swapping. |
+| `CRYPTO_EMAIL_REPORT_ENABLED` | `false` | A separate daily email report, reusing the same SMTP settings as the equity report. |
+
+`CRYPTO_MIN_ORDER_DOLLARS`, `CRYPTO_ANALYSIS_DAYS`,
+`CRYPTO_RECENT_HIGH_LOOKBACK_DAYS`, `CRYPTO_MIN_SIGNAL_OBSERVATIONS`,
+`CRYPTO_OOS_MIN_OBSERVATIONS`, `CRYPTO_OOS_MIN_NET_PROFIT_PERCENT`,
+`CRYPTO_ROUND_TRIP_COST_PERCENT`, `CRYPTO_DISCOVERY_BATCH_SIZE`, and
+`CRYPTO_DISCOVERY_REFRESH_DAYS` mirror their `PORTFOLIO_*` equivalents; see
+`config.example.json` for the full set with working defaults.
+
+### State files
+
+The crypto service writes only its own files, entirely separate from the
+equity service's `.portfolio_*` files: `.crypto_holding_state.json`,
+`.crypto_rotation_state.json`, `.crypto_opportunistic_swap_state.json`,
+`.crypto_portfolio_memory.duckdb`, `.crypto_trade_memory.duckdb`,
+`.crypto_universe.duckdb` (autonomous discovery), and
+`.crypto_last_email_report`.
+
+### Enabling it
+
+1. Stop both services before editing configuration:
+   `sudo systemctl stop trading-agent.service trading-agent-crypto.service`
+2. Edit `config.json`: set `CRYPTO_ENABLED: true` and a
+   `CRYPTO_CASH_ALLOCATION_DOLLARS` you're comfortable risking in paper mode
+   first.
+3. Restart both services:
+   `sudo systemctl start trading-agent.service trading-agent-crypto.service`
+4. Follow crypto-specific logs with
+   `sudo journalctl -u trading-agent-crypto.service -f`. You should see it log
+   "NYSE is open; crypto trading paused" or "NYSE is closed; crypto trading
+   resumed" depending on the time of day.
+
+Confirm `IS_PAPER_TRADING` is `true` before enabling crypto for the first
+time, exactly as you would for the equity strategy.
+
 ## Operating the service
 
 ### Understanding common log messages
@@ -1243,6 +1346,10 @@ The service waits 30 seconds before restarting after a crash. Repeated restarts
 usually indicate invalid configuration, bad credentials, unavailable packages,
 or a startup error. Inspect the journal rather than repeatedly rerunning the
 installer.
+
+The optional crypto strategy runs as its own service,
+`trading-agent-crypto.service` — the same commands above apply with that name
+in place of `trading-agent.service`. See "Crypto trading mode" below.
 
 ### Changing strategy settings
 

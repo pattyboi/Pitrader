@@ -20,11 +20,12 @@ import token_estimate
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer
-from market_sessions import is_next_trading_session
+from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_is_open
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
 from portfolio_memory import PortfolioMemory
 from symbol_reference import SymbolReference
+from crypto_strategy import CryptoRotationStrategy, _crypto_asset_symbol_filter
 from strategy import AssetRotationStrategy
 from trade_memory import TradeMemory
 from main import _DropOptionalLumiwealthWarning, format_market_open_time
@@ -38,6 +39,43 @@ def test_market_open_time_is_logged_in_eastern_time() -> None:
 def test_next_trading_session_uses_the_exchange_holiday_calendar() -> None:
     assert is_next_trading_session("2026-07-02", "2026-07-06")
     assert not is_next_trading_session("2026-07-13", "2026-07-16")
+
+
+def test_nyse_is_open_during_a_normal_trading_session() -> None:
+    # 2026-07-14 is an ordinary Tuesday: NYSE open 13:30-20:00 UTC.
+    assert nyse_is_open(datetime(2026, 7, 14, 15, 0, tzinfo=timezone.utc))
+
+
+def test_nyse_is_open_respects_the_open_and_close_boundary_minutes() -> None:
+    assert nyse_is_open(datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc))
+    assert nyse_is_open(datetime(2026, 7, 14, 20, 0, tzinfo=timezone.utc))
+    assert not nyse_is_open(datetime(2026, 7, 14, 13, 29, tzinfo=timezone.utc))
+    assert not nyse_is_open(datetime(2026, 7, 14, 20, 1, tzinfo=timezone.utc))
+
+
+def test_nyse_is_open_is_false_outside_regular_hours_on_a_trading_day() -> None:
+    assert not nyse_is_open(datetime(2026, 7, 14, 23, 0, tzinfo=timezone.utc))
+
+
+def test_nyse_is_open_is_false_on_a_weekend() -> None:
+    assert not nyse_is_open(datetime(2026, 7, 18, 16, 0, tzinfo=timezone.utc))
+
+
+def test_nyse_is_open_is_false_on_an_observed_holiday() -> None:
+    # 2026-07-04 (Independence Day) falls on a Saturday; NYSE observes it Friday 2026-07-03.
+    assert not nyse_is_open(datetime(2026, 7, 3, 16, 0, tzinfo=timezone.utc))
+
+
+def test_nyse_is_open_treats_a_naive_datetime_as_utc() -> None:
+    assert nyse_is_open(datetime(2026, 7, 14, 15, 0))
+    assert not nyse_is_open(datetime(2026, 7, 18, 16, 0))
+
+
+def test_is_next_calendar_day_accepts_any_consecutive_dates_including_weekends() -> None:
+    assert is_next_calendar_day("2026-07-17", "2026-07-18")  # Friday -> Saturday
+    assert is_next_calendar_day("2026-07-18", "2026-07-19")  # Saturday -> Sunday
+    assert not is_next_calendar_day("2026-07-17", "2026-07-19")  # skips a day
+    assert not is_next_calendar_day("2026-07-18", "2026-07-17")  # out of order
 
 
 def test_cpu_watchdog_skips_a_negative_percentage_after_a_service_restart(tmp_path: Path) -> None:
@@ -267,6 +305,59 @@ def test_autonomous_universe_excludes_unpriceable_symbols_from_future_batches(
     assert second == ["NVDA", "TSLA"]
 
 
+def test_autonomous_universe_asset_class_parameter_changes_the_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_params = {}
+
+    def fake_get(*args, **kwargs):
+        captured_params.update(kwargs.get("params", {}))
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: [])
+
+    monkeypatch.setattr(autonomous_universe.requests, "get", fake_get)
+    universe = AutonomousUniverse(
+        tmp_path / "crypto_universe.duckdb", refresh_days=7, batch_size=2, asset_class="crypto"
+    )
+
+    universe.next_batch("key", "secret")
+
+    assert captured_params["asset_class"] == "crypto"
+
+
+def test_autonomous_universe_crypto_symbol_filter_extracts_usd_pairs_only() -> None:
+    assert _crypto_asset_symbol_filter({"symbol": "BTC/USD", "tradable": True}) == "BTC"
+    assert _crypto_asset_symbol_filter({"symbol": "ETH/BTC", "tradable": True}) is None
+    assert _crypto_asset_symbol_filter({"symbol": "DOGE/USD", "tradable": False}) is None
+    assert _crypto_asset_symbol_filter({"symbol": "NOTAPAIR", "tradable": True}) is None
+
+
+def test_autonomous_universe_next_batch_uses_the_crypto_symbol_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    universe = AutonomousUniverse(
+        tmp_path / "crypto_universe.duckdb",
+        refresh_days=7,
+        batch_size=5,
+        asset_class="crypto",
+        symbol_filter=_crypto_asset_symbol_filter,
+    )
+    payload = [
+        {"symbol": "BTC/USD", "tradable": True},
+        {"symbol": "ETH/USD", "tradable": True},
+        {"symbol": "ETH/BTC", "tradable": True},  # non-USD quote, excluded
+        {"symbol": "SOL/USD", "tradable": False},  # not tradable, excluded
+    ]
+    monkeypatch.setattr(
+        autonomous_universe.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload),
+    )
+
+    batch = universe.next_batch("key", "secret")
+
+    assert batch == ["BTC", "ETH"]
+
+
 def test_autonomous_universe_remember_refreshes_recency_of_a_re_mentioned_symbol(tmp_path: Path) -> None:
     universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=7, batch_size=5)
     universe.remember(["AAA"], limit=2)
@@ -336,6 +427,156 @@ def test_portfolio_ignores_unmanaged_account_positions() -> None:
     held, entry_prices = strategy._portfolio_held_positions({"SPY"})
     assert held == {"SPY": 3}
     assert entry_prices == {"SPY": 400.0}
+
+
+def _stub_buy_portfolio_symbol(crypto_reserve_dollars: float) -> AssetRotationStrategy:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy._rotation_lock = threading.Lock()
+    strategy.CASH_BUFFER_FRACTION = AssetRotationStrategy.CASH_BUFFER_FRACTION
+    strategy.parameters = {
+        "portfolio_cash_reserve_dollars": 0.0,
+        "portfolio_crypto_reserve_dollars": crypto_reserve_dollars,
+        "portfolio_min_order_dollars": 5.0,
+        "fractional_shares": False,
+    }
+    strategy._has_active_order = lambda symbol, side: False
+    strategy.get_cash = lambda: 100.0
+    strategy.create_order = lambda symbol, quantity, side, order_type, time_in_force: SimpleNamespace(quantity=quantity)
+    strategy._submit_order_checked = lambda order, description: True
+    strategy.log_message = lambda *args, **kwargs: None
+    return strategy
+
+
+def test_buy_portfolio_symbol_treats_the_crypto_allocation_as_untouchable() -> None:
+    # $100 cash, 1% buffer, no equity reserve, $90 reserved for the separate
+    # crypto process: only ~$9 is spendable, so a $5 share buys just 1 share
+    # instead of the ~19 it would without the crypto reserve subtraction.
+    strategy = _stub_buy_portfolio_symbol(crypto_reserve_dollars=90.0)
+    assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "submitted"
+
+
+def test_buy_portfolio_symbol_is_blocked_once_the_crypto_reserve_exhausts_cash() -> None:
+    strategy = _stub_buy_portfolio_symbol(crypto_reserve_dollars=100.0)
+    assert strategy._buy_portfolio_symbol("SPY", price=5.0, budget=100.0) == "insufficient"
+
+
+def test_crypto_held_positions_only_counts_managed_crypto_symbols() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.get_positions = lambda: [
+        SimpleNamespace(asset=SimpleNamespace(symbol="AAPL", asset_type="stock"), quantity="2", avg_fill_price="150.0"),
+        SimpleNamespace(asset=SimpleNamespace(symbol="BTC", asset_type="crypto"), quantity="0.5", avg_fill_price="60000.0"),
+        SimpleNamespace(asset=SimpleNamespace(symbol="DOGE", asset_type="crypto"), quantity="100", avg_fill_price="0.1"),
+    ]
+
+    held, entry_prices = strategy._crypto_held_positions({"BTC", "ETH"})
+    assert held == {"BTC": Decimal("0.5")}
+    assert entry_prices == {"BTC": 60000.0}
+
+
+def test_crypto_holding_is_due_uses_plain_calendar_days() -> None:
+    assert CryptoRotationStrategy._holding_is_due("2026-01-02", date(2026, 1, 17), 15)
+    assert not CryptoRotationStrategy._holding_is_due("2026-01-03", date(2026, 1, 17), 15)
+
+
+def test_crypto_exit_reasons_prefers_take_profit_over_stop_loss() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "crypto_take_profit_percent": 1.5,
+        "crypto_stop_loss_percent": 1.0,
+        "crypto_holding_horizon_max_days": 15,
+    }
+    strategy._crypto_realizable_sale_price = lambda symbol: {"BTC": 102.0, "ETH": 98.5}[symbol]
+    held = {"BTC": Decimal("1"), "ETH": Decimal("1")}
+    entry_prices = {"BTC": 100.0, "ETH": 100.0}
+    today = date(2026, 1, 17)
+
+    reasons = strategy._crypto_exit_reasons(held, entry_prices, {"BTC": "2026-01-16", "ETH": "2026-01-16"}, today)
+
+    assert "take-profit" in reasons["BTC"]
+    assert "stop-loss" in reasons["ETH"]
+
+
+def test_crypto_exit_reasons_falls_back_to_the_holding_backstop() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "crypto_take_profit_percent": 5.0,
+        "crypto_stop_loss_percent": 5.0,
+        "crypto_holding_horizon_max_days": 15,
+    }
+    strategy._crypto_realizable_sale_price = lambda symbol: 101.0
+    held = {"BTC": Decimal("1")}
+    entry_prices = {"BTC": 100.0}
+    today = date(2026, 1, 20)
+
+    reasons = strategy._crypto_exit_reasons(held, entry_prices, {"BTC": "2026-01-01"}, today)
+
+    assert "backstop" in reasons["BTC"]
+
+
+def _stub_buy_crypto_symbol(cash: float) -> CryptoRotationStrategy:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy._rotation_lock = threading.Lock()
+    strategy.CASH_BUFFER_FRACTION = CryptoRotationStrategy.CASH_BUFFER_FRACTION
+    strategy.parameters = {"crypto_min_order_dollars": 5.0}
+    strategy._has_active_order = lambda symbol, side: False
+    strategy.get_cash = lambda: cash
+    strategy._quote_asset = None  # bypass the quote_asset property setter, which touches self.broker
+    strategy.create_order = lambda asset, quantity, side, quote, order_type, time_in_force: SimpleNamespace(quantity=quantity)
+    strategy._submit_order_checked = lambda order, description: True
+    strategy.log_message = lambda *args, **kwargs: None
+    return strategy
+
+
+def test_buy_crypto_symbol_never_exceeds_the_allocation_budget() -> None:
+    # $100 real cash, but the caller passes a $9 budget (the crypto
+    # allocation minus what's already deployed) -- min(cash, budget) must
+    # bind on the budget, not the larger real cash balance.
+    strategy = _stub_buy_crypto_symbol(cash=100.0)
+    captured = {}
+    original_create_order = strategy.create_order
+    def capture(asset, quantity, side, quote, order_type, time_in_force):
+        captured["quantity"] = quantity
+        return original_create_order(asset, quantity, side, quote, order_type, time_in_force)
+    strategy.create_order = capture
+
+    assert strategy._buy_crypto_symbol("BTC", price=5.0, budget=9.0) == "submitted"
+    assert captured["quantity"] == Decimal("1.78200000")
+
+
+def test_buy_crypto_symbol_is_insufficient_below_the_minimum_order() -> None:
+    strategy = _stub_buy_crypto_symbol(cash=100.0)
+    assert strategy._buy_crypto_symbol("BTC", price=5.0, budget=1.0) == "insufficient"
+
+
+def test_crypto_iteration_is_a_no_op_while_nyse_is_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    import crypto_strategy as crypto_strategy_module
+
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_enabled": True}
+    strategy._last_logged_nyse_open = None
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy._send_crypto_email = lambda report: None
+    ran = {"count": 0}
+    strategy._run_crypto_iteration = lambda report: ran.__setitem__("count", ran["count"] + 1)
+
+    monkeypatch.setattr(crypto_strategy_module, "nyse_is_open", lambda now: True)
+    strategy.on_trading_iteration()
+    assert ran["count"] == 0
+
+    monkeypatch.setattr(crypto_strategy_module, "nyse_is_open", lambda now: False)
+    strategy.on_trading_iteration()
+    assert ran["count"] == 1
+
+
+def test_crypto_iteration_is_a_no_op_when_disabled() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_enabled": False}
+    ran = {"count": 0}
+    strategy._run_crypto_iteration = lambda report: ran.__setitem__("count", ran["count"] + 1)
+
+    strategy.on_trading_iteration()
+
+    assert ran["count"] == 0
 
 
 def test_live_spread_percent_reads_bid_ask_from_the_quote() -> None:
@@ -1624,6 +1865,126 @@ def test_filled_replacement_buy_clears_restart_state(tmp_path: Path) -> None:
     assert strategy.vars.portfolio_pending_rotation == {}
 
 
+def test_managed_crypto_symbols_includes_discovery_owned_symbols_when_enabled() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_symbols": ["BTC"], "crypto_autonomous_discovery": True}
+    strategy._crypto_autonomous_universe = lambda: SimpleNamespace(managed_symbols=lambda: ["DOGE"])
+
+    assert strategy._managed_crypto_symbols() == {"BTC", "DOGE"}
+
+
+def test_managed_crypto_symbols_ignores_discovery_when_disabled() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_symbols": ["BTC"], "crypto_autonomous_discovery": False}
+    strategy._crypto_autonomous_universe = lambda: (_ for _ in ()).throw(AssertionError("should not be called"))
+
+    assert strategy._managed_crypto_symbols() == {"BTC"}
+
+
+def test_crypto_symbols_combines_managed_held_and_one_discovery_batch() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_symbols": ["BTC"], "crypto_autonomous_discovery": True}
+    strategy._crypto_autonomous_universe = lambda: SimpleNamespace(
+        managed_symbols=lambda: [], next_batch=lambda key, secret: ["SOL"]
+    )
+    report: dict = {}
+
+    symbols = strategy._crypto_symbols(report, held={"ETH": Decimal("1")})
+
+    assert symbols == ["BTC", "ETH", "SOL"]
+    assert report["discovered_crypto_symbols"] == "SOL"
+
+
+def _stub_crypto_rotation_strategy(pending: dict | None) -> CryptoRotationStrategy:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.vars = SimpleNamespace(crypto_pending_rotation=pending)
+    strategy.parameters = {"crypto_rotation_state_file": None}
+    strategy._crypto_state_lock = threading.RLock()
+    strategy.log_message = lambda *args, **kwargs: None
+    return strategy
+
+
+def test_reconcile_pending_crypto_rotation_waits_for_the_sale() -> None:
+    strategy = _stub_crypto_rotation_strategy({"from": "BTC", "to": "ETH", "budget": 100.0})
+    strategy._has_active_order = lambda symbol, side: True
+
+    actions, claimed = strategy._reconcile_pending_crypto_rotation({"BTC": Decimal("1")})
+
+    assert "waiting for BTC sale" in actions[0]
+    assert claimed == {"BTC", "ETH"}
+    assert strategy.vars.crypto_pending_rotation is not None
+
+
+def test_reconcile_pending_crypto_rotation_resets_when_sale_did_not_fill() -> None:
+    strategy = _stub_crypto_rotation_strategy({"from": "BTC", "to": "ETH", "budget": 100.0})
+    strategy._has_active_order = lambda symbol, side: False
+
+    actions, claimed = strategy._reconcile_pending_crypto_rotation({"BTC": Decimal("1")})
+
+    assert "did not fill" in actions[0]
+    assert claimed == set()
+    assert strategy.vars.crypto_pending_rotation is None
+
+
+def test_reconcile_pending_crypto_rotation_completes_once_target_is_held() -> None:
+    strategy = _stub_crypto_rotation_strategy({"from": "BTC", "to": "ETH", "budget": 100.0})
+    strategy._has_active_order = lambda symbol, side: False
+
+    actions, claimed = strategy._reconcile_pending_crypto_rotation({"ETH": Decimal("1")})
+
+    assert "complete" in actions[0]
+    assert claimed == set()
+    assert strategy.vars.crypto_pending_rotation is None
+
+
+def test_reconcile_pending_crypto_rotation_retries_the_buy() -> None:
+    strategy = _stub_crypto_rotation_strategy({"from": "BTC", "to": "ETH", "budget": 100.0})
+    strategy._has_active_order = lambda symbol, side: False
+    strategy._crypto_asset = lambda symbol: symbol
+    strategy._quote_asset = None
+    strategy.get_last_price = lambda asset, quote=None: 100.0
+    strategy._buy_crypto_symbol = lambda symbol, price, budget: "submitted"
+
+    actions, claimed = strategy._reconcile_pending_crypto_rotation({})
+
+    assert "purchase submitted" in actions[0]
+    assert claimed == {"BTC", "ETH"}
+
+
+def test_submit_crypto_rotation_sell_refuses_when_already_in_flight() -> None:
+    strategy = _stub_crypto_rotation_strategy({"from": "BTC", "to": "ETH", "budget": 100.0})
+
+    accepted = strategy._submit_crypto_rotation_sell("BTC", "ETH", Decimal("1"), 100.0)
+
+    assert accepted is False
+
+
+def test_crypto_on_filled_order_journals_execution_and_records_entry_date(
+    tmp_path: Path,
+) -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "crypto_trade_memory_database_file": str(tmp_path / "crypto_trade_memory.duckdb"),
+        "crypto_holding_state_file": str(tmp_path / "crypto_holding_state.json"),
+    }
+    strategy._crypto_state_lock = threading.RLock()
+    strategy.vars = SimpleNamespace(crypto_holding_dates={}, crypto_pending_rotation=None)
+    strategy.log_message = lambda *args, **kwargs: None
+    order = SimpleNamespace(
+        asset=SimpleNamespace(symbol="BTC"),
+        side="buy",
+        quantity=Decimal("0.01"),
+        get_fill_price=lambda: 60000.0,
+    )
+
+    strategy.on_filled_order(None, order, 60000.0, 0.01, 1.0)
+
+    assert "BTC" in strategy.vars.crypto_holding_dates
+    with duckdb.connect(str(tmp_path / "crypto_trade_memory.duckdb")) as conn:
+        rows = conn.execute("SELECT symbol, side, price FROM executions").fetchall()
+    assert rows == [("BTC", "buy", 60000.0)]
+
+
 def test_nightly_preevaluation_never_consumes_a_discovery_batch() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {"llm_news_enabled": True, "portfolio_nightly_preeval_enabled": True}
@@ -1751,6 +2112,48 @@ def test_portfolio_memory_does_not_label_a_multisession_gap_as_next_session(
     assert settled is None
 
 
+def test_portfolio_memory_default_predicate_does_not_settle_across_a_weekend(
+    tmp_path: Path,
+) -> None:
+    # With the default (NYSE-session) predicate, Saturday is never the "next
+    # session" after Friday -- demonstrates why crypto needs its own predicate.
+    db_path = tmp_path / "equity_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+    memory.update_and_forecast("2026-07-17", "SPY", 100.0, 5.0, None)  # Friday
+    memory.update_and_forecast("2026-07-18", "SPY", 110.0, 5.0, None)  # Saturday
+
+    with duckdb.connect(str(db_path)) as conn:
+        settled = conn.execute(
+            "SELECT next_session_return_percent FROM observations "
+            "WHERE evaluation_date = '2026-07-17' AND symbol = 'SPY'"
+        ).fetchone()[0]
+    assert settled is None
+
+
+def test_portfolio_memory_with_calendar_day_predicate_settles_across_a_weekend(
+    tmp_path: Path,
+) -> None:
+    # Crypto trades every calendar day, so CryptoRotationStrategy passes
+    # is_next_calendar_day instead of the NYSE-session default -- this is
+    # the same scenario as the test above, but it must settle.
+    db_path = tmp_path / "crypto_memory.duckdb"
+    memory = PortfolioMemory(
+        db_path,
+        minimum_observations=1,
+        maximum_observations=50,
+        next_session_predicate=is_next_calendar_day,
+    )
+    memory.update_and_forecast("2026-07-17", "BTC", 100.0, 5.0, None)  # Friday
+    memory.update_and_forecast("2026-07-18", "BTC", 110.0, 5.0, None)  # Saturday
+
+    with duckdb.connect(str(db_path)) as conn:
+        settled = conn.execute(
+            "SELECT next_session_return_percent FROM observations "
+            "WHERE evaluation_date = '2026-07-17' AND symbol = 'BTC'"
+        ).fetchone()[0]
+    assert settled == 10.0
+
+
 def test_trade_memory_does_not_label_a_multisession_gap_as_next_session(
     tmp_path: Path,
 ) -> None:
@@ -1765,6 +2168,24 @@ def test_trade_memory_does_not_label_a_multisession_gap_as_next_session(
             "WHERE evaluation_date = '2026-07-13'"
         ).fetchone()[0]
     assert settled is None
+
+
+def test_trade_memory_with_calendar_day_predicate_settles_across_a_weekend(
+    tmp_path: Path,
+) -> None:
+    # Crypto's Opportunistic Opportunity swap uses TradeMemory too, with
+    # is_next_calendar_day instead of the NYSE-session default -- same fix
+    # as PortfolioMemory needed for the same reason.
+    db_path = tmp_path / "crypto_trade_memory.duckdb"
+    memory = TradeMemory(db_path, 1, 50, next_session_predicate=is_next_calendar_day)
+    memory.update_and_forecast("2026-07-17", 100.0, 100.0, 5.0, None, True)  # Friday
+    memory.update_and_forecast("2026-07-18", 100.0, 110.0, 5.0, None, True)  # Saturday
+
+    with duckdb.connect(str(db_path)) as conn:
+        settled = conn.execute(
+            "SELECT relative_return_percent FROM observations WHERE evaluation_date = '2026-07-17'"
+        ).fetchone()[0]
+    assert settled == 10.0
 
 
 def test_adaptive_news_model_does_not_learn_from_a_multisession_gap(

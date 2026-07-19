@@ -9,7 +9,7 @@ qualifying symbol's daily observation contribute to the same model.
 """
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -23,10 +23,21 @@ from ridge_regression import fit_two_feature_ridge
 class PortfolioMemory:
     """Record per-symbol dip observations and forecast next-session return."""
 
-    def __init__(self, database_path: Path, minimum_observations: int, maximum_observations: int):
+    def __init__(
+        self,
+        database_path: Path,
+        minimum_observations: int,
+        maximum_observations: int,
+        next_session_predicate: Callable[[str, str], bool] = is_next_trading_session,
+    ):
         self.database_path = database_path
         self.minimum_observations = minimum_observations
         self.maximum_observations = maximum_observations
+        # Defaults to NYSE-trading-session succession (equity's behavior,
+        # unchanged). CryptoRotationStrategy passes
+        # market_sessions.is_next_calendar_day instead, since crypto trades
+        # every calendar day rather than skipping weekends/holidays.
+        self._next_session_predicate = next_session_predicate
 
     def update_and_forecast(
         self,
@@ -55,7 +66,7 @@ class PortfolioMemory:
         durable context for the day, not model inputs.
         """
         with self._open() as conn:
-            self._settle_prior_observations(conn, symbol, evaluation_date, price)
+            self._settle_prior_observations_with_predicate(conn, symbol, evaluation_date, price)
             conn.execute(
                 """
                 INSERT INTO observations
@@ -167,9 +178,8 @@ class PortfolioMemory:
             conn.execute("UPDATE observations SET signal_present = 1 WHERE signal_present IS NULL")
             conn.execute("ALTER TABLE observations ALTER COLUMN signal_present SET DEFAULT 1")
 
-    @staticmethod
-    def _settle_prior_observations(
-        conn: duckdb.DuckDBPyConnection, symbol: str, date: str, price: float
+    def _settle_prior_observations_with_predicate(
+        self, conn: duckdb.DuckDBPyConnection, symbol: str, date: str, price: float
     ) -> None:
         rows = conn.execute(
             """
@@ -181,7 +191,7 @@ class PortfolioMemory:
             (symbol, date),
         ).fetchall()
         for prior_date, prior_price in rows:
-            if not is_next_trading_session(str(prior_date), date):
+            if not self._next_session_predicate(str(prior_date), date):
                 continue
             if prior_price is None or prior_price <= 0:
                 continue
