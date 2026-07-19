@@ -36,6 +36,7 @@ from lumibot.strategies import Strategy
 
 import decision_math
 import email_render
+import signal_snapshot
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
 from portfolio_memory import PortfolioMemory
@@ -1141,6 +1142,12 @@ class CryptoRotationStrategy(Strategy):
         eligible.sort(key=lambda signal: float(signal["posture_adjusted_edge"]), reverse=True)
         report["crypto_candidates"] = len(eligible)
         report["crypto_holdings"] = ", ".join(sorted(held_working)) or "none"
+        signal_snapshot.write_snapshot(
+            str(self.parameters.get("crypto_signal_snapshot_file", "")),
+            datetime.now(timezone.utc).isoformat(),
+            posture,
+            signal_snapshot.build_snapshot_entries(signals_by_symbol.values(), held),
+        )
 
         # Opportunistic Opportunity: evaluated exactly once, as a single
         # non-looped decision, reserving both legs via claimed_symbols so it

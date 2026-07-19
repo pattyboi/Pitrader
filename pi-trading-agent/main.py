@@ -740,6 +740,7 @@ def build_strategy(
             "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
             "portfolio_holding_state_file": str(base_dir / ".portfolio_holding_state.json"),
             "portfolio_rotation_state_file": str(base_dir / ".portfolio_rotation_state.json"),
+            "portfolio_signal_snapshot_file": str(base_dir / ".portfolio_signal_snapshot.json"),
             "portfolio_iteration_state_file": str(base_dir / ".portfolio_iteration_state.json"),
             "portfolio_second_iteration_offset_minutes": config[
                 "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"

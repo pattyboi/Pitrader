@@ -19,6 +19,7 @@ from lumibot.strategies import Strategy
 import article_filter
 import decision_math
 import email_render
+import signal_snapshot
 from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
@@ -2755,6 +2756,12 @@ class AssetRotationStrategy(Strategy):
                 signal, risk_posture, news_score
             )
         report["portfolio_risk_posture"] = risk_posture
+        signal_snapshot.write_snapshot(
+            str(self.parameters.get("portfolio_signal_snapshot_file", "")),
+            self.get_datetime().isoformat(),
+            risk_posture,
+            signal_snapshot.build_snapshot_entries(signals, held),
+        )
         eligible = [
             signal
             for signal in signals

@@ -1237,7 +1237,9 @@ equity service's `.portfolio_*` files: `.crypto_holding_state.json`,
 `.crypto_rotation_state.json`, `.crypto_opportunistic_swap_state.json`,
 `.crypto_portfolio_memory.duckdb`, `.crypto_trade_memory.duckdb`,
 `.crypto_universe.duckdb` (autonomous discovery), and
-`.crypto_last_email_report`.
+`.crypto_last_email_report`. It also writes `.crypto_signal_snapshot.json`
+(equity's counterpart is `.portfolio_signal_snapshot.json`) — see "Viewing
+the agent's current per-symbol opinions" below.
 
 ### Enabling it
 
@@ -1258,6 +1260,31 @@ Confirm `IS_PAPER_TRADING` is `true` before enabling crypto for the first
 time, exactly as you would for the equity strategy.
 
 ## Operating the service
+
+### Viewing the agent's current per-symbol opinions
+
+Every iteration, both the equity and crypto strategies write a small snapshot
+of what they currently think about each symbol they evaluated — not just the
+ones they decided to trade. View it with:
+
+```bash
+python3 scripts/view_signals.py
+```
+
+This prints a plain-text table, sectioned into `STOCKS` and `CRYPTO`, one row
+per symbol, sorted alphabetically: whether it's currently held, today's dip
+percentage, the edge percentage behind the opinion (today's posture-adjusted
+edge if the symbol is dipping right now, otherwise its raw historical
+expected profit), and a green `+` (non-negative edge) or red `-` (negative
+edge). It's a read-only viewer: no broker calls, no network access, no
+dependency on the project's virtualenv — it just reads the two small JSON
+files the live strategies already write
+(`.portfolio_signal_snapshot.json`/`.crypto_signal_snapshot.json`) and exits
+immediately, so it's cheap enough to run any time, including over a slow SSH
+session on the Pi. If a section says "no data yet," that strategy hasn't
+completed an iteration since the snapshot file was last written — equity only
+evaluates twice a trading day (see `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES`
+above), so it can take a while to appear even right after the service starts.
 
 ### Understanding common log messages
 

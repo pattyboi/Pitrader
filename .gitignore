@@ -18,6 +18,8 @@ pi-trading-agent/config.json
 .portfolio_holding_state.json.*
 .portfolio_iteration_state.json
 .portfolio_iteration_state.json.*
+.portfolio_signal_snapshot.json
+.portfolio_signal_snapshot.json.*
 .nightly_preeval_state.json
 .nightly_preeval_state.json.*
 .autonomous_universe.json
@@ -53,6 +55,8 @@ pi-trading-agent/config.json
 .crypto_trade_memory.duckdb.*
 .crypto_portfolio_memory.duckdb
 .crypto_portfolio_memory.duckdb.*
+.crypto_signal_snapshot.json
+.crypto_signal_snapshot.json.*
 
 # Python bytecode
 __pycache__/

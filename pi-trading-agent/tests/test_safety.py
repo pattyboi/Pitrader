@@ -16,6 +16,7 @@ import pytest
 import article_filter
 import autonomous_universe
 import llm_news
+import signal_snapshot
 import token_estimate
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
@@ -2508,3 +2509,82 @@ def test_world_event_analyzer_merges_rss_articles_after_alpaca(monkeypatch: pyte
     assert context.available is True
     assert context.article_count == 1
     assert context.per_article[0]["headline"] == "Widget Co beats earnings"
+
+
+def test_build_snapshot_entries_uses_posture_adjusted_edge_when_qualifying() -> None:
+    signals = [
+        {"symbol": "SPY", "qualifies": True, "dip": 2.5, "expected_profit": -1.0, "posture_adjusted_edge": 0.75},
+    ]
+    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
+    assert entries == [
+        {
+            "symbol": "SPY",
+            "held": False,
+            "qualifies": True,
+            "dip_percent": 2.5,
+            "edge_percent": 0.75,
+            "opinion": "+",
+        }
+    ]
+
+
+def test_build_snapshot_entries_falls_back_to_expected_profit_when_idle() -> None:
+    # Not qualifying today (no dip signal) -- posture_adjusted_edge is absent
+    # entirely, mirroring both strategies' actual signal shape, so the
+    # opinion falls back to the raw historical expected_profit.
+    signals = [{"symbol": "QQQ", "qualifies": False, "dip": 0.0, "expected_profit": -0.4}]
+    entries = signal_snapshot.build_snapshot_entries(signals, held={"QQQ"})
+    assert entries == [
+        {
+            "symbol": "QQQ",
+            "held": True,
+            "qualifies": False,
+            "dip_percent": 0.0,
+            "edge_percent": -0.4,
+            "opinion": "-",
+        }
+    ]
+
+
+def test_build_snapshot_entries_sorts_alphabetically_by_symbol() -> None:
+    signals = [
+        {"symbol": "QQQ", "qualifies": False, "dip": 0.0, "expected_profit": 0.1},
+        {"symbol": "DIA", "qualifies": False, "dip": 0.0, "expected_profit": 0.1},
+    ]
+    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
+    assert [entry["symbol"] for entry in entries] == ["DIA", "QQQ"]
+
+
+def test_build_snapshot_entries_zero_edge_is_a_positive_opinion() -> None:
+    signals = [{"symbol": "IWM", "qualifies": False, "dip": 0.0, "expected_profit": 0.0}]
+    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
+    assert entries[0]["opinion"] == "+"
+
+
+def test_write_snapshot_round_trips_through_json(tmp_path: Path) -> None:
+    path = tmp_path / "snapshot.json"
+    entries = signal_snapshot.build_snapshot_entries(
+        [{"symbol": "BTC", "qualifies": True, "dip": 3.0, "expected_profit": 1.0, "posture_adjusted_edge": 1.2}],
+        held={"BTC"},
+    )
+    signal_snapshot.write_snapshot(str(path), "2026-07-19T09:00:00+00:00", "risky", entries)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["risk_posture"] == "risky"
+    assert saved["symbols"][0]["symbol"] == "BTC"
+    assert saved["symbols"][0]["opinion"] == "+"
+
+
+def test_write_snapshot_is_a_no_op_with_an_empty_path(tmp_path: Path) -> None:
+    # An empty path means the feature isn't wired up for this caller -- must
+    # not raise, matching this codebase's fail-open convention for
+    # observational side channels.
+    signal_snapshot.write_snapshot("", "2026-07-19T09:00:00+00:00", "risky", [])
+
+
+def test_write_snapshot_swallows_a_write_failure(tmp_path: Path) -> None:
+    # A directory that doesn't exist can't be written to -- must fail open,
+    # not raise, since this is a purely observational side channel.
+    bad_path = tmp_path / "missing-dir" / "snapshot.json"
+    signal_snapshot.write_snapshot(str(bad_path), "2026-07-19T09:00:00+00:00", "risky", [])
+    assert not bad_path.exists()
