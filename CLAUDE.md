@@ -37,7 +37,7 @@ The service restarts on crash after 30s (`Restart=always`), so a config error sh
 
 ## Architecture
 
-Eight supporting modules plus the one strategy class (portfolio mode is the only mode — the legacy Asset-A/B rotation pipeline, WallStreetBets context, and congressional-trading context have all been removed). Full per-module breakdown: `.claude/docs/architecture.md`.
+Two independent systemd services, each its own process: an equity service (`main.py` → `strategy.py`'s `AssetRotationStrategy`, portfolio mode is the only mode) and an optional crypto service (`main_crypto.py` → `crypto_strategy.py`'s `CryptoRotationStrategy`, active only while NYSE is closed). They share `config.json`/the Alpaca account but write disjoint state files. Many supporting modules (news/LLM context, decision math, memory/learning, discovery, a read-only browser dashboard) back the two strategy classes — the legacy Asset-A/B rotation pipeline, WallStreetBets context, and congressional-trading context have all been removed. Full per-module breakdown: `.claude/docs/architecture.md`.
 
 ### Decision pipeline
 

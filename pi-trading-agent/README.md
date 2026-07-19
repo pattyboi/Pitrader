@@ -228,14 +228,25 @@ pi-trading-agent/
 ├── runtime_state.py    Transactional DuckDB store for restart-critical process state
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── rss_news.py         Optional free RSS headline ingestion (no API key)
+├── article_filter.py   Optional full-article fetch/scoring for discovery-only red flags
 ├── symbol_reference.py Local, cross-checked ticker-to-company-name mapping
 ├── autonomous_universe.py Bounded daily symbol discovery from Alpaca's asset directory
 ├── llm_news.py         Optional LLM daily news assessment (local Ollama only)
+├── token_estimate.py   Shared, dependency-free prompt token-count estimate
+├── market_sessions.py  Shared NYSE/calendar-day session-succession helpers (equity and crypto)
+├── ridge_regression.py Shared two-feature ridge fit used by decision/portfolio memory
+├── signal_snapshot.py  Writes the per-symbol opinion snapshot the browser dashboard reads
+├── trade_counter.py    Writes the same-day trade count the browser dashboard reads
 ├── strategy.py         Daily dip and rotation logic
 ├── decision_math.py     Shared position-sizing/ranking math (equity and crypto)
 ├── email_render.py      Shared HTML email-report rendering (equity and crypto)
 ├── main_crypto.py       Crypto strategy startup (separate process/service, see "Crypto trading mode")
 ├── crypto_strategy.py   Crypto dip-buying and rotation logic, active only while NYSE is closed
+├── scripts/
+│   ├── web_dashboard.py     Read-only browser dashboard (own systemd service, see below)
+│   ├── nightly_preeval.py   03:00 ET cache warm-up for the LLM article-verdict check
+│   ├── ollama_warmup.sh     Pre-loads the local LLM ahead of market open
+│   └── cpu_watchdog.sh      Samples service CPU into .cpu_watchdog.log
 └── setup_service.sh    Virtual environment and systemd installer
 ```
 
@@ -1230,6 +1241,7 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 | `CRYPTO_SYMBOLS` | `["BTC", "ETH"]` | Static watchlist, base symbols only (no `/USD` suffix). |
 | `CRYPTO_MAX_POSITIONS` | `1` | Ceiling on simultaneous crypto holdings. |
 | `CRYPTO_DIP_THRESHOLD_PERCENT` | `5.0` | Dip size (from the recent high) required to consider buying. |
+| `CRYPTO_MIN_EXPECTED_PROFIT_PERCENT` | `1.0` | Minimum cost-adjusted historical average next-session return required to buy; the crypto equivalent of `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT`. A dip that clears `CRYPTO_DIP_THRESHOLD_PERCENT` but not this floor produces no trade — the most common reason crypto stays idle even while dips are showing in the logs. |
 | `CRYPTO_TAKE_PROFIT_PERCENT` / `CRYPTO_STOP_LOSS_PERCENT` | `1.5` / `1.0` | Exit thresholds, wider than the equity defaults since crypto moves more. |
 | `CRYPTO_HOLDING_HORIZON_MAX_DAYS` | `15` | Backstop exit if neither take-profit nor stop-loss has triggered. |
 | `CRYPTO_ITERATION_INTERVAL_MINUTES` | `15` | How often the service re-evaluates while the stock market is closed. |
@@ -1243,9 +1255,11 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 `CRYPTO_MIN_ORDER_DOLLARS`, `CRYPTO_ANALYSIS_DAYS`,
 `CRYPTO_RECENT_HIGH_LOOKBACK_DAYS`, `CRYPTO_MIN_SIGNAL_OBSERVATIONS`,
 `CRYPTO_OOS_MIN_OBSERVATIONS`, `CRYPTO_OOS_MIN_NET_PROFIT_PERCENT`,
-`CRYPTO_ROUND_TRIP_COST_PERCENT`, `CRYPTO_DISCOVERY_BATCH_SIZE`, and
-`CRYPTO_DISCOVERY_REFRESH_DAYS` mirror their `PORTFOLIO_*` equivalents; see
-`config.example.json` for the full set with working defaults.
+`CRYPTO_ROUND_TRIP_COST_PERCENT`, `CRYPTO_DISCOVERY_BATCH_SIZE`,
+`CRYPTO_DISCOVERY_REFRESH_DAYS`, `CRYPTO_MEMORY_MIN_OBSERVATIONS` (`20`), and
+`CRYPTO_MEMORY_MAX_OBSERVATIONS` (`500`) mirror their `PORTFOLIO_*`
+equivalents; see `config.example.json` for the full set with working
+defaults.
 
 ### State files
 
