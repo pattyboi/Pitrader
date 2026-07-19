@@ -1281,34 +1281,23 @@ time, exactly as you would for the equity strategy.
 
 Every iteration, both the equity and crypto strategies write a small snapshot
 of what they currently think about each symbol they evaluated — not just the
-ones they decided to trade. View it with:
+ones they decided to trade. `setup_service.sh` installs and starts
+`trading-agent-dashboard.service`, a small always-on browser dashboard for
+it, showing the per-symbol opinions plus a running count of trades placed
+today. It's read-only, stdlib-only Python (`scripts/web_dashboard.py`, no new
+pip dependency) — no broker calls, no network access beyond serving the page
+itself, just the same two small JSON files the live strategies already write
+(`.portfolio_signal_snapshot.json`/`.crypto_signal_snapshot.json`).
 
-```bash
-python3 scripts/view_signals.py
-```
+Each row shows whether the symbol is currently held, today's dip percentage,
+the edge percentage behind the opinion (today's posture-adjusted edge if the
+symbol is dipping right now, otherwise its raw historical expected profit),
+and a green `+` (non-negative edge) or red `-` (negative edge). If a section
+says "no data yet," that strategy hasn't completed an iteration since the
+snapshot file was last written — equity only evaluates twice a trading day
+(see `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES` above), so it can take a
+while to appear even right after the service starts.
 
-This prints a plain-text table, sectioned into `STOCKS` and `CRYPTO`, one row
-per symbol, sorted alphabetically: whether it's currently held, today's dip
-percentage, the edge percentage behind the opinion (today's posture-adjusted
-edge if the symbol is dipping right now, otherwise its raw historical
-expected profit), and a green `+` (non-negative edge) or red `-` (negative
-edge). It's a read-only viewer: no broker calls, no network access, no
-dependency on the project's virtualenv — it just reads the two small JSON
-files the live strategies already write
-(`.portfolio_signal_snapshot.json`/`.crypto_signal_snapshot.json`) and exits
-immediately, so it's cheap enough to run any time, including over a slow SSH
-session on the Pi. If a section says "no data yet," that strategy hasn't
-completed an iteration since the snapshot file was last written — equity only
-evaluates twice a trading day (see `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES`
-above), so it can take a while to appear even right after the service starts.
-
-### Viewing the same thing in a browser
-
-`setup_service.sh` also installs and starts `trading-agent-dashboard.service`,
-a small always-on browser dashboard showing the same per-symbol opinions plus
-a running count of trades placed today. It's read-only, stdlib-only Python
-(`scripts/web_dashboard.py`, no new pip dependency), reads the same two
-snapshot files as `view_signals.py` above, and never touches the broker.
 Browse to `http://<this Pi's LAN IP>:8765` from any device on the same
 network — the service binds `0.0.0.0:8765` by default, so it has **no login
 and is reachable by anyone on that network**. If that's not acceptable for

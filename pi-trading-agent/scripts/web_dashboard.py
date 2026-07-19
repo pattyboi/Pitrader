@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Browser dashboard for the per-symbol opinion snapshot (signal_snapshot.py).
 
-The browser-facing counterpart to view_signals.py: same two read-only JSON
-snapshot files (.portfolio_signal_snapshot.json, .crypto_signal_snapshot.json),
-same "never touches the broker" guarantee, just rendered as a terminal-themed
-HTML page instead of printed to a TTY. Deliberately stdlib-only (http.server,
-no Flask/aiohttp/etc.) so it adds zero new pip dependencies and stays cheap
-enough to run continuously on the Pi -- a few MB of RSS, no background
-polling thread, snapshot files are only read in response to an actual HTTP
-request. The browser itself does the polling (see POLL_INTERVAL_MS in the
-page's inline JS), and there's no work to do between requests.
+Reads two read-only JSON snapshot files (.portfolio_signal_snapshot.json,
+.crypto_signal_snapshot.json) the live equity and crypto iterations already
+write, and renders them as a terminal-themed HTML page -- never touches the
+broker, never imports lumibot, never affects the trading path. Deliberately
+stdlib-only (http.server, no Flask/aiohttp/etc.) so it adds zero new pip
+dependencies and stays cheap enough to run continuously on the Pi -- a few
+MB of RSS, no background polling thread, snapshot files are only read in
+response to an actual HTTP request. The browser itself does the polling (see
+POLL_INTERVAL_MS in the page's inline JS), and there's no work to do between
+requests.
 
 Usage: python3 scripts/web_dashboard.py
 Env vars: DASHBOARD_HOST (default 0.0.0.0), DASHBOARD_PORT (default 8765)

@@ -6,8 +6,9 @@ build_snapshot_entries/write_snapshot at the same point each iteration --
 right after every evaluated symbol's posture-adjusted edge (or, for a symbol
 not dipping today, its raw historical expected_profit) is known, but before
 eligibility filtering trims the list down to actionable candidates -- so the
-CLI viewer (scripts/view_signals.py) can show the agent's standing opinion on
-every symbol it looked at, not just the ones it decided to act on. Purely
+browser dashboard (scripts/web_dashboard.py) can show the agent's standing
+opinion on every symbol it looked at, not just the ones it decided to act on.
+Purely
 observational: writing this snapshot can never affect a trading decision, and
 a failed write is swallowed rather than raised, the same fail-open posture as
 the rest of this codebase's advisory-only side channels (e.g. the nightly
