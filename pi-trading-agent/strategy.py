@@ -1606,25 +1606,48 @@ class AssetRotationStrategy(Strategy):
 
     _walk_forward_net_returns = staticmethod(decision_math.walk_forward_net_returns)
 
-    def _get_bid_ask(self, symbol: str) -> tuple[float, float] | None:
-        """Live (bid, ask) for symbol, or None on any missing/invalid/one-sided quote.
+    def _uses_alpaca_market_data(self) -> bool:
+        source = getattr(getattr(getattr(self, "broker", None), "data_source", None), "SOURCE", "")
+        return str(source).upper() == "ALPACA"
 
-        Never raises: a quote failure here must not block the caller.
-        """
+    def _get_quote_price_and_bid_ask(
+        self, symbol: str
+    ) -> tuple[float | None, tuple[float, float] | None]:
+        """Read Alpaca's signal price and spread inputs from one quote."""
         try:
             quote = self.get_quote(symbol)
         except Exception:
-            return None
+            return None, None
         if quote is None:
-            return None
+            return None, None
+        price: float | None = None
+        raw_price = getattr(quote, "price", None)
+        if raw_price is not None:
+            try:
+                candidate = float(raw_price)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(candidate) and candidate > 0:
+                    price = candidate
         try:
-            bid = float(quote.bid)
-            ask = float(quote.ask)
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
         except (TypeError, ValueError, AttributeError):
-            return None
-        if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= bid:
-            return None
-        return bid, ask
+            return price, None
+        if price is None:
+            fallback = bid if bid > 0 else ask
+            price = fallback if math.isfinite(fallback) and fallback > 0 else None
+        bid_ask = (
+            (bid, ask)
+            if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > bid
+            else None
+        )
+        return price, bid_ask
+
+    def _get_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        """Live (bid, ask) for symbol, or None on any invalid quote."""
+        return self._get_quote_price_and_bid_ask(symbol)[1]
 
     def _live_spread_percent(self, symbol: str) -> float | None:
         """Best-effort live bid/ask spread, as a round-trip cost estimate.
@@ -1738,15 +1761,12 @@ class AssetRotationStrategy(Strategy):
         lookback = int(self.parameters["recent_high_lookback_days"])
         if len(values) <= lookback:
             return None
-        # Alpaca's get_last_price() is itself implemented as a quote request.
-        # Reuse that quote for both its midpoint and spread instead of issuing
-        # a second request for the same symbol moments later.
-        bid_ask = self._get_bid_ask(symbol)
-        price = (
-            (bid_ask[0] + bid_ask[1]) / 2.0
-            if bid_ask is not None
-            else self.get_last_price(symbol)
-        )
+        alpaca_quote = self._uses_alpaca_market_data()
+        if alpaca_quote:
+            price, bid_ask = self._get_quote_price_and_bid_ask(symbol)
+        else:
+            price = self.get_last_price(symbol)
+            bid_ask = None
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
         # A low-priced or thin-volume symbol can still clear the profit/OOS
@@ -1797,11 +1817,14 @@ class AssetRotationStrategy(Strategy):
         # order where the spread is a much larger share of the target edge.
         # Fetched for every symbol reaching this point, not just a qualifying
         # dip, so it becomes one of the daily learning facts too.
-        live_spread = (
-            self._spread_percent_from_bid_ask(bid_ask)
-            if bid_ask is not None
-            else None
-        )
+        if alpaca_quote:
+            live_spread = (
+                self._spread_percent_from_bid_ask(bid_ask)
+                if bid_ask is not None
+                else None
+            )
+        else:
+            live_spread = self._live_spread_percent(symbol)
         round_trip_cost = (
             max(configured_round_trip_cost, live_spread)
             if live_spread is not None
@@ -1885,9 +1908,16 @@ class AssetRotationStrategy(Strategy):
                 str(getattr(asset, "symbol", asset)).upper(): bars
                 for asset, bars in batch.items()
             }
-        except Exception:
+        except Exception as exc:
             # Preserve compatibility with alternate/backtesting brokers that
             # do not implement the multi-asset path.
+            log_message = getattr(self, "log_message", None)
+            if callable(log_message) and getattr(self, "logger", None) is not None:
+                log_message(
+                    "Portfolio history batch unavailable; using per-symbol requests: "
+                    f"{type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
             prefetched = None
         with ThreadPoolExecutor(
             max_workers=min(self._PORTFOLIO_HISTORY_WORKERS, len(symbols)),

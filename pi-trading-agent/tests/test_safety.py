@@ -7,6 +7,7 @@ import logging
 import os
 import stat
 import subprocess
+import sys
 import threading
 
 import duckdb
@@ -369,7 +370,7 @@ def test_duckdb_runtime_state_round_trips_and_deletes_values(tmp_path: Path) -> 
     assert store.get("portfolio") == (False, None)
 
 
-def test_duckdb_runtime_state_reuses_its_connection(
+def test_duckdb_runtime_state_caches_recent_values_without_holding_a_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_connect = runtime_state.duckdb.connect
@@ -385,12 +386,43 @@ def test_duckdb_runtime_state_reuses_its_connection(
 
     store.set("one", 1)
     assert store.get("one") == (True, 1)
-    assert store.get("missing") == (False, None)
+    assert store.get("one") == (True, 1)
     assert len(connections) == 1
 
     store.close()
     assert store.get("one") == (True, 1)
     assert len(connections) == 2
+    store.close()
+
+
+def test_duckdb_runtime_state_allows_a_second_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(runtime_state.time, "monotonic", lambda: clock[0])
+    database_path = tmp_path / "runtime.duckdb"
+    store = DuckDBStateStore(database_path)
+    store.set("one", 1)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import duckdb,sys; "
+                "conn=duckdb.connect(sys.argv[1]); "
+                "conn.execute(\"UPDATE runtime_state SET payload='2' WHERE state_key='one'\"); "
+                "conn.commit(); conn.close()"
+            ),
+            str(database_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    clock[0] = store._CACHE_TTL_SECONDS + 0.1
+    assert store.get("one") == (True, 2)
     store.close()
 
 
@@ -1521,6 +1553,13 @@ def test_symbol_reference_refresh_queues_symbols_seen_during_active_refresh() ->
 def test_portfolio_history_requests_use_bounded_concurrency() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy._PORTFOLIO_HISTORY_WORKERS = 2
+    strategy.parameters = {"portfolio_analysis_days": 252}
+    strategy.get_historical_prices_for_assets = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("batch unavailable")
+    )
+    messages = []
+    strategy.logger = object()
+    strategy.log_message = lambda message, **kwargs: messages.append(message)
     rendezvous = threading.Barrier(2)
 
     def signal(symbol: str):
@@ -1533,6 +1572,7 @@ def test_portfolio_history_requests_use_bounded_concurrency() -> None:
         {"symbol": "SPY"},
         {"symbol": "QQQ"},
     ]
+    assert "using per-symbol requests" in messages[0]
 
 
 def test_portfolio_history_requests_use_the_multi_asset_path() -> None:
@@ -1540,9 +1580,18 @@ def test_portfolio_history_requests_use_the_multi_asset_path() -> None:
     strategy.parameters = {"portfolio_analysis_days": 252}
     bars = {"SPY": object(), "QQQ": object()}
     calls = []
-    strategy.get_historical_prices_for_assets = lambda assets, *args, **kwargs: (
-        calls.append(list(assets)) or bars
-    )
+
+    class FakeDataSource:
+        SOURCE = "ALPACA"
+        IS_BACKTESTING_DATA_SOURCE = False
+
+        def get_bars(self, assets, *args, **kwargs):
+            calls.append(list(assets))
+            return {asset: bars[asset.symbol] for asset in assets}
+
+    strategy.broker = SimpleNamespace(data_source=FakeDataSource())
+    strategy._logged_get_historical_prices_assets = set()
+    strategy.logger = logging.getLogger("test-portfolio-batch")
     strategy._portfolio_signal = lambda symbol, supplied=None, **kwargs: {
         "symbol": symbol,
         "bars": supplied,
@@ -1551,7 +1600,7 @@ def test_portfolio_history_requests_use_the_multi_asset_path() -> None:
 
     results = strategy._portfolio_signals(["SPY", "QQQ"])
 
-    assert calls == [["SPY", "QQQ"]]
+    assert [[asset.symbol for asset in calls[0]]] == [["SPY", "QQQ"]]
     assert [result["bars"] for result in results] == [bars["SPY"], bars["QQQ"]]
     assert all(result["prefetched"] for result in results)
 
@@ -1563,9 +1612,18 @@ def test_crypto_history_requests_use_the_multi_asset_path() -> None:
     strategy._unpriceable_symbols_lock = threading.Lock()
     bars = {"BTC": object(), "ETH": object()}
     calls = []
-    strategy.get_historical_prices_for_assets = lambda assets, *args, **kwargs: (
-        calls.append(list(assets)) or bars
-    )
+
+    class FakeDataSource:
+        SOURCE = "ALPACA"
+        IS_BACKTESTING_DATA_SOURCE = False
+
+        def get_bars(self, assets, *args, **kwargs):
+            calls.append(list(assets))
+            return {pair[0]: bars[pair[0].symbol] for pair in assets}
+
+    strategy.broker = SimpleNamespace(data_source=FakeDataSource())
+    strategy._logged_get_historical_prices_assets = set()
+    strategy.logger = logging.getLogger("test-crypto-batch")
     strategy._crypto_signal = lambda symbol, supplied=None, **kwargs: {
         "symbol": symbol,
         "bars": supplied,
@@ -1637,14 +1695,51 @@ def test_portfolio_signal_exposes_round_trip_cost_for_memory_blending() -> None:
 
 def test_portfolio_signal_reuses_one_quote_for_price_and_spread() -> None:
     strategy = _signal_test_strategy(last_price=90.0, volume=[200000] * 5)
+    strategy.broker = SimpleNamespace(data_source=SimpleNamespace(SOURCE="ALPACA"))
     strategy.get_last_price = lambda _symbol: pytest.fail(
         "a valid quote should avoid a second last-price request"
     )
-    strategy._get_bid_ask = lambda _symbol: (89.0, 91.0)
+    strategy.get_quote = lambda _symbol: SimpleNamespace(
+        price=88.0, bid=89.0, ask=91.0
+    )
 
     result = strategy._portfolio_signal("OK")
 
-    assert result["price"] == pytest.approx(90.0)
+    assert result["price"] == pytest.approx(88.0)
+    assert result["live_spread_percent"] == pytest.approx(200.0 / 90.0)
+
+
+def test_crypto_signal_reuses_one_quote_for_price_and_spread() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "crypto_recent_high_lookback_days": 3,
+        "crypto_dip_threshold_percent": 5.0,
+        "crypto_round_trip_cost_percent": 0.20,
+        "crypto_oos_min_observations": 10,
+        "crypto_min_expected_profit_percent": 1.0,
+    }
+    strategy._quote_asset = SimpleNamespace(symbol="USD")
+    strategy.broker = SimpleNamespace(data_source=SimpleNamespace(SOURCE="ALPACA"))
+    strategy.get_last_price = lambda *_args, **_kwargs: pytest.fail(
+        "a valid quote should avoid a second last-price request"
+    )
+    strategy.get_quote = lambda *_args, **_kwargs: SimpleNamespace(
+        price=88.0, bid=89.0, ask=91.0
+    )
+    strategy._unpriceable_symbols_lock = threading.Lock()
+    strategy._unpriceable_symbols_this_iteration = set()
+    bars = SimpleNamespace(
+        df=pd.DataFrame(
+            {
+                "high": [100.0, 100.0, 100.0, 100.0, 100.0],
+                "close": [100.0, 100.0, 100.0, 90.0, 95.0],
+            }
+        )
+    )
+
+    result = strategy._crypto_signal("BTC", bars, bars_prefetched=True)
+
+    assert result["price"] == pytest.approx(88.0)
     assert result["live_spread_percent"] == pytest.approx(200.0 / 90.0)
 
 

@@ -409,21 +409,46 @@ class CryptoRotationStrategy(Strategy):
     def _crypto_asset(symbol: str) -> Asset:
         return Asset(symbol=symbol, asset_type="crypto")
 
-    def _get_crypto_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+    def _uses_alpaca_market_data(self) -> bool:
+        source = getattr(getattr(getattr(self, "broker", None), "data_source", None), "SOURCE", "")
+        return str(source).upper() == "ALPACA"
+
+    def _get_crypto_quote_price_and_bid_ask(
+        self, symbol: str
+    ) -> tuple[float | None, tuple[float, float] | None]:
         try:
             quote = self.get_quote(self._crypto_asset(symbol), quote=self.quote_asset)
         except Exception:
-            return None
+            return None, None
         if quote is None:
-            return None
+            return None, None
+        price: float | None = None
+        raw_price = getattr(quote, "price", None)
+        if raw_price is not None:
+            try:
+                candidate = float(raw_price)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(candidate) and candidate > 0:
+                    price = candidate
         try:
-            bid = float(quote.bid)
-            ask = float(quote.ask)
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
         except (TypeError, ValueError, AttributeError):
-            return None
-        if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= bid:
-            return None
-        return bid, ask
+            return price, None
+        if price is None:
+            fallback = bid if bid > 0 else ask
+            price = fallback if math.isfinite(fallback) and fallback > 0 else None
+        bid_ask = (
+            (bid, ask)
+            if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > bid
+            else None
+        )
+        return price, bid_ask
+
+    def _get_crypto_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        return self._get_crypto_quote_price_and_bid_ask(symbol)[1]
 
     def _crypto_live_spread_percent(self, symbol: str) -> float | None:
         bid_ask = self._get_crypto_bid_ask(symbol)
@@ -587,12 +612,12 @@ class CryptoRotationStrategy(Strategy):
         lookback = int(self.parameters["crypto_recent_high_lookback_days"])
         if len(values) <= lookback:
             return None
-        bid_ask = self._get_crypto_bid_ask(symbol)
-        price = (
-            (bid_ask[0] + bid_ask[1]) / 2.0
-            if bid_ask is not None
-            else self.get_last_price(base, quote=self.quote_asset)
-        )
+        alpaca_quote = self._uses_alpaca_market_data()
+        if alpaca_quote:
+            price, bid_ask = self._get_crypto_quote_price_and_bid_ask(symbol)
+        else:
+            price = self.get_last_price(base, quote=self.quote_asset)
+            bid_ask = None
         if price is None or not math.isfinite(float(price)) or float(price) <= 0:
             return None
         threshold = float(self.parameters["crypto_dip_threshold_percent"])
@@ -614,11 +639,14 @@ class CryptoRotationStrategy(Strategy):
         recent_high = float(values[-lookback:, 0].max())
         current_dip = ((recent_high - float(price)) / recent_high) * 100.0
         configured_round_trip_cost = float(self.parameters.get("crypto_round_trip_cost_percent", 0.50))
-        live_spread = (
-            self._crypto_spread_percent_from_bid_ask(bid_ask)
-            if bid_ask is not None
-            else None
-        )
+        if alpaca_quote:
+            live_spread = (
+                self._crypto_spread_percent_from_bid_ask(bid_ask)
+                if bid_ask is not None
+                else None
+            )
+        else:
+            live_spread = self._crypto_live_spread_percent(symbol)
         round_trip_cost = (
             max(configured_round_trip_cost, live_spread) if live_spread is not None else configured_round_trip_cost
         )
@@ -684,7 +712,14 @@ class CryptoRotationStrategy(Strategy):
                 str(getattr(asset, "symbol", asset)).upper(): bars
                 for asset, bars in batch.items()
             }
-        except Exception:
+        except Exception as exc:
+            log_message = getattr(self, "log_message", None)
+            if callable(log_message) and getattr(self, "logger", None) is not None:
+                log_message(
+                    "Crypto history batch unavailable; using per-symbol requests: "
+                    f"{type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
             prefetched = None
         with ThreadPoolExecutor(
             max_workers=min(self._CRYPTO_HISTORY_WORKERS, len(symbols)), thread_name_prefix="crypto-history"
