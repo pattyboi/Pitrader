@@ -12,6 +12,7 @@ decision, and a failed read/write is swallowed rather than raised.
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 
@@ -28,19 +29,22 @@ def record_trade(path: str, today: str) -> None:
         return
     try:
         file = Path(path)
-        try:
-            data = json.loads(file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        if not isinstance(data, dict) or data.get("date") != today:
-            data = {"date": today, "count": 0}
-        data["count"] = int(data.get("count", 0)) + 1
-        # Atomic write (temp file + replace) -- scripts/web_dashboard.py polls
-        # this file continuously, and a process kill mid-write (a real risk on
-        # a Pi) would otherwise leave it truncated instead of at the last good
-        # count, matching this codebase's other state files.
-        temporary_path = file.with_suffix(file.suffix + ".tmp")
-        temporary_path.write_text(json.dumps(data), encoding="utf-8")
-        temporary_path.replace(file)
+        lock_path = file.with_suffix(file.suffix + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = {}
+            if not isinstance(data, dict) or data.get("date") != today:
+                data = {"date": today, "count": 0}
+            data["count"] = int(data.get("count", 0)) + 1
+            # Atomic write (temp file + replace) -- scripts/web_dashboard.py polls
+            # this file continuously, and a process kill mid-write (a real risk on
+            # a Pi) would otherwise leave it truncated instead of at the last good
+            # count, matching this codebase's other state files.
+            temporary_path = file.with_suffix(file.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(data), encoding="utf-8")
+            temporary_path.replace(file)
     except Exception:
         pass

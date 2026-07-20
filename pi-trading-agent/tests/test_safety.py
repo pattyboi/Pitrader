@@ -21,6 +21,7 @@ import decision_math
 import llm_news
 import signal_snapshot
 import token_estimate
+import trade_counter
 from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer
@@ -2450,7 +2451,7 @@ def test_filled_replacement_buy_clears_restart_state(tmp_path: Path) -> None:
     strategy._forget_confirmed_portfolio_symbol = lambda symbol: None
     strategy._remove_portfolio_rotation = lambda source: strategy.vars.portfolio_pending_rotation.pop(source)
     order = SimpleNamespace(
-        asset=SimpleNamespace(symbol="QQQ"),
+        asset=SimpleNamespace(symbol="qqq"),
         side="buy",
         quantity=Decimal("2"),
         get_fill_price=lambda: 25.0,
@@ -3328,11 +3329,39 @@ def test_on_canceled_order_invalidates_orders_cache() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy._orders_cache = ["stale"]
     strategy.log_message = lambda *args, **kwargs: None
-    strategy.vars = SimpleNamespace(portfolio_pending_rotation={})
+    strategy.vars = SimpleNamespace(
+        portfolio_pending_rotation={
+            "AAAA": {"to": "BBBB", "budget": 50.0, "kind": "replacement"}
+        }
+    )
+    strategy._remove_portfolio_rotation = (
+        lambda source: strategy.vars.portfolio_pending_rotation.pop(source)
+    )
 
-    strategy.on_canceled_order(SimpleNamespace(asset=SimpleNamespace(symbol="AAAA"), side="sell"))
+    strategy.on_canceled_order(
+        SimpleNamespace(asset=SimpleNamespace(symbol="aaaa"), side="sell")
+    )
 
     assert strategy._orders_cache is None
+    assert strategy.vars.portfolio_pending_rotation == {}
+
+
+def test_trade_counter_serializes_concurrent_updates(tmp_path: Path) -> None:
+    path = tmp_path / "trade-count.json"
+    threads = [
+        threading.Thread(target=trade_counter.record_trade, args=(str(path), "2026-07-20"))
+        for _ in range(50)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "date": "2026-07-20",
+        "count": 50,
+    }
 
 
 def test_get_quote_price_and_bid_ask_does_not_cache_a_failed_lookup() -> None:

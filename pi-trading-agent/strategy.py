@@ -3341,7 +3341,7 @@ class AssetRotationStrategy(Strategy):
         # cancellation is itself proof the order book just changed, so any
         # snapshot from a prior iteration must not be trusted here.
         self._invalidate_orders_cache()
-        symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
+        symbol = str(getattr(getattr(order, "asset", None), "symbol", "unknown")).upper()
         side = getattr(order, "side", "unknown")
         # `quantity`/`price` here are the broker trade-update event's own fields,
         # which for an order that fills across multiple partial executions are
@@ -3448,7 +3448,7 @@ class AssetRotationStrategy(Strategy):
     def on_canceled_order(self, order: Any) -> None:
         """Keep the rotation state truthful when the broker kills an order."""
         self._invalidate_orders_cache()  # see on_filled_order's comment
-        symbol = getattr(getattr(order, "asset", None), "symbol", "unknown")
+        symbol = str(getattr(getattr(order, "asset", None), "symbol", "unknown")).upper()
         side = str(getattr(order, "side", "unknown")).lower()
         self.log_message(
             f"Order canceled or rejected by the broker: {side} {symbol}.",
