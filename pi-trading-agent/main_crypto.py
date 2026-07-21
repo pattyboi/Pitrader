@@ -76,6 +76,7 @@ def build_crypto_strategy(
             "crypto_memory_enabled": config["CRYPTO_MEMORY_ENABLED"],
             "crypto_memory_min_observations": config["CRYPTO_MEMORY_MIN_OBSERVATIONS"],
             "crypto_memory_max_observations": config["CRYPTO_MEMORY_MAX_OBSERVATIONS"],
+            "crypto_memory_min_correlation": config["CRYPTO_MEMORY_MIN_CORRELATION"],
             "crypto_memory_database_file": str(base_dir / ".crypto_portfolio_memory.duckdb"),
             "crypto_trade_memory_database_file": str(base_dir / ".crypto_trade_memory.duckdb"),
             "crypto_email_report_enabled": config["CRYPTO_EMAIL_REPORT_ENABLED"],

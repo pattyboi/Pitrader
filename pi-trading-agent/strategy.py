@@ -57,6 +57,7 @@ class AssetRotationStrategy(Strategy):
         "portfolio_stop_loss_percent": 0.5,
         "portfolio_holding_horizon_max_days": 15,
         "portfolio_risk_posture": "conservative",
+        "portfolio_memory_min_correlation": 0.10,
     }
 
     # Fraction of cash withheld from the Asset B buy so the market order is not
@@ -1083,6 +1084,7 @@ class AssetRotationStrategy(Strategy):
             str(self.parameters["portfolio_memory_database_file"]),
             int(self.parameters["portfolio_memory_min_observations"]),
             int(self.parameters["portfolio_memory_max_observations"]),
+            float(self.parameters.get("portfolio_memory_min_correlation", 0.10)),
         )
         cached = getattr(self, "_portfolio_memory_instance", None)
         if cached is None or getattr(self, "_portfolio_memory_key", None) != key:
@@ -1090,6 +1092,7 @@ class AssetRotationStrategy(Strategy):
                 database_path=Path(key[0]),
                 minimum_observations=key[1],
                 maximum_observations=key[2],
+                minimum_correlation=key[3],
             )
             self._portfolio_memory_instance = cached
             self._portfolio_memory_key = key
@@ -2266,10 +2269,12 @@ class AssetRotationStrategy(Strategy):
         claimed_symbols: set[str],
         effective_max_positions: int,
         actions: list[str],
+        deployment_fraction: float = 1.0,
     ) -> int:
         """Submit empty-slot buys without reusing cash reserved earlier in the pass."""
         submitted = 0
-        remaining_cash = max(0.0, float(self.get_cash()))
+        deployment_fraction = max(0.0, min(1.0, float(deployment_fraction)))
+        remaining_cash = max(0.0, float(self.get_cash())) * deployment_fraction
         for candidate in desired:
             symbol = str(candidate["symbol"])
             if symbol in held_working or symbol in claimed_symbols:
@@ -2366,6 +2371,7 @@ class AssetRotationStrategy(Strategy):
         desired: list[dict[str, Any]],
         held_working: dict[str, Decimal],
         actions: list[str],
+        deployment_fraction: float = 1.0,
     ) -> None:
         """Put a usable residual deposit into the best already-held candidate."""
         top_up_candidate = next(
@@ -2376,7 +2382,8 @@ class AssetRotationStrategy(Strategy):
             ),
             None,
         )
-        cash = float(self.get_cash())
+        deployment_fraction = max(0.0, min(1.0, float(deployment_fraction)))
+        cash = float(self.get_cash()) * deployment_fraction
         minimum_cash = float(
             self.parameters.get("portfolio_cash_reserve_dollars", 0.0)
         ) + float(self.parameters.get("portfolio_min_order_dollars", 1.0))
@@ -2577,6 +2584,10 @@ class AssetRotationStrategy(Strategy):
             ),
             block_score=int(self.parameters.get("llm_news_block_score", -6)),
         )
+        llm_exposure = decision_math.llm_exposure_multiplier(
+            llm_assessment.score if llm_assessment.available else None
+        )
+        report["portfolio_llm_exposure_multiplier"] = f"{llm_exposure:.0%}"
 
         # A/B is no longer an alternate strategy mode. It is a separately
         # labelled opportunity inside portfolio mode, trained only on the
@@ -2725,6 +2736,7 @@ class AssetRotationStrategy(Strategy):
             and int(signal["oos_observations"]) >= oos_minimum_observations
             and signal["oos_expected_profit"] is not None
             and float(signal["oos_expected_profit"]) >= oos_minimum_profit
+            and decision_math.learned_edge_allows_purchase(signal)
         ]
         eligible.sort(key=lambda signal: (float(signal["posture_adjusted_edge"]), float(signal["dip"])), reverse=True)
         opportunity_probability = opportunity.get("probability")
@@ -2815,7 +2827,7 @@ class AssetRotationStrategy(Strategy):
             total_capital = self._account_total_value_dollars() - self._crypto_reserve_dollars()
             min_order_dollars = float(self.parameters.get("portfolio_min_order_dollars", 1.0))
             candidate_edges = [
-                (float(signal["expected_profit"]), float(signal.get("return_stdev") or 0.0))
+                (float(signal["posture_adjusted_edge"]), float(signal.get("return_stdev") or 0.0))
                 for signal in remaining_candidates
             ]
             effective_max_positions = self._optimal_position_count(
@@ -2830,6 +2842,7 @@ class AssetRotationStrategy(Strategy):
                 claimed_symbols,
                 effective_max_positions,
                 actions,
+                deployment_fraction=llm_exposure,
             )
 
             replacements_submitted = 0
@@ -2855,7 +2868,12 @@ class AssetRotationStrategy(Strategy):
                 # A recurring small deposit should grow the highest-ranked
                 # current holding instead of remaining idle once the portfolio
                 # is full and every top candidate is already held.
-                self._maybe_top_up_portfolio(desired, held_working, actions)
+                self._maybe_top_up_portfolio(
+                    desired,
+                    held_working,
+                    actions,
+                    deployment_fraction=llm_exposure,
+                )
 
         report["portfolio_actions"] = actions
         report["status"] = self._summarize_portfolio_actions(actions, signal_present, veto_reason)

@@ -360,6 +360,7 @@ The initial file is:
   "PORTFOLIO_MEMORY_ENABLED": true,
   "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
   "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
+  "PORTFOLIO_MEMORY_MIN_CORRELATION": 0.10,
   "LLM_NEWS_ENABLED": false,
   "LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
   "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
@@ -451,11 +452,18 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_MEMORY_ENABLED` | Records every evaluated symbol's dip signal and pools them into one learned-edge forecast used in ranking | `true` |
 | `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` | Pooled settled dip signals (across every symbol) needed before the forecast is used | `20` |
 | `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
+| `PORTFOLIO_MEMORY_MIN_CORRELATION` | Minimum fit correlation before learned edge can rank or block an entry | `0.10` |
 | `LLM_NEWS_ENABLED` | Runs the local LLM assessment before order decisions and enables its veto | `false` |
 | `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"` |
 | `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
 | `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | When the LLM is enabled, blocks opening trades if its assessment fails | `true` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
+
+For scores above the hard block threshold, adverse LLM assessments scale only
+new capital deployment (`-1` = 90%, `-5` = 50%, with a 25% floor). Neutral or
+constructive assessments keep 100% deployment. The LLM cannot make an
+otherwise ineligible signal tradable or increase exposure above its configured
+portfolio cap.
 
 JSON is strict:
 
@@ -1000,11 +1008,12 @@ since any single symbol's dips are too infrequent to train its own model
 reliably.
 
 Once at least `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` pooled signals are settled
-(default 20), the forecast is blended into that day's ranking: it can shift
+(default 20) and fit correlation reaches `PORTFOLIO_MEMORY_MIN_CORRELATION`
+(default 0.10), the forecast is blended into that day's ranking. It can shift
 which already-qualifying candidate looks best or which current holding looks
-weakest, the same way the risky/conservative posture reasoning already does.
-It never changes eligibility — `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and the
-out-of-sample floor are untouched by it, exactly like the posture adjustment.
+weakest, and a validated forecast below zero blocks a new entry. Raw
+`PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and out-of-sample floors still apply,
+so learned memory can reject but cannot manufacture an otherwise invalid trade.
 A risky posture leans into this learned edge
 more; a conservative posture trusts the raw historical backtest more until
 the learned edge has proven itself.
@@ -1088,6 +1097,7 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 | `CRYPTO_AUTONOMOUS_DISCOVERY` | `false` | Expand the watchlist with other Alpaca-tradable USD-quoted crypto pairs. |
 | `CRYPTO_RISK_POSTURE` | `conservative` | Same risky/conservative ranking behavior as `PORTFOLIO_RISK_POSTURE`. |
 | `CRYPTO_MEMORY_ENABLED` | `true` | Pooled cross-symbol learning, same concept as portfolio memory. |
+| `CRYPTO_MEMORY_MIN_CORRELATION` | `0.10` | Minimum fit correlation before pooled memory affects an entry. |
 | `CRYPTO_ASSET_A` / `CRYPTO_ASSET_B` | `BTC` / `ETH` | The Opportunistic Opportunity swap pair. |
 | `CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY` | `0.55` | Minimum historical win probability required before swapping. |
 | `CRYPTO_EMAIL_REPORT_ENABLED` | `false` | A separate daily email report, reusing the same SMTP settings as the equity report. |

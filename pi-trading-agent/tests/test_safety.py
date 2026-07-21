@@ -64,6 +64,8 @@ def test_config_secrets_can_be_supplied_without_storing_them_in_json(
     assert config["ALPACA_API_KEY"] == "environment-key"
     assert config["ALPACA_SECRET_KEY"] == "environment-secret"
     assert config["EMAIL_SMTP_PASSWORD"] == "environment-email-secret"
+    assert config["PORTFOLIO_MEMORY_MIN_CORRELATION"] == pytest.approx(0.10)
+    assert config["CRYPTO_MEMORY_MIN_CORRELATION"] == pytest.approx(0.10)
 
 
 def test_live_trading_requires_an_independent_environment_acknowledgement(
@@ -2779,6 +2781,92 @@ def test_portfolio_builds_reserve_cash_across_same_pass_orders() -> None:
     assert submitted == 2
     assert budgets == pytest.approx([50.0, 50.0])
     assert sum(budgets) <= 100.0
+
+
+def test_portfolio_builds_scale_new_capital_from_adverse_llm_score() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.get_cash = lambda: 100.0
+    budgets: list[float] = []
+    strategy._buy_portfolio_symbol = lambda symbol, price, budget: (
+        budgets.append(budget) or "submitted"
+    )
+
+    submitted = strategy._submit_portfolio_builds(
+        [{"symbol": "AAPL", "price": 10.0}, {"symbol": "MSFT", "price": 20.0}],
+        {},
+        set(),
+        effective_max_positions=2,
+        actions=[],
+        deployment_fraction=decision_math.llm_exposure_multiplier(-5),
+    )
+
+    assert submitted == 2
+    assert budgets == pytest.approx([25.0, 25.0])
+
+
+def test_portfolio_top_up_scales_new_capital_from_adverse_llm_score() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "portfolio_cash_reserve_dollars": 0.0,
+        "portfolio_min_order_dollars": 1.0,
+    }
+    strategy.get_cash = lambda: 100.0
+    budgets: list[float] = []
+    strategy._buy_portfolio_symbol = lambda symbol, price, budget: (
+        budgets.append(budget) or "submitted"
+    )
+
+    strategy._maybe_top_up_portfolio(
+        [{"symbol": "AAPL", "price": 10.0}],
+        {"AAPL": Decimal("1")},
+        [],
+        deployment_fraction=0.5,
+    )
+
+    assert budgets == pytest.approx([50.0])
+
+
+def test_llm_exposure_multiplier_only_reserves_cash_for_adverse_scores() -> None:
+    assert decision_math.llm_exposure_multiplier(None) == 1.0
+    assert decision_math.llm_exposure_multiplier(4) == 1.0
+    assert decision_math.llm_exposure_multiplier(0) == 1.0
+    assert decision_math.llm_exposure_multiplier(-1) == pytest.approx(0.9)
+    assert decision_math.llm_exposure_multiplier(-5) == pytest.approx(0.5)
+    assert decision_math.llm_exposure_multiplier(-10) == pytest.approx(0.25)
+
+
+def test_validated_negative_learned_edge_blocks_only_new_purchases() -> None:
+    assert decision_math.learned_edge_allows_purchase({"learned_edge_ready": False})
+    assert decision_math.learned_edge_allows_purchase(
+        {"learned_edge_ready": True, "learned_edge": 0.1}
+    )
+    assert not decision_math.learned_edge_allows_purchase(
+        {"learned_edge_ready": True, "learned_edge": -0.01}
+    )
+
+
+def test_portfolio_memory_ignores_a_weak_fit(tmp_path: Path) -> None:
+    memory = PortfolioMemory(
+        tmp_path / "weak_memory.duckdb",
+        minimum_observations=3,
+        maximum_observations=50,
+        minimum_correlation=0.10,
+    )
+    memory.backfill_history(
+        "SPY",
+        [
+            ("2026-01-02", 3.0, 1.0),
+            ("2026-01-05", 5.0, 1.0),
+            ("2026-01-06", 7.0, 1.0),
+        ],
+    )
+
+    forecast = memory.update_and_forecast("2026-01-07", "QQQ", 100.0, 6.0, None)
+
+    assert not forecast.ready
+    assert forecast.predicted_edge_percent is None
+    assert forecast.correlation == pytest.approx(0.0)
+    assert "below the required 0.10" in forecast.explanation
 
 
 def test_portfolio_memory_does_not_label_a_multisession_gap_as_next_session(

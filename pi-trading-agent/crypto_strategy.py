@@ -98,6 +98,7 @@ class CryptoRotationStrategy(Strategy):
         "crypto_memory_enabled": True,
         "crypto_memory_min_observations": 20,
         "crypto_memory_max_observations": 500,
+        "crypto_memory_min_correlation": 0.10,
         "crypto_email_report_enabled": False,
         "crypto_autonomous_discovery": False,
         "crypto_discovery_batch_size": 6,
@@ -914,6 +915,7 @@ class CryptoRotationStrategy(Strategy):
             str(self.parameters["crypto_memory_database_file"]),
             int(self.parameters["crypto_memory_min_observations"]),
             int(self.parameters["crypto_memory_max_observations"]),
+            float(self.parameters.get("crypto_memory_min_correlation", 0.10)),
         )
         cached = getattr(self, "_crypto_memory_instance", None)
         if cached is None or getattr(self, "_crypto_memory_key", None) != key:
@@ -922,6 +924,7 @@ class CryptoRotationStrategy(Strategy):
                 minimum_observations=key[1],
                 maximum_observations=key[2],
                 next_session_predicate=is_next_calendar_day,
+                minimum_correlation=key[3],
             )
             self._crypto_memory_instance = cached
             self._crypto_memory_key = key
@@ -1550,6 +1553,8 @@ class CryptoRotationStrategy(Strategy):
                     color="yellow",
                 )
         llm_purchase_score = llm_assessment.score if llm_assessment.available else None
+        llm_exposure = decision_math.llm_exposure_multiplier(llm_purchase_score)
+        report["crypto_llm_exposure_multiplier"] = f"{llm_exposure:.0%}"
         forecasts = self._update_crypto_memories(
             signals, today.isoformat(), llm_purchase_score
         )
@@ -1579,6 +1584,8 @@ class CryptoRotationStrategy(Strategy):
             signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(
                 signal, posture, llm_purchase_score
             )
+            if not decision_math.learned_edge_allows_purchase(signal):
+                continue
             eligible.append(signal)
         eligible.sort(key=lambda signal: float(signal["posture_adjusted_edge"]), reverse=True)
         report["crypto_candidates"] = len(eligible)
@@ -1658,7 +1665,7 @@ class CryptoRotationStrategy(Strategy):
 
         deployed = self._crypto_deployed_dollars(held_working, signals_by_symbol)
         report["crypto_deployed_dollars"] = f"${deployed:.2f}"
-        remaining_budget = max(0.0, crypto_allocation - deployed)
+        remaining_budget = max(0.0, crypto_allocation - deployed) * llm_exposure
         submitted = 0
         candidates_for_purchase = eligible if veto_reason is None else []
         if veto_reason is not None and (eligible or opportunity_is_eligible):

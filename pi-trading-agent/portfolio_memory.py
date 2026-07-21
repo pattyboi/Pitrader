@@ -45,10 +45,12 @@ class PortfolioMemory:
         minimum_observations: int,
         maximum_observations: int,
         next_session_predicate: Callable[[str, str], bool] = is_next_trading_session,
+        minimum_correlation: float = 0.0,
     ):
         self.database_path = database_path
         self.minimum_observations = minimum_observations
         self.maximum_observations = maximum_observations
+        self.minimum_correlation = minimum_correlation
         self._schema_initialized = False
         # Defaults to NYSE-trading-session succession (equity's behavior,
         # unchanged). CryptoRotationStrategy passes
@@ -319,6 +321,16 @@ class PortfolioMemory:
                 None,
                 None,
                 "Portfolio memory lacks enough feature variation for a trustworthy forecast.",
+            )
+            return {item.symbol: forecast for item in observations}
+        if model.correlation < self.minimum_correlation:
+            forecast = RotationForecast(
+                count,
+                False,
+                None,
+                model.correlation,
+                f"Portfolio memory fit correlation {model.correlation:+.2f} is below "
+                f"the required {self.minimum_correlation:.2f}; learned edge ignored.",
             )
             return {item.symbol: forecast for item in observations}
         forecasts: dict[str, RotationForecast] = {}

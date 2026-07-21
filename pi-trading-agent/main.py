@@ -405,6 +405,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "CRYPTO_MEMORY_ENABLED": True,
         "CRYPTO_MEMORY_MIN_OBSERVATIONS": 20,
         "CRYPTO_MEMORY_MAX_OBSERVATIONS": 500,
+        "CRYPTO_MEMORY_MIN_CORRELATION": 0.10,
         "CRYPTO_EMAIL_REPORT_ENABLED": False,
     }
     for key, default in crypto_defaults.items():
@@ -495,12 +496,15 @@ def load_config(path: Path) -> dict[str, Any]:
     _require_booleans(config, "CRYPTO_MEMORY_ENABLED", "CRYPTO_EMAIL_REPORT_ENABLED")
     crypto_memory_minimum = int(config["CRYPTO_MEMORY_MIN_OBSERVATIONS"])
     crypto_memory_maximum = int(config["CRYPTO_MEMORY_MAX_OBSERVATIONS"])
+    crypto_memory_correlation = float(config["CRYPTO_MEMORY_MIN_CORRELATION"])
     _require_range("CRYPTO_MEMORY_MIN_OBSERVATIONS", crypto_memory_minimum, 20, 500)
     _require_range(
         "CRYPTO_MEMORY_MAX_OBSERVATIONS", crypto_memory_maximum, crypto_memory_minimum, 5000
     )
+    _require_range("CRYPTO_MEMORY_MIN_CORRELATION", crypto_memory_correlation, 0, 1)
     config["CRYPTO_MEMORY_MIN_OBSERVATIONS"] = crypto_memory_minimum
     config["CRYPTO_MEMORY_MAX_OBSERVATIONS"] = crypto_memory_maximum
+    config["CRYPTO_MEMORY_MIN_CORRELATION"] = crypto_memory_correlation
 
     _require_booleans(config, "EMAIL_REPORT_ENABLED", "EMAIL_USE_TLS")
     email_port = int(config["EMAIL_SMTP_PORT"])
@@ -601,12 +605,14 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_MEMORY_ENABLED": True,
         "PORTFOLIO_MEMORY_MIN_OBSERVATIONS": 20,
         "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
+        "PORTFOLIO_MEMORY_MIN_CORRELATION": 0.10,
     }
     for key, default in portfolio_memory_defaults.items():
         config.setdefault(key, default)
     _require_booleans(config, "PORTFOLIO_MEMORY_ENABLED")
     portfolio_memory_minimum = int(config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"])
     portfolio_memory_maximum = int(config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"])
+    portfolio_memory_correlation = float(config["PORTFOLIO_MEMORY_MIN_CORRELATION"])
     _require_range("PORTFOLIO_MEMORY_MIN_OBSERVATIONS", portfolio_memory_minimum, 20, 500)
     _require_range(
         "PORTFOLIO_MEMORY_MAX_OBSERVATIONS",
@@ -614,8 +620,12 @@ def load_config(path: Path) -> dict[str, Any]:
         portfolio_memory_minimum,
         5000,
     )
+    _require_range(
+        "PORTFOLIO_MEMORY_MIN_CORRELATION", portfolio_memory_correlation, 0, 1
+    )
     config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"] = portfolio_memory_minimum
     config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"] = portfolio_memory_maximum
+    config["PORTFOLIO_MEMORY_MIN_CORRELATION"] = portfolio_memory_correlation
 
     symbol_reference_defaults = {
         "SYMBOL_REFERENCE_ENABLED": True,
@@ -797,6 +807,7 @@ def build_strategy(
             "portfolio_memory_enabled": config["PORTFOLIO_MEMORY_ENABLED"],
             "portfolio_memory_min_observations": config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"],
             "portfolio_memory_max_observations": config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"],
+            "portfolio_memory_min_correlation": config["PORTFOLIO_MEMORY_MIN_CORRELATION"],
             "portfolio_memory_database_file": str(base_dir / ".portfolio_memory.duckdb"),
             "llm_news_enabled": config["LLM_NEWS_ENABLED"],
             "llm_news_model": config["LLM_NEWS_MODEL"],

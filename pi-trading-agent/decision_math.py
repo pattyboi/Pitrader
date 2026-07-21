@@ -34,6 +34,29 @@ POSTURE_LEARNED_EDGE_WEIGHT = {"conservative": 0.25, "risky": 0.6}
 POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
 
 
+def llm_exposure_multiplier(llm_score: float | int | None) -> float:
+    """Translate a non-vetoed LLM score into a bounded new-capital fraction.
+
+    Neutral and constructive assessments leave the strategy fully deployed.
+    Adverse scores progressively reserve cash, but never create a trade or
+    override the caller's hard-veto threshold and quantitative entry gates.
+    """
+    if llm_score is None:
+        return 1.0
+    score = max(-10.0, min(10.0, float(llm_score)))
+    return max(0.25, min(1.0, 1.0 + score * 0.10))
+
+
+def learned_edge_allows_purchase(
+    signal: dict[str, float | int | str | bool | None],
+) -> bool:
+    """Let validated pooled knowledge veto a forecasted losing entry."""
+    if not signal.get("learned_edge_ready"):
+        return True
+    learned_edge = signal.get("learned_edge")
+    return learned_edge is not None and float(learned_edge) >= 0.0
+
+
 def walk_forward_net_returns(
     returns: list[float],
     round_trip_cost_percent: float,

@@ -1,0 +1,282 @@
+{
+  "version": "1.0.0",
+  "kind": "codebase",
+  "project": {
+    "name": "pi-trading-agent",
+    "languages": ["Python", "Bash"],
+    "frameworks": ["Lumibot", "Alpaca", "DuckDB", "NumPy"],
+    "description": "A Raspberry Pi trading service that rotates bounded equity and crypto portfolios into historically profitable dip opportunities, augments ranking and learned-return forecasts with local news/LLM context, and executes through Alpaca with explicit allocation, order, restart, and live-trading safeguards.",
+    "analyzedAt": "2026-07-21T19:28:36Z",
+    "gitCommitHash": "6858dbfb288a80fd0f6c973b68660988d1759782"
+  },
+  "nodes": [
+    {
+      "id": "domain:equity-portfolio-rotation",
+      "type": "domain",
+      "name": "Equity Portfolio Rotation",
+      "summary": "Builds and actively rotates a bounded portfolio of configured, held, and autonomously discovered US equities. Purchases require a current dip plus profitable in-sample and walk-forward history, while current holdings are harvested, stopped, or replaced when stronger candidates justify doing so.",
+      "tags": ["equities", "dip-buying", "portfolio-rotation"],
+      "complexity": "complex",
+      "domainMeta": {
+        "entities": ["Equity Symbol", "Portfolio Signal", "Holding", "Candidate", "Rotation"],
+        "businessRules": ["A candidate must pass price, liquidity, dip, minimum observation, expected net profit, and out-of-sample profit floors", "Ranking posture may reshape candidate ordering but does not waive raw expected-profit eligibility", "The strategy manages only configured holdings or discovered symbols whose buy has been confirmed", "The configured position ceiling is narrowed by available equity capital, minimum order size, and candidate quality"],
+        "crossDomainInteractions": ["Consumes learned edges from Return Learning and Validation", "Consumes purchase vetoes and ranking scores from News and LLM Intelligence", "Delegates every broker mutation to Execution and Runtime Safety"]
+      }
+    },
+    {
+      "id": "domain:crypto-portfolio-rotation",
+      "type": "domain",
+      "name": "Crypto Portfolio Rotation",
+      "summary": "Runs a separate crypto strategy process while the NYSE is closed and applies the same broad dip, return-validation, ranking, and lifecycle pattern to Alpaca-tradable crypto assets. It confines purchases to a crypto allocation budget and supports fractional quantities and continuous-market holding exits.",
+      "tags": ["crypto", "dip-buying", "allocation"],
+      "complexity": "complex",
+      "domainMeta": {
+        "entities": ["Crypto Symbol", "Crypto Signal", "Crypto Holding", "Allocation Budget"],
+        "businessRules": ["Crypto trading is skipped while the NYSE is open", "Entries must clear crypto-specific dip, sample, expected-profit, and out-of-sample floors", "Crypto spending cannot exceed its configured allocation or real-time cash", "Take-profit, stop-loss, and maximum holding days can independently trigger an exit"],
+        "crossDomainInteractions": ["Uses shared decision math and pooled memory", "Uses crypto-scoped news and the bounded LLM purchase assessment", "Shares account cash with equities through an explicit allocation reserve"]
+      }
+    },
+    {
+      "id": "domain:return-learning-and-validation",
+      "type": "domain",
+      "name": "Return Learning and Validation",
+      "summary": "Turns settled market observations into auditable estimates of net return, uncertainty, and opportunity quality. It combines direct historical dip returns, walk-forward validation, pooled ridge forecasts, and a separately labelled Asset A to Asset B probability forecast without allowing sparse learned estimates to replace hard historical floors.",
+      "tags": ["learning", "forecasting", "walk-forward-validation"],
+      "complexity": "complex",
+      "domainMeta": {
+        "entities": ["PortfolioMemoryInput", "RotationForecast", "OpportunityProbability", "Learned Edge", "Out-of-Sample Return"],
+        "businessRules": ["Memory records all usable daily observations but regression training is scoped to decision-specific signal days", "Expected returns are evaluated net of configured or live round-trip costs", "Pooled learned forecasts are used only after minimum samples and fit correlation are satisfied", "A validated negative learned edge blocks a new entry but cannot create an otherwise ineligible trade", "The LLM score is the sole news feature in the two-feature ridge model", "The Asset A to Asset B opportunity has separate readiness, probability, dip, and edge thresholds"],
+        "crossDomainInteractions": ["Receives observations from both equity and crypto evaluation", "Receives the signed bounded news score from News and LLM Intelligence", "Returns learned and posture-adjusted edges to portfolio construction"]
+      }
+    },
+    {
+      "id": "domain:news-and-llm-intelligence",
+      "type": "domain",
+      "name": "News and LLM Intelligence",
+      "summary": "Ingests recent Alpaca and public RSS articles, attributes and prioritizes them deterministically, and asks a local Ollama model for one structured bounded market assessment. The result influences learned forecasts and ranking, while configured severe-score and availability policies can veto new purchases; discovery-only symbols may also receive company-specific red-flag screening.",
+      "tags": ["news", "ollama", "sentiment", "risk"],
+      "complexity": "complex",
+      "domainMeta": {
+        "entities": ["NewsContext", "Article", "LLMNewsAssessment", "Symbol News Score", "Red Flag"],
+        "businessRules": ["Deterministic headline scoring preprocesses and prioritizes evidence but does not cast a separate ranking or veto vote", "The LLM assessment score is signed and bounded from -10 to +10", "When enabled, an unavailable assessment may fail closed according to configuration", "A score at or below the configured block threshold vetoes new purchases but not risk-reducing exits", "Article text is treated as untrusted evidence and model output must parse into the expected structured schema"],
+        "crossDomainInteractions": ["Supplies the same bounded purchase score to equity, crypto, and return memory", "Can stop entry flows while leaving exit and reconciliation flows operational", "Uses symbol reference validation and safe public HTTP ingestion"]
+      }
+    },
+    {
+      "id": "domain:execution-and-runtime-safety",
+      "type": "domain",
+      "name": "Execution and Runtime Safety",
+      "summary": "Constrains all broker-side actions through live-trading authorization, account-state checks, allocation budgets, minimum order floors, cash buffers, active-order de-duplication, and checked submission choke points. Multi-leg rotations are persisted and reconciled across iterations and restarts so a submitted sell cannot silently lose its replacement-buy intent.",
+      "tags": ["execution", "guardrails", "broker", "reconciliation"],
+      "complexity": "complex",
+      "domainMeta": {
+        "entities": ["Broker Order", "Pending Rotation", "Runtime State", "Cash Reserve", "Live Trading Acknowledgement"],
+        "businessRules": ["Live trading requires an independent environment acknowledgement", "Unknown or unavailable broker positions stop purchase decisions", "No symbol may be touched twice in one iteration", "An active same-side order prevents duplicate submission", "Quantity is rounded down and kept within the stated budget after a cash buffer", "Rejected orders do not advance ownership or rotation state"],
+        "crossDomainInteractions": ["Executes approved equity and crypto actions", "Preserves risk-reducing exits even when news blocks entries", "Publishes observational signal and trade-count snapshots without placing orders"]
+      }
+    },
+
+    {"id":"flow:evaluate-equity-candidates","type":"flow","name":"Evaluate Equity Candidates","summary":"Collect the bounded equity universe and turn market history, quotes, liquidity, spreads, and current dips into net-return signals.","tags":["equities","screening"],"complexity":"complex","domainMeta":{"entryPoint":"AssetRotationStrategy._run_portfolio_iteration","entryType":"cron"}},
+    {"id":"flow:construct-and-rotate-equity-portfolio","type":"flow","name":"Construct and Rotate Equity Portfolio","summary":"Choose a quality- and capital-supported target count, fill empty slots, replace weak holdings, and top up desired positions in ranked order.","tags":["equities","construction","rotation"],"complexity":"complex","domainMeta":{"entryPoint":"AssetRotationStrategy.on_trading_iteration","entryType":"cron"}},
+    {"id":"flow:exit-equity-holdings","type":"flow","name":"Exit Equity Holdings","summary":"Sell managed holdings when bid-side gains, losses, or holding duration cross configured lifecycle thresholds.","tags":["equities","exits","risk"],"complexity":"moderate","domainMeta":{"entryPoint":"AssetRotationStrategy._run_portfolio_iteration","entryType":"cron"}},
+
+    {"id":"flow:evaluate-crypto-candidates","type":"flow","name":"Evaluate Crypto Candidates","summary":"Build and evaluate the crypto universe using crypto-specific dip, spread, return, and out-of-sample thresholds.","tags":["crypto","screening"],"complexity":"complex","domainMeta":{"entryPoint":"CryptoRotationStrategy._run_crypto_iteration","entryType":"cron"}},
+    {"id":"flow:construct-crypto-portfolio","type":"flow","name":"Construct Crypto Portfolio","summary":"Rank eligible crypto opportunities and buy, replace, or top up positions within the crypto allocation ceiling.","tags":["crypto","construction","allocation"],"complexity":"complex","domainMeta":{"entryPoint":"CryptoRotationStrategy.on_trading_iteration","entryType":"cron"}},
+    {"id":"flow:exit-crypto-holdings","type":"flow","name":"Exit Crypto Holdings","summary":"Continuously manage crypto holdings with realizable-price take-profit, stop-loss, and calendar-day holding backstops.","tags":["crypto","exits","risk"],"complexity":"moderate","domainMeta":{"entryPoint":"CryptoRotationStrategy._run_crypto_iteration","entryType":"cron"}},
+
+    {"id":"flow:learn-pooled-return-edge","type":"flow","name":"Learn Pooled Return Edge","summary":"Backfill historical signal outcomes, settle daily observations, and fit a pooled two-feature forecast of next-session return.","tags":["memory","ridge-regression"],"complexity":"complex","domainMeta":{"entryPoint":"PortfolioMemory.update_many_and_forecast","entryType":"event"}},
+    {"id":"flow:validate-and-rank-profit-edge","type":"flow","name":"Validate and Rank Profit Edge","summary":"Require profitable net historical and walk-forward behavior, then blend ready learned forecasts and risk posture for ordering.","tags":["validation","ranking","profit"],"complexity":"complex","domainMeta":{"entryPoint":"AssetRotationStrategy._run_portfolio_iteration","entryType":"cron"}},
+    {"id":"flow:assess-opportunistic-asset-rotation","type":"flow","name":"Assess Opportunistic Asset Rotation","summary":"Evaluate the separately labelled Asset A to Asset B rotation from settled pair observations and submit at most one qualifying swap per day.","tags":["asset-rotation","probability","memory"],"complexity":"moderate","domainMeta":{"entryPoint":"AssetRotationStrategy._run_portfolio_iteration","entryType":"cron"}},
+
+    {"id":"flow:build-news-context","type":"flow","name":"Build News Context","summary":"Fetch, normalize, attribute, deduplicate, decay, and prioritize recent market and symbol news for downstream assessment.","tags":["news","rss","attribution"],"complexity":"complex","domainMeta":{"entryPoint":"AssetRotationStrategy._get_news_context","entryType":"cron"}},
+    {"id":"flow:obtain-llm-purchase-assessment","type":"flow","name":"Obtain LLM Purchase Assessment","summary":"Budget untrusted article evidence into a local Ollama prompt and parse a single structured, bounded purchase assessment.","tags":["ollama","assessment","structured-output"],"complexity":"complex","domainMeta":{"entryPoint":"LLMNewsAnalyzer.assess","entryType":"event"}},
+    {"id":"flow:apply-news-purchase-controls","type":"flow","name":"Apply News Purchase Controls","summary":"Feed the LLM score into learning and ranking, scale new-capital deployment on adverse non-vetoed assessments, screen discovery-only red flags, and veto new buys under configured severe-risk or availability conditions.","tags":["veto","red-flags","ranking"],"complexity":"complex","domainMeta":{"entryPoint":"AssetRotationStrategy._run_portfolio_iteration","entryType":"cron"}},
+
+    {"id":"flow:authorize-and-schedule-trading","type":"flow","name":"Authorize and Schedule Trading","summary":"Validate configuration and explicit live authority, then dispatch only the asset-class iteration allowed by the relevant market session.","tags":["authorization","sessions","configuration"],"complexity":"moderate","domainMeta":{"entryPoint":"main.py / main_crypto.py","entryType":"cli"}},
+    {"id":"flow:submit-bounded-orders","type":"flow","name":"Submit Bounded Orders","summary":"Convert an approved action into a rounded, buffered, duplicate-checked broker order and record only broker-accepted submissions.","tags":["orders","budget","safety"],"complexity":"moderate","domainMeta":{"entryPoint":"_submit_order_checked","entryType":"event"}},
+    {"id":"flow:reconcile-pending-rotations","type":"flow","name":"Reconcile Pending Rotations","summary":"Persist sell-first rotations and retry or complete their replacement buys across broker latency, later iterations, and process restarts.","tags":["reconciliation","restart-safety","rotation"],"complexity":"complex","domainMeta":{"entryPoint":"_reconcile_pending_portfolio_rotations / _reconcile_pending_crypto_rotations","entryType":"cron"}},
+
+    {"id":"step:evaluate-equity-candidates:assemble-bounded-symbol-universe","type":"step","name":"Assemble Bounded Symbol Universe","summary":"Merge configured symbols, managed holdings, and a rotating discovery batch without allowing an unbounded market scan.","tags":["universe","discovery"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2192,2221]},
+    {"id":"step:evaluate-equity-candidates:fetch-bars-price-and-quote","type":"step","name":"Fetch Bars, Price, and Quote","summary":"Obtain usable historical bars and a current quote, excluding only discovery-sourced symbols that remain unpriceable.","tags":["market-data","quotes"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1516,1681]},
+    {"id":"step:evaluate-equity-candidates:enforce-price-liquidity-and-spread-floors","type":"step","name":"Enforce Price, Liquidity, and Spread Floors","summary":"Reject candidates below configured price or dollar-volume floors and estimate round-trip cost from the larger of configured cost and live spread.","tags":["liquidity","spread","screening"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1516,1681]},
+    {"id":"step:evaluate-equity-candidates:calculate-dip-and-net-history","type":"step","name":"Calculate Dip and Net History","summary":"Compare the current price with its recent high and calculate subsequent returns for historical dips net of estimated trading cost.","tags":["dip","historical-return"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1516,1681]},
+    {"id":"step:evaluate-equity-candidates:emit-signal-statistics","type":"step","name":"Emit Signal Statistics","summary":"Return qualification, mean net profit, sample count, out-of-sample profit, dispersion, win probability, and memory backfill history.","tags":["signal","statistics"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1516,1681]},
+
+    {"id":"step:construct-and-rotate-equity-portfolio:filter-hard-eligibility","type":"step","name":"Filter Hard Eligibility","summary":"Keep only current dips that clear minimum observations, raw expected net profit, walk-forward observations and profit, plus any ready learned-edge loss veto.","tags":["eligibility","profit-floor"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2880]},
+    {"id":"step:construct-and-rotate-equity-portfolio:sort-by-posture-adjusted-edge","type":"step","name":"Sort by Posture-Adjusted Edge","summary":"Order eligible symbols by posture-adjusted edge and then dip size while retaining the hard raw-profit floor.","tags":["ranking","risk-posture"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+    {"id":"step:construct-and-rotate-equity-portfolio:derive-effective-position-count","type":"step","name":"Derive Effective Position Count","summary":"Narrow the configured position ceiling using equity capital, minimum order size, and the relative quality and volatility of candidate edges.","tags":["position-sizing","capital"],"complexity":"complex","filePath":"decision_math.py","lineRange":[138,182]},
+    {"id":"step:construct-and-rotate-equity-portfolio:build-empty-slots","type":"step","name":"Build Empty Slots","summary":"Buy desired symbols into available position slots using equal-slot portfolio budgets.","tags":["build","buy"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2262,2297]},
+    {"id":"step:construct-and-rotate-equity-portfolio:replace-weaker-holdings","type":"step","name":"Replace Weaker Holdings","summary":"Sell a held symbol only when a remaining candidate has sufficient superiority and reserve its replacement buy as a pending rotation.","tags":["replacement","rotation"],"complexity":"complex","filePath":"strategy.py","lineRange":[2299,2362]},
+    {"id":"step:construct-and-rotate-equity-portfolio:top-up-target-positions","type":"step","name":"Top Up Target Positions","summary":"Use remaining spendable equity cash to move desired positions toward their target per-position budget without exceeding action limits.","tags":["top-up","sizing"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+
+    {"id":"step:exit-equity-holdings:read-cost-basis-and-realizable-price","type":"step","name":"Read Cost Basis and Realizable Price","summary":"Use broker entry prices and bid-side realizable sale prices for each strategy-managed holding.","tags":["cost-basis","bid-price"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1482,1514]},
+    {"id":"step:exit-equity-holdings:apply-profit-and-loss-thresholds","type":"step","name":"Apply Profit and Loss Thresholds","summary":"Mark holdings for sale when their realizable return reaches configured take-profit or stop-loss percentages.","tags":["take-profit","stop-loss"],"complexity":"simple","filePath":"strategy.py","lineRange":[1482,1514]},
+    {"id":"step:exit-equity-holdings:apply-trading-session-backstop","type":"step","name":"Apply Trading-Session Backstop","summary":"Exit positions that remain open past the configured maximum number of equity trading sessions.","tags":["holding-horizon","backstop"],"complexity":"simple","filePath":"strategy.py","lineRange":[1482,1514]},
+    {"id":"step:exit-equity-holdings:submit-unvetoed-sells","type":"step","name":"Submit Unvetoed Sells","summary":"Submit each due single-leg exit independently; purchase news vetoes never prevent these risk-reducing sales.","tags":["sell","risk-reduction"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2390,2441]},
+
+    {"id":"step:evaluate-crypto-candidates:skip-while-nyse-open","type":"step","name":"Skip While NYSE Is Open","summary":"Keep the separate crypto service idle during the equity session so the two strategies do not compete for shared account cash concurrently.","tags":["session","coordination"],"complexity":"simple","filePath":"crypto_strategy.py","lineRange":[1687,1717]},
+    {"id":"step:evaluate-crypto-candidates:assemble-crypto-universe","type":"step","name":"Assemble Crypto Universe","summary":"Merge configured crypto assets, confirmed managed assets, holdings, and bounded discovery candidates.","tags":["crypto","universe"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1077,1100]},
+    {"id":"step:evaluate-crypto-candidates:measure-dip-and-spread","type":"step","name":"Measure Dip and Spread","summary":"Calculate the current drawdown from the recent high and estimate round-trip cost using Alpaca bid/ask spread when available.","tags":["dip","spread"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[645,752]},
+    {"id":"step:evaluate-crypto-candidates:calculate-net-and-walk-forward-returns","type":"step","name":"Calculate Net and Walk-Forward Returns","summary":"Measure historical dip outcomes net of trading cost and produce walk-forward returns using only prior observations at each validation point.","tags":["net-return","out-of-sample"],"complexity":"complex","filePath":"crypto_strategy.py","lineRange":[645,752]},
+    {"id":"step:evaluate-crypto-candidates:emit-crypto-signal","type":"step","name":"Emit Crypto Signal","summary":"Expose qualification, profit, samples, OOS performance, uncertainty, win probability, and backfill observations for later gates.","tags":["crypto-signal","statistics"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[645,752]},
+
+    {"id":"step:construct-crypto-portfolio:apply-crypto-eligibility-floors","type":"step","name":"Apply Crypto Eligibility Floors","summary":"Require a qualifying dip plus configured in-sample and out-of-sample sample and profit thresholds.","tags":["eligibility","profit-floor"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1422,1685]},
+    {"id":"step:construct-crypto-portfolio:rank-eligible-crypto","type":"step","name":"Rank Eligible Crypto","summary":"Sort qualifying assets by posture-adjusted edge and dip while preserving raw historical-profit eligibility.","tags":["ranking","crypto"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1422,1685]},
+    {"id":"step:construct-crypto-portfolio:compute-allocation-budget","type":"step","name":"Compute Allocation Budget","summary":"Derive the strategy's spendable share of account value, cap total crypto exposure, and scale only new capital when the non-vetoed LLM score is adverse.","tags":["allocation","capital"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1422,1692]},
+    {"id":"step:construct-crypto-portfolio:select-target-count-and-rotations","type":"step","name":"Select Target Count and Rotations","summary":"Choose an effective number of positions, fill empty capacity, and replace materially weaker crypto holdings.","tags":["position-count","rotation"],"complexity":"complex","filePath":"crypto_strategy.py","lineRange":[1422,1685]},
+    {"id":"step:construct-crypto-portfolio:buy-fractional-quantity","type":"step","name":"Buy Fractional Quantity","summary":"Round the buffered dollar budget down to eight decimal places and submit a GTC market order without exceeding allocation or cash.","tags":["fractional-order","buy"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1385,1418]},
+
+    {"id":"step:exit-crypto-holdings:calculate-realizable-return","type":"step","name":"Calculate Realizable Return","summary":"Compare each broker cost basis with a current realizable crypto sale price.","tags":["return","bid-price"],"complexity":"simple","filePath":"crypto_strategy.py","lineRange":[615,641]},
+    {"id":"step:exit-crypto-holdings:take-profit","type":"step","name":"Take Profit","summary":"Mark a crypto holding for exit when realizable appreciation meets the configured take-profit percentage.","tags":["take-profit","crypto"],"complexity":"simple","filePath":"crypto_strategy.py","lineRange":[615,641]},
+    {"id":"step:exit-crypto-holdings:stop-loss","type":"step","name":"Stop Loss","summary":"Mark a crypto holding for exit when realizable loss reaches the configured stop-loss percentage.","tags":["stop-loss","crypto"],"complexity":"simple","filePath":"crypto_strategy.py","lineRange":[615,641]},
+    {"id":"step:exit-crypto-holdings:enforce-calendar-day-backstop","type":"step","name":"Enforce Calendar-Day Backstop","summary":"Exit positions held through the configured maximum calendar-day horizon even when profit and loss thresholds were not reached.","tags":["holding-horizon","backstop"],"complexity":"simple","filePath":"crypto_strategy.py","lineRange":[615,641]},
+
+    {"id":"step:learn-pooled-return-edge:backfill-historical-signals","type":"step","name":"Backfill Historical Signals","summary":"Insert prior qualifying dip observations for newly seen symbols into pooled memory without duplicating settled dates.","tags":["backfill","history"],"complexity":"moderate","filePath":"portfolio_memory.py","lineRange":[168,202]},
+    {"id":"step:learn-pooled-return-edge:settle-prior-observations","type":"step","name":"Settle Prior Observations","summary":"Attach next-session realized returns to earlier signal observations once their outcome session is available.","tags":["settlement","realized-return"],"complexity":"moderate","filePath":"portfolio_memory.py","lineRange":[99,157]},
+    {"id":"step:learn-pooled-return-edge:record-daily-symbol-inputs","type":"step","name":"Record Daily Symbol Inputs","summary":"Persist dip, signal presence, and the available LLM opinion score for every usable watched or held symbol.","tags":["observation","llm-feature"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1098,1138]},
+    {"id":"step:learn-pooled-return-edge:fit-two-feature-ridge-model","type":"step","name":"Fit Two-Feature Ridge Model","summary":"Fit pooled next-session return on dip size and LLM opinion with regularization and readiness checks.","tags":["ridge-regression","forecast"],"complexity":"complex","filePath":"portfolio_memory.py","lineRange":[99,157]},
+    {"id":"step:learn-pooled-return-edge:subtract-current-trading-cost","type":"step","name":"Subtract Current Trading Cost","summary":"Convert a ready predicted gross return into learned edge by subtracting the candidate's current round-trip cost.","tags":["learned-edge","cost"],"complexity":"simple","filePath":"strategy.py","lineRange":[2501,2861]},
+
+    {"id":"step:validate-and-rank-profit-edge:calculate-walk-forward-outcomes","type":"step","name":"Calculate Walk-Forward Outcomes","summary":"For each historical signal, admit it only when the preceding training window would itself have met readiness and profitability requirements.","tags":["walk-forward","validation"],"complexity":"complex","filePath":"decision_math.py","lineRange":[37,60]},
+    {"id":"step:validate-and-rank-profit-edge:require-net-positive-history","type":"step","name":"Require Net-Positive History","summary":"Gate current candidates on minimum sample count and mean historical return after round-trip costs.","tags":["profit-floor","samples"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+    {"id":"step:validate-and-rank-profit-edge:require-oos-evidence","type":"step","name":"Require OOS Evidence","summary":"Require sufficient walk-forward outcomes and a configured minimum out-of-sample net profit before entry.","tags":["oos","guardrail"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+    {"id":"step:validate-and-rank-profit-edge:blend-ready-learned-edge","type":"step","name":"Blend Ready Learned Edge","summary":"Use learned edge only after pooled memory clears its sample and correlation floors; otherwise retain auditable historical expected profit for ranking context.","tags":["blend","readiness"],"complexity":"moderate","filePath":"decision_math.py","lineRange":[131,158]},
+    {"id":"step:validate-and-rank-profit-edge:adjust-ordering-for-risk-posture","type":"step","name":"Adjust Ordering for Risk Posture","summary":"Use uncertainty, win probability, and bounded LLM opinion to reshape candidate ordering under the configured conservative or risky posture.","tags":["risk-posture","ranking"],"complexity":"moderate","filePath":"decision_math.py","lineRange":[108,135]},
+
+    {"id":"step:assess-opportunistic-asset-rotation:settle-pair-observations","type":"step","name":"Settle Pair Observations","summary":"Update durable Asset A versus Asset B observations with realized next-session outcomes.","tags":["pair-memory","settlement"],"complexity":"moderate","filePath":"trade_memory.py","lineRange":[56,93]},
+    {"id":"step:assess-opportunistic-asset-rotation:forecast-edge-and-probability","type":"step","name":"Forecast Edge and Probability","summary":"Estimate the rotation's predicted return edge and historical opportunity probability when memory is ready.","tags":["forecast","probability"],"complexity":"complex","filePath":"trade_memory.py","lineRange":[56,93]},
+    {"id":"step:assess-opportunistic-asset-rotation:apply-separate-thresholds","type":"step","name":"Apply Separate Thresholds","summary":"Require source ownership, target absence, dip, forecast readiness, minimum probability, minimum edge, and the one-swap-per-day flag.","tags":["eligibility","one-per-day"],"complexity":"complex","filePath":"strategy.py","lineRange":[2501,2861]},
+    {"id":"step:assess-opportunistic-asset-rotation:persist-sell-first-swap","type":"step","name":"Persist Sell-First Swap","summary":"Submit the source sale, reserve both legs, and persist the daily completion flag plus replacement intent.","tags":["rotation","persistence"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+
+    {"id":"step:build-news-context:fetch-recent-articles","type":"step","name":"Fetch Recent Articles","summary":"Collect recent Alpaca and free RSS articles under bounded network time and size limits.","tags":["alpaca-news","rss"],"complexity":"moderate","filePath":"strategy.py","lineRange":[806,843]},
+    {"id":"step:build-news-context:normalize-and-deduplicate","type":"step","name":"Normalize and Deduplicate","summary":"Normalize article shape and damp repeated phrases or duplicate coverage so one story does not gain votes by repetition.","tags":["deduplication","normalization"],"complexity":"moderate","filePath":"news_context.py","lineRange":[155,241]},
+    {"id":"step:build-news-context:attribute-symbol-evidence","type":"step","name":"Attribute Symbol Evidence","summary":"Assign article evidence only to validated tagged symbols and decay older evidence toward the configured floor.","tags":["attribution","recency"],"complexity":"complex","filePath":"strategy.py","lineRange":[1732,1777]},
+    {"id":"step:build-news-context:prioritize-risk-relevant-context","type":"step","name":"Prioritize Risk-Relevant Context","summary":"Use deterministic scores to prioritize the most relevant market and symbol evidence for the LLM without treating that score as an independent trade vote.","tags":["prioritization","preprocessing"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[219,247]},
+
+    {"id":"step:obtain-llm-purchase-assessment:format-market-and-symbol-context","type":"step","name":"Format Market and Symbol Context","summary":"Present the model with bounded market articles plus explicit watched and held symbol context.","tags":["prompt","context"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[203,287]},
+    {"id":"step:obtain-llm-purchase-assessment:enforce-token-budget","type":"step","name":"Enforce Token Budget","summary":"Estimate prompt tokens and trim prioritized evidence to the configured local-model context budget.","tags":["tokens","rpi"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[445,490]},
+    {"id":"step:obtain-llm-purchase-assessment:call-local-ollama","type":"step","name":"Call Local Ollama","summary":"Send the assessment request only to the configured local Ollama OpenAI-compatible endpoint with bounded timeout and output length.","tags":["ollama","local-inference"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[314,346]},
+    {"id":"step:obtain-llm-purchase-assessment:parse-structured-assessment","type":"step","name":"Parse Structured Assessment","summary":"Require parseable structured output and clamp the signed score to the supported -10 through +10 range.","tags":["json","validation"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[415,443]},
+    {"id":"step:obtain-llm-purchase-assessment:map-score-to-risk-level","type":"step","name":"Map Score to Risk Level","summary":"Translate the bounded score into the named risk posture included in reports and purchase controls.","tags":["risk-level","score"],"complexity":"simple","filePath":"llm_news.py","lineRange":[401,412]},
+
+    {"id":"step:apply-news-purchase-controls:screen-discovery-red-flags","type":"step","name":"Screen Discovery Red Flags","summary":"Ask for severe company-specific red flags only on discovery-sourced candidates, with advisory or exclusion behavior controlled by configuration.","tags":["discovery","red-flag"],"complexity":"moderate","filePath":"llm_news.py","lineRange":[382,398]},
+    {"id":"step:apply-news-purchase-controls:derive-purchase-veto","type":"step","name":"Derive Purchase Veto","summary":"When LLM news is enabled, block new purchases for an unavailable fail-closed assessment or a score at or below the configured severe threshold.","tags":["veto","fail-closed"],"complexity":"simple","filePath":"llm_news.py","lineRange":[88,103]},
+    {"id":"step:apply-news-purchase-controls:feed-score-to-memory","type":"step","name":"Feed Score to Memory and Exposure","summary":"Use the signed LLM score as the only news feature in memory and progressively reserve new capital for adverse scores above the hard veto threshold.","tags":["memory-feature","llm-score","exposure"],"complexity":"moderate","filePath":"decision_math.py","lineRange":[38,58]},
+    {"id":"step:apply-news-purchase-controls:preserve-exits-and-reconciliation","type":"step","name":"Preserve Exits and Reconciliation","summary":"Apply the veto only to new opportunity execution; due exits and completion of already-pending rotations continue for risk containment.","tags":["risk-reduction","reconciliation"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+
+    {"id":"step:authorize-and-schedule-trading:validate-configured-guardrails","type":"step","name":"Validate Configured Guardrails","summary":"Load and validate thresholds, allocation limits, credentials, asset-class controls, and incompatible configuration combinations before starting.","tags":["configuration","validation"],"complexity":"complex","filePath":"main.py","lineRange":[191,659]},
+    {"id":"step:authorize-and-schedule-trading:require-live-acknowledgement","type":"step","name":"Require Live Acknowledgement","summary":"Refuse live broker mode unless an independent environment variable explicitly acknowledges live trading risk.","tags":["live-trading","authorization"],"complexity":"simple","filePath":"main.py","lineRange":[42,50]},
+    {"id":"step:authorize-and-schedule-trading:dispatch-session-appropriate-iteration","type":"step","name":"Dispatch Session-Appropriate Iteration","summary":"Run scheduled equity windows during their intended session and allow the separate crypto process only while the NYSE is closed.","tags":["market-session","scheduler"],"complexity":"moderate","filePath":"crypto_strategy.py","lineRange":[1687,1717]},
+
+    {"id":"step:submit-bounded-orders:stop-on-unavailable-account-state","type":"step","name":"Stop on Unavailable Account State","summary":"Abort a decision cycle when broker positions or other required account state cannot be read reliably.","tags":["account-state","fail-safe"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2501,2861]},
+    {"id":"step:submit-bounded-orders:reserve-cross-strategy-capital","type":"step","name":"Reserve Cross-Strategy Capital","summary":"Keep the crypto allocation untouchable by equity buys and cap crypto buys to their own share of account value.","tags":["reserve","allocation"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1344,1375]},
+    {"id":"step:submit-bounded-orders:reject-duplicate-active-orders","type":"step","name":"Reject Duplicate Active Orders","summary":"Fetch active orders once per iteration and refuse another same-side order for a symbol already working at the broker.","tags":["deduplication","active-order"],"complexity":"moderate","filePath":"strategy.py","lineRange":[528,547]},
+    {"id":"step:submit-bounded-orders:buffer-round-and-floor-quantity","type":"step","name":"Buffer, Round, and Floor Quantity","summary":"Limit spend to budget and cash, retain a cash buffer, enforce the minimum dollar order, and round quantity down to the asset precision.","tags":["cash-buffer","quantity"],"complexity":"moderate","filePath":"strategy.py","lineRange":[1344,1375]},
+    {"id":"step:submit-bounded-orders:accept-only-checked-submission","type":"step","name":"Accept Only Checked Submission","summary":"Advance business state and observational trade counts only after the broker accepts the order through the common checked-submission choke point.","tags":["broker","submission"],"complexity":"moderate","filePath":"strategy.py","lineRange":[556,584]},
+
+    {"id":"step:reconcile-pending-rotations:persist-replacement-intent","type":"step","name":"Persist Replacement Intent","summary":"Record the source, target, budget, and rotation kind before or alongside the sell-first transition so intent survives restart.","tags":["persistence","intent"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2443,2499]},
+    {"id":"step:reconcile-pending-rotations:reserve-claimed-symbols","type":"step","name":"Reserve Claimed Symbols","summary":"Claim both legs of every surviving rotation so later phases cannot touch either symbol twice in the same iteration.","tags":["idempotency","claims"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2443,2499]},
+    {"id":"step:reconcile-pending-rotations:wait-for-source-sale","type":"step","name":"Wait for Source Sale","summary":"Delay the target purchase while the source remains held or its sell order remains active at the broker.","tags":["sell-first","broker-latency"],"complexity":"moderate","filePath":"strategy.py","lineRange":[2443,2499]},
+    {"id":"step:reconcile-pending-rotations:retry-and-clear-target-buy","type":"step","name":"Retry and Clear Target Buy","summary":"Retry the budgeted target purchase after the sale settles, retaining pending state on rejection and clearing it only when completion is accepted or no longer actionable.","tags":["retry","completion"],"complexity":"complex","filePath":"strategy.py","lineRange":[2443,2499]}
+  ],
+  "edges": [
+    {"source":"domain:equity-portfolio-rotation","target":"flow:evaluate-equity-candidates","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:equity-portfolio-rotation","target":"flow:construct-and-rotate-equity-portfolio","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:equity-portfolio-rotation","target":"flow:exit-equity-holdings","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:crypto-portfolio-rotation","target":"flow:evaluate-crypto-candidates","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:crypto-portfolio-rotation","target":"flow:construct-crypto-portfolio","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:crypto-portfolio-rotation","target":"flow:exit-crypto-holdings","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:return-learning-and-validation","target":"flow:learn-pooled-return-edge","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:return-learning-and-validation","target":"flow:validate-and-rank-profit-edge","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:return-learning-and-validation","target":"flow:assess-opportunistic-asset-rotation","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:news-and-llm-intelligence","target":"flow:build-news-context","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:news-and-llm-intelligence","target":"flow:obtain-llm-purchase-assessment","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:news-and-llm-intelligence","target":"flow:apply-news-purchase-controls","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:execution-and-runtime-safety","target":"flow:authorize-and-schedule-trading","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:execution-and-runtime-safety","target":"flow:submit-bounded-orders","type":"contains_flow","direction":"forward","weight":1.0},
+    {"source":"domain:execution-and-runtime-safety","target":"flow:reconcile-pending-rotations","type":"contains_flow","direction":"forward","weight":1.0},
+
+    {"source":"flow:evaluate-equity-candidates","target":"step:evaluate-equity-candidates:assemble-bounded-symbol-universe","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:evaluate-equity-candidates","target":"step:evaluate-equity-candidates:fetch-bars-price-and-quote","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:evaluate-equity-candidates","target":"step:evaluate-equity-candidates:enforce-price-liquidity-and-spread-floors","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:evaluate-equity-candidates","target":"step:evaluate-equity-candidates:calculate-dip-and-net-history","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:evaluate-equity-candidates","target":"step:evaluate-equity-candidates:emit-signal-statistics","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:filter-hard-eligibility","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:sort-by-posture-adjusted-edge","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:derive-effective-position-count","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:build-empty-slots","type":"flow_step","direction":"forward","weight":0.7},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:replace-weaker-holdings","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:construct-and-rotate-equity-portfolio","target":"step:construct-and-rotate-equity-portfolio:top-up-target-positions","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:exit-equity-holdings","target":"step:exit-equity-holdings:read-cost-basis-and-realizable-price","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:exit-equity-holdings","target":"step:exit-equity-holdings:apply-profit-and-loss-thresholds","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:exit-equity-holdings","target":"step:exit-equity-holdings:apply-trading-session-backstop","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:exit-equity-holdings","target":"step:exit-equity-holdings:submit-unvetoed-sells","type":"flow_step","direction":"forward","weight":1.0},
+
+    {"source":"flow:evaluate-crypto-candidates","target":"step:evaluate-crypto-candidates:skip-while-nyse-open","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:evaluate-crypto-candidates","target":"step:evaluate-crypto-candidates:assemble-crypto-universe","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:evaluate-crypto-candidates","target":"step:evaluate-crypto-candidates:measure-dip-and-spread","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:evaluate-crypto-candidates","target":"step:evaluate-crypto-candidates:calculate-net-and-walk-forward-returns","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:evaluate-crypto-candidates","target":"step:evaluate-crypto-candidates:emit-crypto-signal","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:construct-crypto-portfolio","target":"step:construct-crypto-portfolio:apply-crypto-eligibility-floors","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:construct-crypto-portfolio","target":"step:construct-crypto-portfolio:rank-eligible-crypto","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:construct-crypto-portfolio","target":"step:construct-crypto-portfolio:compute-allocation-budget","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:construct-crypto-portfolio","target":"step:construct-crypto-portfolio:select-target-count-and-rotations","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:construct-crypto-portfolio","target":"step:construct-crypto-portfolio:buy-fractional-quantity","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:exit-crypto-holdings","target":"step:exit-crypto-holdings:calculate-realizable-return","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:exit-crypto-holdings","target":"step:exit-crypto-holdings:take-profit","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:exit-crypto-holdings","target":"step:exit-crypto-holdings:stop-loss","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:exit-crypto-holdings","target":"step:exit-crypto-holdings:enforce-calendar-day-backstop","type":"flow_step","direction":"forward","weight":1.0},
+
+    {"source":"flow:learn-pooled-return-edge","target":"step:learn-pooled-return-edge:backfill-historical-signals","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:learn-pooled-return-edge","target":"step:learn-pooled-return-edge:settle-prior-observations","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:learn-pooled-return-edge","target":"step:learn-pooled-return-edge:record-daily-symbol-inputs","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:learn-pooled-return-edge","target":"step:learn-pooled-return-edge:fit-two-feature-ridge-model","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:learn-pooled-return-edge","target":"step:learn-pooled-return-edge:subtract-current-trading-cost","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:validate-and-rank-profit-edge","target":"step:validate-and-rank-profit-edge:calculate-walk-forward-outcomes","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:validate-and-rank-profit-edge","target":"step:validate-and-rank-profit-edge:require-net-positive-history","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:validate-and-rank-profit-edge","target":"step:validate-and-rank-profit-edge:require-oos-evidence","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:validate-and-rank-profit-edge","target":"step:validate-and-rank-profit-edge:blend-ready-learned-edge","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:validate-and-rank-profit-edge","target":"step:validate-and-rank-profit-edge:adjust-ordering-for-risk-posture","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:assess-opportunistic-asset-rotation","target":"step:assess-opportunistic-asset-rotation:settle-pair-observations","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:assess-opportunistic-asset-rotation","target":"step:assess-opportunistic-asset-rotation:forecast-edge-and-probability","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:assess-opportunistic-asset-rotation","target":"step:assess-opportunistic-asset-rotation:apply-separate-thresholds","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:assess-opportunistic-asset-rotation","target":"step:assess-opportunistic-asset-rotation:persist-sell-first-swap","type":"flow_step","direction":"forward","weight":1.0},
+
+    {"source":"flow:build-news-context","target":"step:build-news-context:fetch-recent-articles","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:build-news-context","target":"step:build-news-context:normalize-and-deduplicate","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:build-news-context","target":"step:build-news-context:attribute-symbol-evidence","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:build-news-context","target":"step:build-news-context:prioritize-risk-relevant-context","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:obtain-llm-purchase-assessment","target":"step:obtain-llm-purchase-assessment:format-market-and-symbol-context","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:obtain-llm-purchase-assessment","target":"step:obtain-llm-purchase-assessment:enforce-token-budget","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:obtain-llm-purchase-assessment","target":"step:obtain-llm-purchase-assessment:call-local-ollama","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:obtain-llm-purchase-assessment","target":"step:obtain-llm-purchase-assessment:parse-structured-assessment","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:obtain-llm-purchase-assessment","target":"step:obtain-llm-purchase-assessment:map-score-to-risk-level","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:apply-news-purchase-controls","target":"step:apply-news-purchase-controls:screen-discovery-red-flags","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:apply-news-purchase-controls","target":"step:apply-news-purchase-controls:derive-purchase-veto","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:apply-news-purchase-controls","target":"step:apply-news-purchase-controls:feed-score-to-memory","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:apply-news-purchase-controls","target":"step:apply-news-purchase-controls:preserve-exits-and-reconciliation","type":"flow_step","direction":"forward","weight":1.0},
+
+    {"source":"flow:authorize-and-schedule-trading","target":"step:authorize-and-schedule-trading:validate-configured-guardrails","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:authorize-and-schedule-trading","target":"step:authorize-and-schedule-trading:require-live-acknowledgement","type":"flow_step","direction":"forward","weight":0.7},
+    {"source":"flow:authorize-and-schedule-trading","target":"step:authorize-and-schedule-trading:dispatch-session-appropriate-iteration","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:submit-bounded-orders","target":"step:submit-bounded-orders:stop-on-unavailable-account-state","type":"flow_step","direction":"forward","weight":0.2},
+    {"source":"flow:submit-bounded-orders","target":"step:submit-bounded-orders:reserve-cross-strategy-capital","type":"flow_step","direction":"forward","weight":0.4},
+    {"source":"flow:submit-bounded-orders","target":"step:submit-bounded-orders:reject-duplicate-active-orders","type":"flow_step","direction":"forward","weight":0.6},
+    {"source":"flow:submit-bounded-orders","target":"step:submit-bounded-orders:buffer-round-and-floor-quantity","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:submit-bounded-orders","target":"step:submit-bounded-orders:accept-only-checked-submission","type":"flow_step","direction":"forward","weight":1.0},
+    {"source":"flow:reconcile-pending-rotations","target":"step:reconcile-pending-rotations:persist-replacement-intent","type":"flow_step","direction":"forward","weight":0.3},
+    {"source":"flow:reconcile-pending-rotations","target":"step:reconcile-pending-rotations:reserve-claimed-symbols","type":"flow_step","direction":"forward","weight":0.5},
+    {"source":"flow:reconcile-pending-rotations","target":"step:reconcile-pending-rotations:wait-for-source-sale","type":"flow_step","direction":"forward","weight":0.8},
+    {"source":"flow:reconcile-pending-rotations","target":"step:reconcile-pending-rotations:retry-and-clear-target-buy","type":"flow_step","direction":"forward","weight":1.0},
+
+    {"source":"domain:equity-portfolio-rotation","target":"domain:return-learning-and-validation","type":"cross_domain","direction":"forward","description":"Equity observations train pooled forecasts and learned edges return to candidate ranking.","weight":0.6},
+    {"source":"domain:crypto-portfolio-rotation","target":"domain:return-learning-and-validation","type":"cross_domain","direction":"forward","description":"Crypto reuses the same decision math and its own pooled-memory updates for learned ranking.","weight":0.6},
+    {"source":"domain:news-and-llm-intelligence","target":"domain:return-learning-and-validation","type":"cross_domain","direction":"forward","description":"The signed bounded LLM assessment is the regression model's only news feature.","weight":0.6},
+    {"source":"domain:news-and-llm-intelligence","target":"domain:equity-portfolio-rotation","type":"cross_domain","direction":"forward","description":"News score reshapes equity ordering and can veto new purchases at severe downside thresholds.","weight":0.6},
+    {"source":"domain:news-and-llm-intelligence","target":"domain:crypto-portfolio-rotation","type":"cross_domain","direction":"forward","description":"Crypto consumes symbol news and the bounded purchase assessment under the same entry-only veto semantics.","weight":0.6},
+    {"source":"domain:equity-portfolio-rotation","target":"domain:execution-and-runtime-safety","type":"cross_domain","direction":"forward","description":"Approved equity builds, replacements, top-ups, and exits pass through bounded checked order submission.","weight":0.6},
+    {"source":"domain:crypto-portfolio-rotation","target":"domain:execution-and-runtime-safety","type":"cross_domain","direction":"forward","description":"Crypto actions are confined to their allocation and reconciled through the same safety pattern in a separate process.","weight":0.6}
+  ],
+  "layers": [],
+  "tour": []
+}
