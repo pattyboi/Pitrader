@@ -2,7 +2,7 @@
 
 This is the short version, with no jargon, for anyone who doesn't want to
 read the full [README](README.md) or the technical
-[decision pipeline doc](../.claude/docs/decision-pipeline.md). If you just
+[decision pipeline doc](.claude/docs/decision-pipeline.md). If you just
 want to understand what the robot is doing and why, start here.
 
 ## The one-sentence version
@@ -14,9 +14,10 @@ news first so it doesn't buy into a crisis.
 
 ## How often does it actually do anything?
 
-Twice a trading day: once when the market opens, and once again a few hours
-later. The rest of the time it's just watching — it does not trade every
-few minutes, and it does not trade every day if nothing looks good.
+The equity service evaluates twice a trading day: once when the market opens,
+and once again a few hours later. The optional crypto service checks every 15
+minutes but only acts while the stock market is closed. Neither service trades
+just because its timer fired; if nothing qualifies, it does nothing.
 
 ## What it looks for, step by step
 
@@ -34,7 +35,9 @@ few minutes, and it does not trade every day if nothing looks good.
    after accounting for trading costs, it passes.
 4. **Rank the candidates.** If more than one stock looks like a good buy, it
    ranks them and picks the strongest one(s), given how much cash is
-   available and how many "slots" it's allowed to hold at once.
+   available and how many "slots" it's allowed to hold at once. By default it
+   fills every fundable slot with candidates that passed all guards; an
+   optional narrower variance-aware sizing mode is also available.
 5. **Buy.** If a slot is open (or a current holding looks clearly weaker
    than a new candidate), it buys.
 6. **Watch what it's holding.** Every round, it re-checks everything it
@@ -76,10 +79,10 @@ not the buying rules themselves.
   enough of a track record behind the decision. No track record, no trade.
 - **It never forgets a position.** Anything it buys stays on its radar
   every single round until it's sold — it can't "lose track" of a holding.
-- **If something breaks — the internet, the news source, a data
-  feed — it just skips that check and carries on as safely as it can,
-  rather than crashing or freezing.** A crash mid-trading-day is worse than
-  a cautious skip.
+- **If something breaks — the internet, news source, model, or a data feed —
+  it contains the failure instead of crashing.** Protective exits continue.
+  New entries are blocked when the enabled LLM is unavailable under the
+  shipped fail-closed setting; other unavailable advisory inputs fail open.
 - **It writes home once a day.** If you've turned on email reports, you get
   a plain-English summary of what it looked at and what (if anything) it did.
 

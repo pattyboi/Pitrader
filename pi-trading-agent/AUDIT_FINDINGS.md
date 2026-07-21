@@ -5,6 +5,7 @@
 - **Observed:** 2026-07-19 11:17 EDT
 - **Classification:** Expected safety behavior; no runtime or broker fault
 - **Status:** Open as an operational finding
+- **Last verified against code:** 2026-07-21
 
 The crypto service was running, connected to Alpaca paper trading, and completing
 its scheduled 15-minute evaluations. It did not submit purchase orders because
@@ -27,6 +28,11 @@ The eligibility pipeline checks the raw expected-profit floor before applying
 risk-posture ranking. Consequently, `CRYPTO_RISK_POSTURE="risky"` cannot promote
 a negative-expectancy signal into the candidate list. The buy method is never
 called when that list is empty, so there are no broker rejection messages.
+
+`CRYPTO_FILL_QUALIFIED_SLOTS=true` does not change that conclusion. It fills
+more fundable slots only *after* candidates pass the dip, observation,
+expected-profit, out-of-sample, learned-edge, and news guards; it cannot turn
+one of the negative-expectancy rows above into an eligible purchase.
 
 ### Assessment
 

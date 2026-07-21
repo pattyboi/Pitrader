@@ -1,7 +1,8 @@
 # Raspberry Pi Trading Agent
 
-This project runs a small Lumibot strategy against an Alpaca account. It runs
-**portfolio mode**: it watches a small list of symbols for a configured
+This project runs two small, independent Lumibot strategies against one Alpaca
+account: an equity portfolio service and an optional crypto service. Portfolio
+mode watches a small list of symbols for a configured
 percentage dip from their recent high and, when a comparable historical dip
 has reliably paid off, rotates cash into the best-qualifying one. It also
 runs a labelled Asset A → Asset B "Opportunistic Opportunity" check
@@ -56,7 +57,7 @@ understand the risks.
 For the full phase-by-phase decision pipeline as a diagram — every step from
 the 10-minute poll through news/LLM screening, the market veto, each trade
 phase, and the daily email — see
-[`.claude/docs/decision-pipeline.md`](../.claude/docs/decision-pipeline.md).
+[`.claude/docs/decision-pipeline.md`](.claude/docs/decision-pipeline.md).
 
 ### How often the agent checks in
 
@@ -218,7 +219,8 @@ pi-trading-agent/
 ├── config.example.json Placeholder template copied to config.json
 ├── config.json         Credentials, symbols, and strategy settings
 ├── requirements.txt    Python package requirements
-├── main.py             Configuration validation and application startup
+├── main.py             Equity configuration validation and application startup
+├── config_support.py   Shared config-to-strategy parameter/path mapping helpers
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
 ├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
 ├── runtime_state.py    Transactional DuckDB store for restart-critical process state
@@ -234,10 +236,14 @@ pi-trading-agent/
 ├── signal_snapshot.py  Writes the per-symbol opinion snapshot the browser dashboard reads
 ├── trade_counter.py    Writes the same-day trade count the browser dashboard reads
 ├── strategy.py         Daily dip and rotation logic
+├── strategy_support.py Shared broker/runtime, iteration-context, and memory helpers
 ├── decision_math.py     Shared position-sizing/ranking math (equity and crypto)
 ├── email_render.py      Shared HTML email-report rendering (equity and crypto)
 ├── main_crypto.py       Crypto strategy startup (separate process/service, see "Crypto trading mode")
 ├── crypto_strategy.py   Crypto dip-buying and rotation logic, active only while NYSE is closed
+├── .claude/docs/
+│   ├── architecture.md      Technical module/process boundaries
+│   └── decision-pipeline.md Exact equity/crypto decision phase ordering
 ├── scripts/
 │   ├── web_dashboard.py     Read-only browser dashboard (own systemd service, see below)
 │   ├── nightly_preeval.py   03:00 ET cache warm-up for the LLM article-verdict check
@@ -325,7 +331,9 @@ Open the configuration file with a terminal editor:
 nano config.json
 ```
 
-The initial file is:
+The template is the source of truth for every supported setting. The following
+excerpt highlights credentials and the optional news/LLM controls; do not
+replace `config.example.json` with this abbreviated excerpt:
 
 ```json
 {
@@ -779,8 +787,8 @@ trusts Alpaca's raw article tags unfiltered — exactly today's behavior.
 
 ### LLM news assessment
 
-In addition to the fixed keyword rules, the equity service sends the same
-Alpaca headlines to a language model before each trading window (up to twice
+In addition to the fixed keyword rules, the equity service sends its assembled
+recent headline set to a language model before each trading window (up to twice
 a trading day), and the crypto service sends symbol-filtered crypto headlines
 on its cached refresh cadence. Unlike the keyword
 scorer, the model reads the articles with genuine language
@@ -797,9 +805,11 @@ assessment is unavailable; protective exits remain independent.
 
 #### Local only — no outside service
 
-This assessment runs entirely on the Pi through [Ollama](https://ollama.com),
-a local model server. Headlines never leave the device and there is no API
-key, no rate limit, and no dependency on an outside provider staying up.
+By default this assessment runs entirely on the Pi through
+[Ollama](https://ollama.com), bound to loopback. In that configuration,
+headlines never leave the device and there is no model API key, hosted-model
+rate limit, or outside inference provider. If `LLM_NEWS_BASE_URL` is changed to
+another LAN host, the headline payload is sent to that host instead.
 `llm_news.py` only speaks to Ollama's OpenAI-compatible endpoint; no other
 provider is supported.
 
@@ -836,14 +846,17 @@ Pull the model once after installing:
 ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M
 ```
 
-This Pi's CPU-only inference is slow regardless of which small (~3-4B) model
-is configured — roughly 27-31 tokens/sec reading the prompt and ~4
-tokens/sec writing the reply, measured directly against this model. The
-request timeout is sized generously around that (see `llm_news.py`'s
-`REQUEST_TIMEOUT_SECONDS`). Because decision-changing checks now finish before
-orders, enabling the LLM can add minutes to an iteration when the same-day
-cache is cold. It also does noticeably weaker risk judgment than a large
-hosted model, so validate its vetoes extensively in paper trading.
+This ARM64 Pi's CPU-only inference is slow regardless of which small (~3-4B)
+model is configured — roughly 30 tokens/sec reading uncached prompt tokens and
+4-5 tokens/sec writing the reply, measured with the shipped IBM Granite 4.1 3B
+Q4_K_M model. The strict assessment schema keeps the normal decision reply
+small: the measured five-article comparison generated 25 tokens in 16.7
+seconds, versus 88 tokens in 29.9 seconds for the previous prose JSON format.
+Cold model loads, larger headline sets, and the separate narrative/article
+analysis calls can still take longer. The request timeout remains deliberately
+generous (see `llm_news.py`'s `REQUEST_TIMEOUT_SECONDS`). Validate model vetoes
+extensively in paper trading; a small local model remains less capable than a
+large hosted model.
 
 #### Enabling it
 
@@ -875,16 +888,25 @@ removed.
    instructions to score aggregate near-term market risk from `-10` (severe,
    market-wide danger) to `+10` (strongly constructive), scoring
    conservatively and treating duplicate coverage as one event.
-3. The model must reply in a fixed JSON format containing the score, a risk
-   level, and two or three sentences of reasoning that cite the headlines.
-4. The score, level, and reasoning are logged and included in that iteration's
-   email. A score at or below `LLM_NEWS_BLOCK_SCORE` vetoes the trade before
-   any opening order is submitted.
+3. Ollama constrains the reply with a strict JSON Schema containing exactly an
+   integer `score`, an enumerated `reason_code`, and up to three unique article
+   numbers in `evidence`. Extra keys, booleans masquerading as integers,
+   out-of-range scores/indices, duplicates, and unknown reason codes are
+   rejected. Generation is deterministic (`temperature=0`, `seed=0`) and
+   capped at 64 output tokens.
+4. The agent derives `risk_level` from the validated score and reconstructs a
+   readable explanation locally from the reason code and selected article
+   headlines. The model does not spend time generating prose and cannot make
+   its displayed risk label disagree with the configured block threshold.
+5. The score, derived level, cited theme, and evidence headlines are logged and
+   included in that iteration's email. A score at or below
+   `LLM_NEWS_BLOCK_SCORE` vetoes the trade before any opening order is
+   submitted.
 
 The log line looks like:
 
 ```text
-LLM news assessment: risk=elevated, score=-3. Several articles describe ...
+LLM news assessment: risk=elevated, score=-3. Aggregate score is elevated. Cited theme: broad negative market conditions. Evidence: article 2: ...
 ```
 
 #### Other uses of the local model
@@ -927,9 +949,9 @@ places reuse it. None can create a buy signal, and none run unless
 #### LLM limitations
 
 - The model sees only headlines and short summaries, not full articles.
-- A language model can misjudge significance in either direction; its
-  reasoning is plausible-sounding even when wrong — a small local model more
-  so than a large hosted one.
+- A language model can misjudge significance in either direction. The readable
+  explanation is assembled locally, but its score, selected theme, and evidence
+  choices still come from the model and can be wrong.
 - If `ollama.service` is down or the model fails to load, opening trades are
   blocked when `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` is `true` (the default).
 - Keyword scores are preprocessing metadata, not a competing trading opinion.
@@ -1289,10 +1311,10 @@ threshold generally causes a signal sooner; a larger threshold requires a
 deeper fall. A longer lookback may preserve an older, higher reference price.
 These observations are mechanical descriptions, not claims about profitability.
 
-Verify that every configured symbol is supported and tradable at Alpaca. This
-strategy is designed for ordinary whole-share stock or ETF symbols. It is not
-configured for options, short positions, leveraged borrowing logic, or crypto
-pairs.
+Verify that every configured symbol is supported and tradable at Alpaca. The
+equity strategy is designed for ordinary stock or ETF symbols. It is not
+configured for options, short positions, or leveraged borrowing. Crypto pairs
+belong only in the separate `CRYPTO_*` configuration and service.
 
 ## Testing and going live
 
@@ -1389,8 +1411,8 @@ This can be correct. Check all of these conditions:
 - There is no unresolved order already pending at the broker.
 - The symbols have current and historical data.
 
-The agent does not buy an initial position for you; it only rotates cash it
-already holds into a qualifying candidate.
+The agent can build a qualifying position from available cash. It intentionally
+does nothing when no candidate clears every entry guard.
 
 ### A symbol was sold but its replacement was not bought
 
@@ -1554,8 +1576,9 @@ Even an automated service needs supervision. A sensible routine is to:
 
 - Check service health and Alpaca activity each trading day.
 - Review all filled, rejected, and canceled orders.
-- Compare LLM scores and reasoning with the underlying headlines; keyword
-  scores help explain article prioritization but do not decide trades.
+- Compare LLM scores, cited themes, and evidence headlines with the underlying
+  news; keyword scores help explain article prioritization but do not decide
+  trades.
 - Check disk usage and system updates regularly.
 - Confirm system time remains synchronized.
 - Test reboot recovery periodically while still in paper mode.
