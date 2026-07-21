@@ -112,6 +112,7 @@ class WorldEventAnalyzer:
         refine_scoring: bool = False,
         rss_enabled: bool = False,
         rss_feed_urls: list[str] | None = None,
+        symbols: list[str] | None = None,
     ):
         self.lookback_hours = lookback_hours
         self.max_articles = max_articles
@@ -126,6 +127,9 @@ class WorldEventAnalyzer:
         # same posture as every other optional source in this pipeline.
         self.rss_enabled = rss_enabled
         self.rss_feed_urls = list(rss_feed_urls or [])
+        self.symbols = list(
+            dict.fromkeys(str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip())
+        )
 
     @staticmethod
     def _contains(text: str, phrase: str) -> bool:
@@ -257,6 +261,7 @@ class WorldEventAnalyzer:
             start=now - timedelta(hours=self.lookback_hours),
             end=now,
             limit=self.max_articles,
+            symbols=",".join(self.symbols) if self.symbols else None,
         )
         client = NewsClient(api_key=api_key, secret_key=secret_key)
         # alpaca-py's REST client currently sends requests without a timeout.

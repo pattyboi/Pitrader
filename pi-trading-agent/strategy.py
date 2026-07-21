@@ -67,6 +67,7 @@ class AssetRotationStrategy(Strategy):
     _POSTURE_VARIANCE_PENALTY = decision_math.POSTURE_VARIANCE_PENALTY
     _POSTURE_CONSISTENCY_WEIGHT = decision_math.POSTURE_CONSISTENCY_WEIGHT
     _POSTURE_NEWS_DISCOUNT_PER_POINT = decision_math.POSTURE_NEWS_DISCOUNT_PER_POINT
+    _POSTURE_LLM_SCORE_WEIGHT = decision_math.POSTURE_LLM_SCORE_WEIGHT
     _POSTURE_LEARNED_EDGE_WEIGHT = decision_math.POSTURE_LEARNED_EDGE_WEIGHT
     _POSTURE_MAX_ADJUSTMENT_PERCENT = decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
 
@@ -2903,6 +2904,7 @@ class AssetRotationStrategy(Strategy):
         # gates on the raw historical expected_profit, unaffected by posture.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
         market_wide_news_score = news_context.score if news_context.available else None
+        llm_purchase_score = llm_assessment.score if llm_assessment.available else None
         pending_backfill = {
             str(signal["symbol"]): signal.get("_memory_history", [])
             for signal in signals
@@ -2960,7 +2962,7 @@ class AssetRotationStrategy(Strategy):
                 else None
             )
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
-                signal, risk_posture, news_score
+                signal, risk_posture, news_score, llm_purchase_score
             )
         report["portfolio_risk_posture"] = risk_posture
         signal_snapshot.write_snapshot(

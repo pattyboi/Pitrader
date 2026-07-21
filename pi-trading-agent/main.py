@@ -401,6 +401,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "CRYPTO_HOLDING_HORIZON_MAX_DAYS": 15,
         "CRYPTO_MIN_ORDER_DOLLARS": 5.0,
         "CRYPTO_ITERATION_INTERVAL_MINUTES": 15,
+        "CRYPTO_NEWS_REFRESH_MINUTES": 60,
         "CRYPTO_AUTONOMOUS_DISCOVERY": False,
         "CRYPTO_DISCOVERY_BATCH_SIZE": 6,
         "CRYPTO_DISCOVERY_REFRESH_DAYS": 7,
@@ -441,6 +442,7 @@ def load_config(path: Path) -> dict[str, Any]:
     crypto_holding_horizon_max_days = int(config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"])
     crypto_min_order = float(config["CRYPTO_MIN_ORDER_DOLLARS"])
     crypto_iteration_interval_minutes = int(config["CRYPTO_ITERATION_INTERVAL_MINUTES"])
+    crypto_news_refresh_minutes = int(config["CRYPTO_NEWS_REFRESH_MINUTES"])
     crypto_discovery_batch_size = int(config["CRYPTO_DISCOVERY_BATCH_SIZE"])
     crypto_discovery_refresh_days = int(config["CRYPTO_DISCOVERY_REFRESH_DAYS"])
     crypto_opportunity_min_probability = float(config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"])
@@ -462,6 +464,7 @@ def load_config(path: Path) -> dict[str, Any]:
         ("CRYPTO_HOLDING_HORIZON_MAX_DAYS", crypto_holding_horizon_max_days, 1, 60),
         ("CRYPTO_MIN_ORDER_DOLLARS", crypto_min_order, 1, 1000),
         ("CRYPTO_ITERATION_INTERVAL_MINUTES", crypto_iteration_interval_minutes, 5, 120),
+        ("CRYPTO_NEWS_REFRESH_MINUTES", crypto_news_refresh_minutes, 15, 1440),
         ("CRYPTO_DISCOVERY_BATCH_SIZE", crypto_discovery_batch_size, 1, 30),
         ("CRYPTO_DISCOVERY_REFRESH_DAYS", crypto_discovery_refresh_days, 1, 90),
         ("CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY", crypto_opportunity_min_probability, 0.5, 0.95),
@@ -486,6 +489,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"] = crypto_holding_horizon_max_days
     config["CRYPTO_MIN_ORDER_DOLLARS"] = crypto_min_order
     config["CRYPTO_ITERATION_INTERVAL_MINUTES"] = crypto_iteration_interval_minutes
+    config["CRYPTO_NEWS_REFRESH_MINUTES"] = crypto_news_refresh_minutes
     config["CRYPTO_DISCOVERY_BATCH_SIZE"] = crypto_discovery_batch_size
     config["CRYPTO_DISCOVERY_REFRESH_DAYS"] = crypto_discovery_refresh_days
     config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"] = crypto_opportunity_min_probability

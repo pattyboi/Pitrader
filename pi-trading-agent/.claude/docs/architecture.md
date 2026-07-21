@@ -19,7 +19,7 @@ They are separate processes, not one process with two Lumibot strategies, becaus
 
 **Strategy classes**
 - `strategy.py` — `AssetRotationStrategy(Strategy)`, ~3300 lines. Owns the entire equity decision pipeline: state-file helpers, email reporting, news/LLM integration, decision memory, portfolio memory, discovery, and the portfolio decision pipeline itself (see decision-pipeline.md).
-- `crypto_strategy.py` — `CryptoRotationStrategy(Strategy)`. Deliberately its own class, not a subclass of `AssetRotationStrategy` — inheriting would couple crypto to equity-specific internals (email HTML, equity-tuned discovery heuristics) that would need silent overriding. Reimplements the same decision shape (dip signal, exits, build, discovery, Opportunistic Opportunity swap) narrowly for crypto, sharing only genuinely asset-class-agnostic code (below). No news/LLM integration — crypto has none of that layer yet.
+- `crypto_strategy.py` — `CryptoRotationStrategy(Strategy)`. Deliberately its own class, not a subclass of `AssetRotationStrategy` — inheriting would couple crypto to equity-specific internals that would need silent overriding. Reimplements the same decision shape narrowly for crypto and consumes Alpaca `BASEUSD`-filtered news plus the shared local LLM before new purchases. News/LLM results are cached because crypto polls more frequently than equity.
 
 **Shared, asset-class-agnostic modules** (imported by both strategy classes)
 - `decision_math.py` — pure math with zero broker/`self` coupling: `walk_forward_net_returns` (chronological out-of-sample validation), `posture_adjusted_edge` (risky/conservative ranking reshaping), `optimal_position_count` (Sharpe-like position sizing). `AssetRotationStrategy` keeps its old method names (`_walk_forward_net_returns` etc.) as `staticmethod` aliases onto these functions so existing call sites/tests are unaffected.
@@ -30,8 +30,8 @@ They are separate processes, not one process with two Lumibot strategies, becaus
 - `ridge_regression.py` — the two-feature ridge fit both memory classes use.
 - `signal_snapshot.py` / `trade_counter.py` — purely observational side channels, both called from each strategy's own decision/order-submission code but never read back into it. `signal_snapshot.write_snapshot` runs once per iteration (per-symbol opinions); `trade_counter.record_trade` runs from each strategy's `_submit_order_checked` choke point on every broker-accepted order, resetting to 1 on a new calendar day. Consumed by `scripts/web_dashboard.py` (browser dashboard) — see "Operating the service" in the README.
 
-**Equity-only supporting modules** (no crypto equivalent yet)
-- `adaptive_news_model.py`, `news_context.py`, `rss_news.py`, `article_filter.py`, `llm_news.py`, `symbol_reference.py` — the news/LLM/learning layer. `token_estimate.py` is a small LLM-prompt-sizing helper used by `llm_news.py`.
+**News/LLM supporting modules**
+- `news_context.py` and `llm_news.py` are shared by equity and crypto; crypto uses Alpaca's symbol filter and deliberately excludes the broad equity-oriented RSS feeds. `adaptive_news_model.py`, `rss_news.py`, `article_filter.py`, and `symbol_reference.py` remain equity-specific. `token_estimate.py` is a small LLM-prompt-sizing helper used by `llm_news.py`.
 
 ## Config
 

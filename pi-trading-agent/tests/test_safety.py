@@ -17,6 +17,7 @@ import pytest
 
 import article_filter
 import autonomous_universe
+import crypto_strategy
 import decision_math
 import llm_news
 import signal_snapshot
@@ -1216,6 +1217,23 @@ def test_conservative_posture_discounts_bad_news_harder_than_risky() -> None:
     risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8)
 
     assert conservative < risky < 2.0
+
+
+def test_llm_assessment_is_a_signed_bounded_purchase_signal() -> None:
+    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
+
+    negative = AssetRotationStrategy._posture_adjusted_edge(
+        signal, "conservative", None, -5
+    )
+    neutral = AssetRotationStrategy._posture_adjusted_edge(
+        signal, "conservative", None, 0
+    )
+    positive = AssetRotationStrategy._posture_adjusted_edge(
+        signal, "conservative", None, 5
+    )
+
+    assert negative < neutral == 2.0 < positive
+    assert positive <= 2.0 + AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
 
 
 def test_learned_edge_only_shifts_ranking_when_ready() -> None:
@@ -3376,6 +3394,101 @@ def test_world_event_analyzer_treats_an_empty_response_as_unavailable(
     assert context.available is False
     assert context.risk_level == "unavailable"
     assert "could not be assessed" in context.explanation
+
+
+def test_world_event_analyzer_passes_crypto_symbol_filter_to_alpaca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeDataFrame:
+        empty = True
+
+    class FakeNewsClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._session = None
+
+        def get_news(self, request) -> SimpleNamespace:
+            captured["symbols"] = request.symbols
+            return SimpleNamespace(df=FakeDataFrame())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "alpaca.data.historical.news",
+        SimpleNamespace(NewsClient=FakeNewsClient),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alpaca.data.requests",
+        SimpleNamespace(NewsRequest=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+
+    WorldEventAnalyzer(24, 10, -6, symbols=["BTCUSD", "ETHUSD"]).analyze()
+
+    assert captured["symbols"] == "BTCUSD,ETHUSD"
+
+
+def test_crypto_news_is_assessed_once_per_refresh_and_maps_pair_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"news": 0, "llm": 0}
+    captured: dict[str, object] = {}
+    context = NewsContext(
+        available=True,
+        score=2,
+        per_symbol_scores={"BTCUSD": 2, "ETH/USD": -1},
+        article_count=1,
+        risk_level="constructive",
+        per_article=[
+            {"headline": "Bitcoin adoption expands", "summary": "", "symbols": ["BTCUSD"], "score": 2}
+        ],
+    )
+
+    class FakeWorldEventAnalyzer:
+        def __init__(self, **kwargs) -> None:
+            captured["news_symbols"] = kwargs["symbols"]
+
+        def analyze(self) -> NewsContext:
+            calls["news"] += 1
+            return context
+
+    class FakeLLMNewsAnalyzer:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def assess(self, articles, **kwargs):
+            calls["llm"] += 1
+            captured["llm_symbols"] = kwargs["symbols"]
+            captured["symbol_scores"] = kwargs["symbol_scores"]
+            return llm_news.LLMNewsAssessment(
+                available=True, score=5, risk_level="constructive", reasoning="Positive crypto news."
+            )
+
+    monkeypatch.setattr(crypto_strategy, "WorldEventAnalyzer", FakeWorldEventAnalyzer)
+    monkeypatch.setattr(crypto_strategy, "LLMNewsAnalyzer", FakeLLMNewsAnalyzer)
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "news_context_enabled": True,
+        "news_lookback_hours": 24,
+        "news_max_articles": 50,
+        "news_high_risk_score": -6,
+        "llm_news_enabled": True,
+        "llm_news_model": "test-model",
+        "llm_news_block_score": -6,
+        "crypto_news_refresh_minutes": 60,
+    }
+    strategy.log_message = lambda *args, **kwargs: None
+
+    first = strategy._crypto_news_signals(["BTC", "ETH"], {"BTC"})
+    second = strategy._crypto_news_signals(["BTC", "ETH"], {"BTC"})
+
+    assert calls == {"news": 1, "llm": 1}
+    assert captured["news_symbols"] == ["BTCUSD", "ETHUSD"]
+    assert captured["llm_symbols"] == ["BTC", "ETH"]
+    assert captured["symbol_scores"] == {"BTC": 2, "ETH": -1}
+    assert first[1].score == second[1].score == 5
 
 
 def test_build_snapshot_entries_uses_posture_adjusted_edge_when_qualifying() -> None:

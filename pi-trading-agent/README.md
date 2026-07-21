@@ -822,18 +822,21 @@ trusts Alpaca's raw article tags unfiltered — exactly today's behavior.
 
 ### LLM news assessment
 
-In addition to the fixed keyword rules, the agent can send the same daily
-Alpaca headlines to a language model for a risk assessment, up to twice a
-trading day (see "How often the agent checks in" below). Unlike the keyword
+In addition to the fixed keyword rules, the equity service sends the same
+Alpaca headlines to a language model before each trading window (up to twice
+a trading day), and the crypto service sends symbol-filtered crypto headlines
+on its cached refresh cadence. Unlike the keyword
 scorer, the model reads the articles with genuine language
 understanding: it can recognize that ten articles describe one event, that a
 headline is speculation rather than fact, or that a negative-sounding story
-is irrelevant to broad US equity markets.
+is irrelevant to the assets being evaluated.
 
-Like every other news feature, this layer can only **veto** a rotation. It
-never creates a buy signal, and if the API is unreachable the price strategy
-continues without it (the same fail-open behavior as the rest of the news
-stack).
+The signed score is a bounded pre-purchase signal: constructive assessments
+raise posture-adjusted candidate edge and negative assessments lower it. It
+cannot bypass the raw historical-profit, out-of-sample, liquidity, cash, or
+position limits. Severe scores still veto new purchases, and the default
+`LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE: true` blocks new entries when an enabled
+assessment is unavailable; protective exits remain independent.
 
 #### Local only — no outside service
 
@@ -1195,6 +1198,12 @@ dip signal, take-profit/stop-loss/holding-horizon exits, autonomous discovery
 of other Alpaca-tradable pairs (if `CRYPTO_AUTONOMOUS_DISCOVERY` is enabled),
 pooled cross-symbol memory, and an equivalent of the Opportunistic Opportunity
 BTC-to-ETH swap (capped at one swap per day, same as the equity version).
+Before any new crypto purchase, it also fetches Alpaca news filtered to the
+evaluated `BASEUSD` pairs and runs the configured local LLM assessment. A
+positive LLM score raises the bounded posture-adjusted purchase edge; a
+negative score lowers it, and severe/unavailable evidence can block new
+purchases under the shared `NEWS_*`/`LLM_NEWS_*` safety settings. Price-based
+exits run first and never depend on news availability.
 
 ### Cash allocation is a dynamic 50/50 split of the shared account
 
@@ -1232,6 +1241,7 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 | `CRYPTO_TAKE_PROFIT_PERCENT` / `CRYPTO_STOP_LOSS_PERCENT` | `1.5` / `1.0` | Exit thresholds, wider than the equity defaults since crypto moves more. |
 | `CRYPTO_HOLDING_HORIZON_MAX_DAYS` | `15` | Backstop exit if neither take-profit nor stop-loss has triggered. |
 | `CRYPTO_ITERATION_INTERVAL_MINUTES` | `15` | How often the service re-evaluates while the stock market is closed. |
+| `CRYPTO_NEWS_REFRESH_MINUTES` | `60` | Cache duration for symbol-filtered crypto news and its LLM assessment, preventing a model call every crypto poll. |
 | `CRYPTO_AUTONOMOUS_DISCOVERY` | `false` | Expand the watchlist with other Alpaca-tradable USD-quoted crypto pairs. |
 | `CRYPTO_RISK_POSTURE` | `conservative` | Same risky/conservative ranking behavior as `PORTFOLIO_RISK_POSTURE`. |
 | `CRYPTO_MEMORY_ENABLED` | `true` | Pooled cross-symbol learning, same concept as portfolio memory. |

@@ -20,6 +20,12 @@ import numpy as np
 POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
 POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
 POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
+# The LLM score is a signed purchase signal: constructive assessments improve
+# ranking, while negative assessments reduce it.  The deliberately small
+# weights and the shared clamp below keep it subordinate to the measured
+# historical edge; callers still enforce their raw profit/OOS eligibility
+# floors before any order can be submitted.
+POSTURE_LLM_SCORE_WEIGHT = {"conservative": 0.10, "risky": 0.15}
 # How much weight a ready learned-edge forecast gets when it disagrees with a
 # symbol's raw historical expected_profit: risky leans into the pooled,
 # cross-symbol learned edge more; conservative trusts the unadjusted
@@ -104,14 +110,16 @@ def posture_adjusted_edge(
     signal: dict[str, float | int | str | None],
     posture: str,
     news_score: float | int | None,
+    llm_score: float | int | None = None,
 ) -> float:
     """Reshape a symbol's historical edge through a risky or conservative lens.
 
     Conservative leans on consistency: it penalizes return variance and a
-    negative news day harder. Risky leans on raw edge: it barely discounts
-    variance or bad news. This never changes the expected-profit eligibility
-    threshold itself; it only reweights which already-qualifying candidate
-    looks best and which current holding looks weakest.
+    negative news day harder. A signed LLM assessment contributes a bounded
+    purchase signal: positive scores improve ranking and negative scores
+    reduce it. This never changes the expected-profit eligibility threshold
+    itself; it only reweights which already-qualifying candidate looks best
+    and which current holding looks weakest.
     """
     posture = posture if posture in ("conservative", "risky") else "conservative"
     expected_profit = float(signal["expected_profit"])
@@ -122,6 +130,9 @@ def posture_adjusted_edge(
     if news_score is not None:
         capped_score = max(-10.0, min(10.0, float(news_score)))
         adjustment -= max(0.0, -capped_score) * POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
+    if llm_score is not None:
+        capped_llm_score = max(-10.0, min(10.0, float(llm_score)))
+        adjustment += capped_llm_score * POSTURE_LLM_SCORE_WEIGHT[posture]
     if signal.get("learned_edge_ready") and signal.get("learned_edge") is not None:
         learned_edge = float(signal["learned_edge"])
         adjustment += (learned_edge - expected_profit) * POSTURE_LEARNED_EDGE_WEIGHT[posture]

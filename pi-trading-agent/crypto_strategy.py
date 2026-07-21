@@ -43,6 +43,8 @@ import signal_snapshot
 import trade_counter
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
+from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
+from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
@@ -91,6 +93,7 @@ class CryptoRotationStrategy(Strategy):
         "crypto_holding_horizon_max_days": 15,
         "crypto_min_order_dollars": 5.0,
         "crypto_iteration_interval_minutes": 15,
+        "crypto_news_refresh_minutes": 60,
         "crypto_risk_posture": "conservative",
         "crypto_memory_enabled": True,
         "crypto_memory_min_observations": 20,
@@ -102,6 +105,18 @@ class CryptoRotationStrategy(Strategy):
         "crypto_asset_a": "BTC",
         "crypto_asset_b": "ETH",
         "crypto_opportunistic_min_probability": 0.55,
+        "news_context_enabled": True,
+        "news_lookback_hours": 24,
+        "news_max_articles": 50,
+        "news_block_on_high_risk": True,
+        "news_fail_closed_on_unavailable": True,
+        "news_high_risk_score": -6,
+        "news_score_refinement_enabled": False,
+        "llm_news_enabled": False,
+        "llm_news_model": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
+        "llm_news_base_url": "http://127.0.0.1:11434/v1",
+        "llm_news_fail_closed_on_unavailable": True,
+        "llm_news_block_score": -6,
     }
 
     # Fraction of cash withheld from a buy so the market order is not rejected
@@ -151,6 +166,7 @@ class CryptoRotationStrategy(Strategy):
         self.vars.crypto_pending_rotation = self._load_crypto_rotation()
         self.vars.crypto_opportunistic_swap_date = self._load_crypto_opportunistic_swap_date()
         self.vars.crypto_decision_memory_backfill_attempted = False
+        self._crypto_news_cache: tuple[float, tuple[str, ...], NewsContext, LLMNewsAssessment] | None = None
         if self.vars.crypto_pending_rotation is not None:
             entry = self.vars.crypto_pending_rotation
             self.log_message(
@@ -782,6 +798,148 @@ class CryptoRotationStrategy(Strategy):
                 )
             )
 
+    @staticmethod
+    def _crypto_symbol_news_scores(
+        context: NewsContext, symbols: list[str]
+    ) -> dict[str, int]:
+        """Map Alpaca's crypto news tags (BTCUSD/BTC/USD) to base symbols."""
+        wanted = {str(symbol).upper() for symbol in symbols}
+        scores: dict[str, int] = {}
+        for tagged_symbol, score in context.per_symbol_scores.items():
+            normalized = re.sub(r"[^A-Z0-9]", "", str(tagged_symbol).upper())
+            base = normalized[:-3] if normalized.endswith("USD") else normalized
+            if base in wanted:
+                scores[base] = scores.get(base, 0) + int(score)
+        return scores
+
+    def _crypto_news_signals(
+        self, symbols: list[str], held_symbols: set[str]
+    ) -> tuple[NewsContext, LLMNewsAssessment, dict[str, int]]:
+        """Fetch symbol-filtered crypto news and assess it before new entries.
+
+        Crypto evaluates every few minutes, so one result is cached for the
+        configured refresh interval. Protective exits run before this method
+        and therefore never wait on or depend on news availability.
+        """
+        if not bool(self.parameters.get("news_context_enabled", True)):
+            context = NewsContext(
+                available=False,
+                risk_level="disabled",
+                explanation="News context is disabled in config.json.",
+            )
+            assessment = LLMNewsAssessment(
+                available=False,
+                risk_level="disabled",
+                explanation="LLM news assessment is disabled with news context.",
+            )
+            return context, assessment, {}
+
+        cache_key = tuple(sorted(str(symbol).upper() for symbol in symbols))
+        refresh_seconds = max(
+            60.0, float(self.parameters.get("crypto_news_refresh_minutes", 60)) * 60.0
+        )
+        cached = getattr(self, "_crypto_news_cache", None)
+        now = time.monotonic()
+        if cached is not None and cached[1] == cache_key and now - cached[0] < refresh_seconds:
+            context, assessment = cached[2], cached[3]
+            return context, assessment, self._crypto_symbol_news_scores(context, symbols)
+
+        try:
+            analyzer = WorldEventAnalyzer(
+                lookback_hours=int(self.parameters.get("news_lookback_hours", 24)),
+                max_articles=int(self.parameters.get("news_max_articles", 50)),
+                block_score=int(self.parameters.get("news_high_risk_score", -6)),
+                refine_scoring=bool(
+                    self.parameters.get("news_score_refinement_enabled", False)
+                ),
+                # The shared RSS feeds are broad equity/market feeds. Alpaca's
+                # symbol-filtered endpoint is the crypto-specific source here.
+                rss_enabled=False,
+                symbols=[f"{symbol}USD" for symbol in cache_key],
+            )
+            context = analyzer.analyze()
+        except Exception as exc:
+            context = NewsContext(
+                available=False,
+                risk_level="unavailable",
+                explanation=f"Crypto news retrieval failed: {type(exc).__name__}: {exc}",
+            )
+        symbol_scores = self._crypto_symbol_news_scores(context, symbols)
+
+        if not bool(self.parameters.get("llm_news_enabled", False)):
+            assessment = LLMNewsAssessment(
+                available=False,
+                risk_level="disabled",
+                explanation="LLM news assessment is disabled in config.json.",
+            )
+        elif not context.available or not context.per_article:
+            assessment = LLMNewsAssessment(
+                available=False,
+                risk_level="unavailable",
+                explanation="No crypto news articles were available for the LLM assessment.",
+            )
+        else:
+            try:
+                assessment = LLMNewsAnalyzer(
+                    model=str(self.parameters.get("llm_news_model", "")),
+                    base_url=str(self.parameters.get("llm_news_base_url", "")),
+                    block_score=int(self.parameters.get("llm_news_block_score", -6)),
+                ).assess(
+                    context.per_article,
+                    symbols=list(cache_key),
+                    held_symbols=held_symbols,
+                    symbol_scores=symbol_scores,
+                )
+            except Exception as exc:
+                assessment = LLMNewsAssessment(
+                    available=False,
+                    risk_level="unavailable",
+                    explanation=f"Crypto LLM assessment failed: {type(exc).__name__}: {exc}",
+                )
+
+        self._crypto_news_cache = (now, cache_key, context, assessment)
+        self.log_message(
+            f"Crypto news: risk={context.risk_level}, score={context.score:+d}, "
+            f"articles={context.article_count}; LLM={assessment.risk_level}, "
+            f"score={assessment.score:+d}.",
+            color="yellow" if context.score < 0 or assessment.score < 0 else "blue",
+        )
+        return context, assessment, symbol_scores
+
+    def _crypto_market_veto_reason(
+        self, context: NewsContext, assessment: LLMNewsAssessment
+    ) -> str | None:
+        """Block new crypto purchases on configured news/LLM safety guards."""
+        news_blocking = bool(self.parameters.get("news_context_enabled", True)) and bool(
+            self.parameters.get("news_block_on_high_risk", True)
+        )
+        if (
+            news_blocking
+            and bool(self.parameters.get("news_fail_closed_on_unavailable", True))
+            and not context.available
+        ):
+            return "Crypto purchase blocked: news context is unavailable"
+        if (
+            news_blocking
+            and context.available
+            and context.score <= int(self.parameters.get("news_high_risk_score", -6))
+        ):
+            return f"Crypto purchase blocked: high news risk score {context.score:+d}"
+        llm_blocking = bool(self.parameters.get("llm_news_enabled", False))
+        if (
+            llm_blocking
+            and bool(self.parameters.get("llm_news_fail_closed_on_unavailable", True))
+            and not assessment.available
+        ):
+            return "Crypto purchase blocked: LLM news assessment is unavailable"
+        if (
+            llm_blocking
+            and assessment.available
+            and assessment.score <= int(self.parameters.get("llm_news_block_score", -6))
+        ):
+            return f"Crypto purchase blocked: LLM news score {assessment.score:+d}"
+        return None
+
     # -- Pooled cross-symbol memory (mirrors AssetRotationStrategy's
     # _portfolio_memory/_update_portfolio_memory/_backfill_portfolio_memory
     # in strategy.py, using PortfolioMemory's crypto-appropriate
@@ -898,7 +1056,11 @@ class CryptoRotationStrategy(Strategy):
             return RotationForecast(0, False, None, None, f"Crypto memory failed: {type(exc).__name__}: {exc}")
 
     def _update_crypto_memories(
-        self, signals: list[dict[str, Any]], evaluation_date: str
+        self,
+        signals: list[dict[str, Any]],
+        evaluation_date: str,
+        symbol_news_scores: dict[str, int] | None = None,
+        market_news_score: int | None = None,
     ) -> dict[str, RotationForecast]:
         if not signals:
             return {}
@@ -912,7 +1074,9 @@ class CryptoRotationStrategy(Strategy):
                 symbol=str(signal["symbol"]),
                 price=float(signal["price"]),
                 dip_percent=float(signal["dip"]),
-                news_score=None,
+                news_score=(symbol_news_scores or {}).get(
+                    str(signal["symbol"]), market_news_score
+                ),
                 signal_present=bool(signal.get("qualifies")),
                 live_spread_percent=signal.get("live_spread_percent"),
                 historical_expected_profit=signal.get("expected_profit"),
@@ -1383,6 +1547,25 @@ class CryptoRotationStrategy(Strategy):
                 exited_this_pass.add(source)
 
         symbols = self._crypto_symbols(report, held, managed)
+        news_context, llm_assessment, symbol_news_scores = self._crypto_news_signals(
+            symbols, set(held)
+        )
+        veto_reason = self._crypto_market_veto_reason(news_context, llm_assessment)
+        report.update(
+            crypto_news_risk=news_context.risk_level,
+            crypto_news_score=(
+                f"{news_context.score:+d}" if news_context.available else "unavailable"
+            ),
+            crypto_news_articles=news_context.article_count,
+            crypto_llm_risk=llm_assessment.risk_level,
+            crypto_llm_score=(
+                f"{llm_assessment.score:+d}" if llm_assessment.available else "unavailable"
+            ),
+            crypto_llm_reasoning=(
+                llm_assessment.reasoning or llm_assessment.explanation
+            ),
+            crypto_purchase_guard=veto_reason or "clear",
+        )
         signals = self._crypto_signals(symbols)
         # Only a discovery-sourced candidate is safe to permanently exclude --
         # a config-listed CRYPTO_SYMBOLS entry hitting a transient data outage
@@ -1427,7 +1610,10 @@ class CryptoRotationStrategy(Strategy):
                     f"Crypto-memory batch backfill failed safely: {type(exc).__name__}: {exc}",
                     color="yellow",
                 )
-        forecasts = self._update_crypto_memories(signals, today.isoformat())
+        market_news_score = news_context.score if news_context.available else None
+        forecasts = self._update_crypto_memories(
+            signals, today.isoformat(), symbol_news_scores, market_news_score
+        )
         # Every evaluated symbol -- not just one clearing today's dip
         # threshold -- contributes a daily learning observation to the pooled
         # memory, mirroring AssetRotationStrategy's _run_portfolio_iteration.
@@ -1451,7 +1637,11 @@ class CryptoRotationStrategy(Strategy):
                 if forecast.ready and forecast.predicted_edge_percent is not None
                 else None
             )
-            signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(signal, posture, None)
+            symbol_news_score = symbol_news_scores.get(symbol, market_news_score)
+            llm_purchase_score = llm_assessment.score if llm_assessment.available else None
+            signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(
+                signal, posture, symbol_news_score, llm_purchase_score
+            )
             eligible.append(signal)
         eligible.sort(key=lambda signal: float(signal["posture_adjusted_edge"]), reverse=True)
         report["crypto_candidates"] = len(eligible)
@@ -1497,7 +1687,7 @@ class CryptoRotationStrategy(Strategy):
             and float(opportunity_edge) >= min_profit
             and not swap_already_done_today
         )
-        if opportunity_is_eligible:
+        if veto_reason is None and opportunity_is_eligible:
             if self._has_active_order(asset_a, "sell"):
                 actions.append("Crypto Opportunistic Opportunity pending: waiting for Asset A sale")
             elif price_a is None or float(price_a) <= 0:
@@ -1531,7 +1721,11 @@ class CryptoRotationStrategy(Strategy):
         report["crypto_deployed_dollars"] = f"${deployed:.2f}"
         remaining_budget = max(0.0, crypto_allocation - deployed)
         submitted = 0
-        for candidate in eligible:
+        candidates_for_purchase = eligible if veto_reason is None else []
+        if veto_reason is not None and (eligible or opportunity_is_eligible):
+            actions.append(veto_reason)
+            self.log_message(veto_reason, color="yellow")
+        for candidate in candidates_for_purchase:
             symbol = str(candidate["symbol"])
             if symbol in claimed_symbols:
                 continue
@@ -1585,8 +1779,7 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Email report (uses email_render.py's shared HTML helpers; mirrors
     # AssetRotationStrategy's _send_daily_email/_render_email_html in
-    # strategy.py at a smaller scale -- no news/LLM/discovery sections since
-    # crypto doesn't have those yet) -----------------------------------------
+    # strategy.py at a smaller scale) ----------------------------------------
 
     @staticmethod
     def _crypto_cash_allocation_display(report: dict[str, Any]) -> str:
@@ -1632,6 +1825,13 @@ class CryptoRotationStrategy(Strategy):
                 f"Deployed: {report.get('crypto_deployed_dollars', 'unavailable')}",
                 f"Discovered symbols: {report.get('discovered_crypto_symbols', 'none')}",
                 f"Discovery status: {report.get('discovery_status', 'ok')}",
+                f"Crypto news: {report.get('crypto_news_risk', 'unavailable')} "
+                f"(score {report.get('crypto_news_score', 'unavailable')}, "
+                f"{report.get('crypto_news_articles', 'unavailable')} articles)",
+                f"Crypto LLM: {report.get('crypto_llm_risk', 'unavailable')} "
+                f"(score {report.get('crypto_llm_score', 'unavailable')})",
+                f"Crypto LLM reasoning: {report.get('crypto_llm_reasoning', 'unavailable')}",
+                f"Purchase guard: {report.get('crypto_purchase_guard', 'unavailable')}",
                 f"Dip threshold: {float(report.get('threshold', 0.0)):.2f}%",
                 f"Opportunistic Opportunity: {report.get('crypto_opportunistic_status', 'unavailable')}",
                 f"Opportunistic Opportunity probability: {report.get('crypto_opportunistic_probability', 'unavailable')}",
@@ -1679,6 +1879,19 @@ class CryptoRotationStrategy(Strategy):
             ("Deployed", report.get("crypto_deployed_dollars", "unavailable")),
             ("Discovered symbols", report.get("discovered_crypto_symbols", "none")),
             ("Discovery status", report.get("discovery_status", "ok")),
+            (
+                "Crypto news",
+                f"{report.get('crypto_news_risk', 'unavailable')} "
+                f"(score {report.get('crypto_news_score', 'unavailable')}, "
+                f"{report.get('crypto_news_articles', 'unavailable')} articles)",
+            ),
+            (
+                "Crypto LLM",
+                f"{report.get('crypto_llm_risk', 'unavailable')} "
+                f"(score {report.get('crypto_llm_score', 'unavailable')})",
+            ),
+            ("Crypto LLM reasoning", report.get("crypto_llm_reasoning", "unavailable")),
+            ("Purchase guard", report.get("crypto_purchase_guard", "unavailable")),
             ("Dip threshold", f"{float(report.get('threshold', 0.0)):.2f}%"),
             ("Opportunistic Opportunity", report.get("crypto_opportunistic_status", "unavailable")),
             ("Opportunistic Opportunity probability", report.get("crypto_opportunistic_probability", "unavailable")),
