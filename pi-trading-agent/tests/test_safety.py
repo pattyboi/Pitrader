@@ -3686,3 +3686,11 @@ def test_dashboard_defaults_to_loopback_and_avoids_html_injection_sinks() -> Non
     assert web_dashboard.HOST == "127.0.0.1"
     assert "innerHTML" not in web_dashboard.INDEX_HTML
     assert "textContent = String(e.symbol" in web_dashboard.INDEX_HTML
+
+
+def test_dashboard_service_binds_only_to_amneziawg() -> None:
+    installer = Path("setup_service.sh").read_text(encoding="utf-8")
+
+    assert "Requires=awg-quick@awg0.service" in installer
+    assert "Environment=DASHBOARD_HOST=10.29.70.1" in installer
+    assert "Environment=DASHBOARD_HOST=0.0.0.0" not in installer
