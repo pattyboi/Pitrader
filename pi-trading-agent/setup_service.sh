@@ -312,5 +312,5 @@ echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
 echo "${DASHBOARD_SERVICE_NAME} is installed on AmneziaWG at http://10.29.70.1:8765."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
-    echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"
+    echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"
 fi

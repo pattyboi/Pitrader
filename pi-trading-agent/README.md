@@ -362,7 +362,7 @@ The initial file is:
   "PORTFOLIO_MEMORY_MAX_OBSERVATIONS": 500,
   "PORTFOLIO_MEMORY_MIN_CORRELATION": 0.10,
   "LLM_NEWS_ENABLED": false,
-  "LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
+  "LLM_NEWS_MODEL": "hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M",
   "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
   "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
   "LLM_NEWS_BLOCK_SCORE": -6
@@ -454,7 +454,7 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
 | `PORTFOLIO_MEMORY_MIN_CORRELATION` | Minimum fit correlation before learned edge can rank or block an entry | `0.10` |
 | `LLM_NEWS_ENABLED` | Runs the local LLM assessment before order decisions and enables its veto | `false` |
-| `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"` |
+| `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"` |
 | `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
 | `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | When the LLM is enabled, blocks opening trades if its assessment fails | `true` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
@@ -834,7 +834,7 @@ provider is supported.
 Pull the model once after installing:
 
 ```bash
-ollama pull hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M
+ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M
 ```
 
 This Pi's CPU-only inference is slow regardless of which small (~3-4B) model
@@ -850,7 +850,7 @@ hosted model, so validate its vetoes extensively in paper trading.
 
 ```json
 "LLM_NEWS_ENABLED": true,
-"LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
+"LLM_NEWS_MODEL": "hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M",
 "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
 "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
 "LLM_NEWS_BLOCK_SCORE": -6

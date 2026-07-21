@@ -112,7 +112,7 @@ class CryptoRotationStrategy(Strategy):
         "news_high_risk_score": -6,
         "news_score_refinement_enabled": False,
         "llm_news_enabled": False,
-        "llm_news_model": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
+        "llm_news_model": "hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M",
         "llm_news_base_url": "http://127.0.0.1:11434/v1",
         "llm_news_fail_closed_on_unavailable": True,
         "llm_news_block_score": -6,

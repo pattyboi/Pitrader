@@ -30,11 +30,11 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).resolve().parent / ".article_verdicts.duckdb"
 
 OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
-MODEL = "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"
+MODEL = "hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"
 # Ollama defaults an API request to a ~4096-token context regardless of what
 # the model natively supports unless a request explicitly asks for more
 # (see llm_news.py's OLLAMA_NUM_CTX, which found this directly in this
-# model's own server log); granite-4.0-micro trains at 131072, so this
+# model's own server log); granite-4.1-3b trains at 131072, so this
 # reclaims real headroom, though MAX_TOKENS below stays small on its own
 # merits (an over-long excerpt isn't worth the model's attention either).
 OLLAMA_NUM_CTX = 8192

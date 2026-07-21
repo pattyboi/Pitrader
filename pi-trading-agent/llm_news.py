@@ -28,7 +28,7 @@ MAX_SYMBOLS_LISTED = 60
 # Ollama silently defaults an API request to a ~4096-token context regardless
 # of what the underlying model actually supports (confirmed via its own
 # "vram-based default context" log line) unless a request explicitly asks
-# for more. granite-4.0-micro trains at 131072 tokens natively, so this
+# for more. granite-4.1-3b trains at 131072 tokens natively, so this
 # reclaims real headroom over that implicit default -- it is not, by itself,
 # a green light to fill the budgets below anywhere close to this number: see
 # MAX_PROMPT_TOKENS_ESTIMATE/REQUEST_TIMEOUT_SECONDS for why this Pi's raw
@@ -44,7 +44,7 @@ OLLAMA_NUM_CTX = 8192
 # instead of a chars/4 one (shared with article_filter.py, calibrated the
 # same way): measured against this Pi's actual Ollama server, chars/4
 # undercounted llama3.2:3b's real tokens by ~1.6x but overcounted
-# granite-4.0-micro's by ~1.1x for the same content (different tokenizers).
+# Granite's by ~1.1x for the same content (different tokenizers).
 # This budget is sized against the worse (undercounting) case so it stays
 # safe if LLM_NEWS_MODEL is changed again. When the budget would be
 # exceeded, articles are prioritized by |score| rather than hard-truncated
@@ -55,7 +55,7 @@ MAX_SCORE = 10
 # A local, CPU-bound small model
 # is slower than a hosted API -- prompt-eval on this Pi runs ~27-31
 # tokens/sec regardless of which ~3-4B model is configured (measured
-# directly against both llama3.2:3b and granite-4.0-micro; a bigger context
+# directly against both llama3.2:3b and Granite 4.x 3B; a bigger context
 # *window* does not mean faster *throughput*), and generation is far slower
 # still at ~4 tokens/sec. Sized so MAX_PROMPT_TOKENS_ESTIMATE's worst-case
 # real token count (~1.6x, see above) plus the system prompt plus
@@ -64,10 +64,10 @@ MAX_SCORE = 10
 # for CRYPTO_NEWS_REFRESH_MINUTES so its shorter polling loop does not flood
 # the model.
 REQUEST_TIMEOUT_SECONDS = 240
-# assess()'s reply is just a score plus "two or three plain sentences," so
-# it doesn't need a large budget; sized against REQUEST_TIMEOUT_SECONDS at
-# ~4 tokens/sec generation, see REQUEST_TIMEOUT_SECONDS's comment.
-MAX_RESPONSE_TOKENS = 400
+# assess() returns a strict score/reason/evidence object. At ~4 generated
+# tokens/sec on this Pi, keeping this deliberately small avoids spending
+# tens of seconds generating prose that never participates in a trade.
+MAX_RESPONSE_TOKENS = 64
 # The narrative/exit/red-flag replies are meant to be short; a smaller cap
 # keeps them fast and terse without needing the assessment's full budget.
 NARRATIVE_MAX_TOKENS = 300
@@ -82,6 +82,8 @@ class LLMNewsAssessment:
     score: int = 0
     risk_level: str = "unknown"
     reasoning: str = ""
+    reason_code: str = "unknown"
+    evidence_indices: tuple[int, ...] = ()
     explanation: str = "LLM news assessment was not evaluated."
 
 
@@ -139,18 +141,52 @@ SYSTEM_PROMPT = (
     "Your score still measures aggregate risk and opportunity, not any one symbol - "
     "but weigh concentrated bad news across several of today's symbols, or "
     "bad news specifically hitting a held position, more heavily than the "
-    "same story would count in isolation, and mention the affected symbols "
-    "by name in your reasoning when they drove the score."
+    "same story would count in isolation. Select up to three numbered articles "
+    "that most directly support the score."
+)
+
+ASSESSMENT_REASON_CODES = (
+    "systemic_risk",
+    "broad_negative",
+    "routine_negative",
+    "mixed",
+    "neutral",
+    "constructive",
 )
 
 JSON_FORMAT_INSTRUCTIONS = (
     "\n\nRespond with only a JSON object and no other text, using exactly "
     "these keys:\n"
     '{"score": <integer from -10 to 10>, '
-    '"risk_level": "high" | "elevated" | "normal" | "constructive", '
-    '"reasoning": "<two or three plain sentences citing the specific '
-    'headlines that drove the score>"}'
+    '"reason_code": "systemic_risk" | "broad_negative" | '
+    '"routine_negative" | "mixed" | "neutral" | "constructive", '
+    '"evidence": <array of up to three supporting article numbers>}'
 )
+
+ASSESSMENT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer", "minimum": MIN_SCORE, "maximum": MAX_SCORE},
+        "reason_code": {"type": "string", "enum": list(ASSESSMENT_REASON_CODES)},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1, "maximum": 60},
+            "maxItems": 3,
+            "uniqueItems": True,
+        },
+    },
+    "required": ["score", "reason_code", "evidence"],
+    "additionalProperties": False,
+}
+
+REASON_CODE_EXPLANATIONS = {
+    "systemic_risk": "Cited theme: severe market-wide or systemic risk.",
+    "broad_negative": "Cited theme: broad negative market conditions.",
+    "routine_negative": "Cited theme: ordinary company or sector downside.",
+    "mixed": "Cited theme: mixed risks and opportunities.",
+    "neutral": "Cited theme: broadly neutral or unremarkable news.",
+    "constructive": "Cited theme: constructive market conditions.",
+}
 
 DAY_SUMMARY_SYSTEM_PROMPT = (
     "You are writing a two-to-three sentence plain-English recap of one "
@@ -318,6 +354,7 @@ class LLMNewsAnalyzer:
         *,
         json_mode: bool,
         max_tokens: int = MAX_RESPONSE_TOKENS,
+        response_schema: dict | None = None,
     ) -> str:
         """Shared request/response plumbing for every call this class makes."""
         import requests
@@ -325,13 +362,31 @@ class LLMNewsAnalyzer:
         payload: dict = {
             "model": self.model,
             "max_tokens": max_tokens,
+            # The OpenAI-compatible endpoint accepts sampling controls at the
+            # top level. Nesting temperature under Ollama's native `options`
+            # object is silently ignored by /v1/chat/completions.
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 0,
+            # This score can veto a purchase. Greedy decoding makes repeated
+            # evaluations of identical news deterministic and avoids sampling
+            # noise changing a trading decision.
             "options": {"num_ctx": OLLAMA_NUM_CTX},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
         }
-        if json_mode:
+        if response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "market_news_assessment",
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
+        elif json_mode:
             payload["response_format"] = {"type": "json_object"}
         response = requests.post(
             f"{self.base_url.rstrip('/')}/chat/completions",
@@ -413,31 +468,63 @@ class LLMNewsAnalyzer:
 
     @classmethod
     def _parse_assessment(
-        cls, text: str, article_count: int, model: str, block_score: int
+        cls, text: str, articles: list[dict], model: str, block_score: int
     ) -> LLMNewsAssessment:
-        """Validate and repair a model reply into a usable assessment."""
+        """Validate the minimal reply and build its human explanation locally."""
         cleaned = text.strip()
         # Some models wrap JSON in a markdown code fence despite instructions.
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
         data = json.loads(cleaned)
-        score = max(MIN_SCORE, min(MAX_SCORE, int(data["score"])))
-        # risk_level is always derived from score rather than trusting the
-        # model's own label: a self-reported label that doesn't match this
-        # pipeline's score thresholds (e.g. "normal" at a negative score)
-        # would otherwise pass validation silently and mislead anyone
-        # skimming the daily report/log line, even though it never affects
-        # trade-blocking (purchase_veto_reason only checks score).
+        expected_keys = {"score", "reason_code", "evidence"}
+        if not isinstance(data, dict) or set(data) != expected_keys:
+            raise ValueError("Assessment must contain exactly score, reason_code, and evidence")
+        raw_score = data["score"]
+        if isinstance(raw_score, bool) or not isinstance(raw_score, int):
+            raise ValueError("Assessment score must be an integer")
+        score = raw_score
+        if not MIN_SCORE <= score <= MAX_SCORE:
+            raise ValueError(f"Assessment score is out of range: {score}")
+        reason_code = str(data["reason_code"])
+        if reason_code not in ASSESSMENT_REASON_CODES:
+            raise ValueError(f"Unknown assessment reason code: {reason_code}")
+        raw_evidence = data["evidence"]
+        if not isinstance(raw_evidence, list) or len(raw_evidence) > 3:
+            raise ValueError("Assessment evidence must be an array of up to three indices")
+        evidence: list[int] = []
+        for raw_index in raw_evidence:
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                raise ValueError("Assessment evidence indices must be integers")
+            if not 1 <= raw_index <= len(articles):
+                raise ValueError(f"Assessment evidence index is out of range: {raw_index}")
+            if raw_index in evidence:
+                raise ValueError(f"Assessment evidence index is duplicated: {raw_index}")
+            evidence.append(raw_index)
+
         risk_level = cls._risk_level_for_score(score, block_score)
-        reasoning = str(data.get("reasoning", "")).strip()
+        # The score is the aggregate result; reason_code classifies the cited
+        # theme. Keep both explicit because mixed coverage can legitimately
+        # produce a positive net score while its most notable theme is a
+        # routine downside (or vice versa).
+        reasoning = f"Aggregate score is {risk_level}. {REASON_CODE_EXPLANATIONS[reason_code]}"
+        if evidence:
+            headlines = [
+                str(articles[index - 1].get("headline", "")).strip()[:160]
+                for index in evidence
+            ]
+            reasoning += " Evidence: " + "; ".join(
+                f"article {index}: {headline}" for index, headline in zip(evidence, headlines)
+            )
         return LLMNewsAssessment(
             available=True,
             score=score,
             risk_level=risk_level,
             reasoning=reasoning,
+            reason_code=reason_code,
+            evidence_indices=tuple(evidence),
             explanation=(
-                f"{model} assessed {article_count} articles; "
+                f"{model} assessed {len(articles)} articles; "
                 f"score {score:+d} ({risk_level})."
             ),
         )
@@ -486,5 +573,11 @@ class LLMNewsAnalyzer:
         user_text = wrapper + article_text
         if symbol_context:
             user_text += "\n\n" + symbol_context
-        text = self._chat(SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS, user_text, json_mode=True)
-        return self._parse_assessment(text, len(selected_articles), self.model, self.block_score)
+        text = self._chat(
+            SYSTEM_PROMPT + JSON_FORMAT_INSTRUCTIONS,
+            user_text,
+            json_mode=True,
+            max_tokens=MAX_RESPONSE_TOKENS,
+            response_schema=ASSESSMENT_RESPONSE_SCHEMA,
+        )
+        return self._parse_assessment(text, selected_articles, self.model, self.block_score)
