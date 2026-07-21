@@ -24,9 +24,8 @@ import signal_snapshot
 import scripts.nightly_preeval as nightly_preeval
 import token_estimate
 import trade_counter
-from adaptive_news_model import AdaptiveNewsModel
 from autonomous_universe import AutonomousUniverse
-from llm_news import LLMNewsAnalyzer
+from llm_news import LLMNewsAnalyzer, purchase_veto_reason
 from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_is_open
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
@@ -230,7 +229,7 @@ def test_portfolio_memory_pools_observations_across_symbols(tmp_path: Path) -> N
     memory.backfill_history("SPY", [("2026-01-02", 5.0, 1.0), ("2026-01-05", 6.0, 2.0)])
     memory.backfill_history("AAPL", [("2026-01-03", 5.5, 1.5)])
 
-    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, llm_score=0)
 
     assert forecast.observations == 3
     assert forecast.ready is True
@@ -240,7 +239,7 @@ def test_portfolio_memory_warms_up_before_forecasting(tmp_path: Path) -> None:
     memory = PortfolioMemory(tmp_path / "portfolio_memory.duckdb", minimum_observations=5, maximum_observations=50)
     memory.backfill_history("SPY", [("2026-01-02", 5.0, 1.0)])
 
-    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, llm_score=0)
 
     assert forecast.ready is False
     assert forecast.predicted_edge_percent is None
@@ -249,13 +248,13 @@ def test_portfolio_memory_warms_up_before_forecasting(tmp_path: Path) -> None:
 def test_portfolio_memory_settlement_is_scoped_to_the_same_symbol(tmp_path: Path) -> None:
     db_path = tmp_path / "portfolio_memory.duckdb"
     memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
-    memory.update_and_forecast("2026-01-02", "SPY", price=100.0, dip_percent=5.0, news_score=0)
-    memory.update_and_forecast("2026-01-02", "AAPL", price=50.0, dip_percent=6.0, news_score=0)
+    memory.update_and_forecast("2026-01-02", "SPY", price=100.0, dip_percent=5.0, llm_score=0)
+    memory.update_and_forecast("2026-01-02", "AAPL", price=50.0, dip_percent=6.0, llm_score=0)
 
     # Settling SPY on a later day must never resolve AAPL's still-open row --
     # a next-session return can only ever be measured from that same symbol's
     # own later price.
-    memory.update_and_forecast("2026-01-05", "SPY", price=101.0, dip_percent=4.0, news_score=0)
+    memory.update_and_forecast("2026-01-05", "SPY", price=101.0, dip_percent=4.0, llm_score=0)
 
     with duckdb.connect(str(db_path)) as conn:
         aapl_return = conn.execute(
@@ -276,7 +275,7 @@ def test_portfolio_memory_regression_ignores_non_signal_observations(tmp_path: P
         conn.execute(
             """
             INSERT INTO observations
-                (evaluation_date, symbol, price, dip_percent, news_score,
+                (evaluation_date, symbol, price, dip_percent, llm_score,
                  next_session_return_percent, signal_present)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
@@ -284,7 +283,7 @@ def test_portfolio_memory_regression_ignores_non_signal_observations(tmp_path: P
         )
         conn.commit()
 
-    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, news_score=0)
+    forecast = memory.update_and_forecast("2026-01-10", "MSFT", price=100.0, dip_percent=5.5, llm_score=0)
 
     assert forecast.observations == 2
 
@@ -298,7 +297,7 @@ def test_portfolio_memory_records_daily_facts_for_a_non_qualifying_symbol(tmp_pa
         "AAPL",
         price=150.0,
         dip_percent=1.0,
-        news_score=2,
+        llm_score=2,
         signal_present=False,
         live_spread_percent=0.3,
         recent_avg_volume=1_000_000.0,
@@ -315,6 +314,28 @@ def test_portfolio_memory_records_daily_facts_for_a_non_qualifying_symbol(tmp_pa
         ).fetchone()
 
     assert row == pytest.approx((0, 0.3, 1_000_000.0, 0.8, 0.6, 1.2))
+
+
+def test_strategy_memory_uses_the_llm_score_as_its_only_news_feature() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeMemory:
+        def update_many_and_forecast(self, evaluation_date, inputs):
+            captured["scores"] = [item.llm_score for item in inputs]
+            return {}
+
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {"portfolio_memory_enabled": True}
+    strategy.get_datetime = lambda: datetime(2026, 7, 21, tzinfo=timezone.utc)
+    strategy._portfolio_memory = lambda: FakeMemory()
+    signals = [
+        {"symbol": "SPY", "price": 100.0, "dip": 5.0, "qualifies": True},
+        {"symbol": "QQQ", "price": 200.0, "dip": 6.0, "qualifies": True},
+    ]
+
+    strategy._update_portfolio_memories(signals, llm_score=4)
+
+    assert captured["scores"] == [4, 4]
 
 
 def test_portfolio_memory_batches_updates_and_forecasts(tmp_path: Path) -> None:
@@ -444,28 +465,6 @@ def test_portfolio_runtime_state_migrates_legacy_json_to_duckdb(tmp_path: Path) 
     assert strategy._load_portfolio_holding_dates() == {"SPY": "2026-07-18"}
     legacy_path.unlink()
     assert strategy._load_portfolio_holding_dates() == {"SPY": "2026-07-18"}
-
-
-def test_adaptive_news_state_migrates_legacy_json_to_duckdb(tmp_path: Path) -> None:
-    legacy_path = tmp_path / "learning.json"
-    legacy_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "observations": [{"news_score": -2, "return_percent": 1.5}],
-                "pending": None,
-            }
-        ),
-        encoding="utf-8",
-    )
-    model = AdaptiveNewsModel(
-        tmp_path / "learning.duckdb", minimum_observations=2, maximum_observations=50
-    )
-
-    state = model._load_state()
-
-    assert state["observations"] == [{"news_score": -2, "return_percent": 1.5}]
-    assert (tmp_path / "learning.duckdb").exists()
 
 
 def test_crypto_runtime_state_migrates_rotation_json_to_duckdb(tmp_path: Path) -> None:
@@ -647,24 +646,6 @@ def test_only_optional_lumiwealth_api_key_warning_is_silenced() -> None:
 
     assert not noise_filter.filter(logging.makeLogRecord({"msg": "LUMIWEALTH_API_KEY not set. Not sending an update to the cloud"}))
     assert noise_filter.filter(logging.makeLogRecord({"msg": "Alpaca API authentication failed"}))
-
-
-def test_news_model_discards_stale_pending_return(tmp_path: Path) -> None:
-    model = AdaptiveNewsModel(tmp_path / "news.json", 1, 10)
-    model.update("2026-01-02", 100.0, -2)
-
-    result = model.update("2026-01-10", 120.0, 1)
-
-    assert result.observations == 0
-
-
-def test_news_model_keeps_weekend_next_session_return(tmp_path: Path) -> None:
-    model = AdaptiveNewsModel(tmp_path / "news.json", 1, 10)
-    model.update("2026-01-02", 100.0, -2)
-
-    result = model.update("2026-01-05", 102.0, 1)
-
-    assert result.observations == 1
 
 
 def test_portfolio_ignores_unmanaged_account_positions() -> None:
@@ -1089,66 +1070,34 @@ def test_due_iteration_window_skips_open_once_completed_today() -> None:
     )
 
 
-def test_unavailable_news_blocks_when_fail_closed_is_enabled() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "news_context_enabled": True,
-        "news_block_on_high_risk": True,
-        "news_fail_closed_on_unavailable": True,
-        "news_high_risk_score": -6,
-        "llm_news_enabled": False,
-        "llm_news_block_on_high_risk": False,
-        "llm_news_block_score": -6,
-        "news_learning_block_enabled": False,
-    }
-
-    reason = strategy._market_veto_reason(
-        NewsContext(available=False, risk_level="unavailable"),
-        llm_news.LLMNewsAssessment(available=False),
-        None,
-    )
-
-    assert reason == "Trade blocked: world-event risk context is unavailable"
-
-
 def test_unavailable_llm_blocks_when_llm_is_enabled() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "news_context_enabled": True,
-        "news_block_on_high_risk": True,
-        "news_fail_closed_on_unavailable": True,
-        "news_high_risk_score": -6,
-        "llm_news_enabled": True,
-        "llm_news_fail_closed_on_unavailable": True,
-        "llm_news_block_score": -6,
-        "news_learning_block_enabled": False,
-    }
-
-    reason = strategy._market_veto_reason(
-        NewsContext(available=True),
+    reason = purchase_veto_reason(
         llm_news.LLMNewsAssessment(available=False),
-        None,
+        enabled=True,
+        fail_closed_on_unavailable=True,
+        block_score=-6,
     )
 
     assert reason == "Trade blocked: LLM news assessment is unavailable"
 
 
-def test_high_risk_llm_score_blocks_when_llm_is_enabled() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "news_context_enabled": True,
-        "news_block_on_high_risk": False,
-        "news_high_risk_score": -6,
-        "llm_news_enabled": True,
-        "llm_news_fail_closed_on_unavailable": True,
-        "llm_news_block_score": -6,
-        "news_learning_block_enabled": False,
-    }
+def test_disabled_llm_never_blocks_on_missing_assessment() -> None:
+    reason = purchase_veto_reason(
+        llm_news.LLMNewsAssessment(available=False),
+        enabled=False,
+        fail_closed_on_unavailable=True,
+        block_score=-6,
+    )
 
-    reason = strategy._market_veto_reason(
-        NewsContext(available=True),
+    assert reason is None
+
+
+def test_high_risk_llm_score_blocks_when_llm_is_enabled() -> None:
+    reason = purchase_veto_reason(
         llm_news.LLMNewsAssessment(available=True, score=-7),
-        None,
+        enabled=True,
+        fail_closed_on_unavailable=True,
+        block_score=-6,
     )
 
     assert reason == "Trade blocked: LLM news assessment score -7"
@@ -1210,27 +1159,12 @@ def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
     assert conservative < risky < 3.0
 
 
-def test_conservative_posture_discounts_bad_news_harder_than_risky() -> None:
-    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
-
-    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -8)
-    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", -8)
-
-    assert conservative < risky < 2.0
-
-
 def test_llm_assessment_is_a_signed_bounded_purchase_signal() -> None:
     signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    negative = AssetRotationStrategy._posture_adjusted_edge(
-        signal, "conservative", None, -5
-    )
-    neutral = AssetRotationStrategy._posture_adjusted_edge(
-        signal, "conservative", None, 0
-    )
-    positive = AssetRotationStrategy._posture_adjusted_edge(
-        signal, "conservative", None, 5
-    )
+    negative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -5)
+    neutral = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", 0)
+    positive = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", 5)
 
     assert negative < neutral == 2.0 < positive
     assert positive <= 2.0 + AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
@@ -2365,27 +2299,6 @@ def test_discovery_analysis_runs_all_negative_symbols_before_trading() -> None:
     )
 
 
-def test_market_llm_assessment_is_synchronous_even_with_legacy_advisory_setting() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "llm_news_enabled": True,
-        "llm_news_block_on_high_risk": False,
-    }
-    expected = llm_news.LLMNewsAssessment(available=True, score=-1, risk_level="elevated")
-    strategy._get_llm_news_assessment = lambda *args, **kwargs: expected
-    context = NewsContext(
-        available=True,
-        articles=[{"headline": "Market update", "summary": "", "symbols": []}],
-        per_article=[{"headline": "Market update", "summary": "", "symbols": []}],
-    )
-
-    assessment = strategy._llm_assessment_for_iteration(
-        context, ["SPY"], set(), {"SPY": -1}
-    )
-
-    assert assessment is expected
-
-
 def test_trading_iteration_starts_only_exit_narratives_after_reporting() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {"dip_threshold_percent": 5.0}
@@ -2531,9 +2444,6 @@ def test_portfolio_orchestrator_completes_a_no_signal_broker_cycle() -> None:
         "asset_a": "SPY",
         "asset_b": "QQQ",
         "llm_news_enabled": False,
-        "llm_news_block_on_high_risk": False,
-        "news_block_on_high_risk": False,
-        "news_learning_block_enabled": False,
     }
     strategy.vars = SimpleNamespace(
         portfolio_pending_rotation={},
@@ -2961,18 +2871,6 @@ def test_trade_memory_with_calendar_day_predicate_settles_across_a_weekend(
             "SELECT relative_return_percent FROM observations WHERE evaluation_date = '2026-07-17'"
         ).fetchone()[0]
     assert settled == 10.0
-
-
-def test_adaptive_news_model_does_not_learn_from_a_multisession_gap(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "news.json"
-    model = AdaptiveNewsModel(state_path, minimum_observations=1, maximum_observations=50)
-    model.update("2026-07-13", 100.0, -1)
-    model.update("2026-07-16", 110.0, -1)
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["observations"] == []
 
 
 def test_article_context_cache_is_scoped_to_the_watchlist(

@@ -42,7 +42,6 @@ fi
 
 if [[ ! -f "${PROJECT_DIR}/main.py" || ! -f "${PROJECT_DIR}/strategy.py" || \
       ! -f "${PROJECT_DIR}/main_crypto.py" || ! -f "${PROJECT_DIR}/crypto_strategy.py" || \
-      ! -f "${PROJECT_DIR}/adaptive_news_model.py" || \
       ! -f "${PROJECT_DIR}/news_context.py" || ! -f "${PROJECT_DIR}/config.json" || \
       ! -f "${PROJECT_DIR}/requirements.lock" ]]; then
     echo "Required project files are missing from ${PROJECT_DIR}." >&2

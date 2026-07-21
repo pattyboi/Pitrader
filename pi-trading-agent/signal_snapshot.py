@@ -77,7 +77,7 @@ def write_snapshot(
     try:
         target = Path(path)
         # Atomic write (temp file + replace), matching this codebase's other
-        # state files (e.g. adaptive_news_model.py) -- scripts/web_dashboard.py
+        # state files -- scripts/web_dashboard.py
         # polls this file continuously, and a truncate-then-write left
         # half-written by a mid-write process kill (a real risk on a Pi) would
         # otherwise show as a momentary "no data" instead of the last good read.

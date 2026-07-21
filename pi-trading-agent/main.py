@@ -217,14 +217,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "NEWS_CONTEXT_ENABLED",
         "NEWS_LOOKBACK_HOURS",
         "NEWS_MAX_ARTICLES",
-        "NEWS_BLOCK_ON_HIGH_RISK",
         "NEWS_HIGH_RISK_SCORE",
-        "NEWS_LEARNING_ENABLED",
-        "NEWS_LEARNING_BLOCK_ENABLED",
-        "NEWS_LEARNING_MIN_OBSERVATIONS",
-        "NEWS_LEARNING_MAX_OBSERVATIONS",
-        "NEWS_LEARNING_MIN_CORRELATION",
-        "NEWS_PREDICTED_RETURN_BLOCK_PERCENT",
         "LLM_NEWS_ENABLED",
         "LLM_NEWS_MODEL",
         "LLM_NEWS_BASE_URL",
@@ -532,13 +525,7 @@ def load_config(path: Path) -> dict[str, Any]:
                 + ", ".join(invalid_email_fields)
             )
 
-    config.setdefault("NEWS_FAIL_CLOSED_ON_UNAVAILABLE", True)
-    _require_booleans(
-        config,
-        "NEWS_CONTEXT_ENABLED",
-        "NEWS_BLOCK_ON_HIGH_RISK",
-        "NEWS_FAIL_CLOSED_ON_UNAVAILABLE",
-    )
+    _require_booleans(config, "NEWS_CONTEXT_ENABLED")
     news_lookback = int(config["NEWS_LOOKBACK_HOURS"])
     news_limit = int(config["NEWS_MAX_ARTICLES"])
     news_block_score = int(config["NEWS_HIGH_RISK_SCORE"])
@@ -546,23 +533,6 @@ def load_config(path: Path) -> dict[str, Any]:
     _require_range("NEWS_MAX_ARTICLES", news_limit, 1, 50)
     if news_block_score >= 0:
         raise ValueError("NEWS_HIGH_RISK_SCORE must be a negative integer")
-    _require_booleans(
-        config, "NEWS_LEARNING_ENABLED", "NEWS_LEARNING_BLOCK_ENABLED"
-    )
-    learning_minimum = int(config["NEWS_LEARNING_MIN_OBSERVATIONS"])
-    learning_maximum = int(config["NEWS_LEARNING_MAX_OBSERVATIONS"])
-    predicted_return_block = float(config["NEWS_PREDICTED_RETURN_BLOCK_PERCENT"])
-    minimum_correlation = float(config["NEWS_LEARNING_MIN_CORRELATION"])
-    _require_range("NEWS_LEARNING_MIN_OBSERVATIONS", learning_minimum, 10, 500)
-    _require_range(
-        "NEWS_LEARNING_MAX_OBSERVATIONS", learning_maximum, learning_minimum, 1000
-    )
-    _require_range(
-        "NEWS_PREDICTED_RETURN_BLOCK_PERCENT", predicted_return_block, -25, 0,
-        maximum_inclusive=False,
-    )
-    _require_range("NEWS_LEARNING_MIN_CORRELATION", minimum_correlation, 0, 1)
-
     config.setdefault("LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE", True)
     _require_booleans(
         config,
@@ -589,10 +559,6 @@ def load_config(path: Path) -> dict[str, Any]:
     config["NEWS_LOOKBACK_HOURS"] = news_lookback
     config["NEWS_MAX_ARTICLES"] = news_limit
     config["NEWS_HIGH_RISK_SCORE"] = news_block_score
-    config["NEWS_LEARNING_MIN_OBSERVATIONS"] = learning_minimum
-    config["NEWS_LEARNING_MAX_OBSERVATIONS"] = learning_maximum
-    config["NEWS_PREDICTED_RETURN_BLOCK_PERCENT"] = predicted_return_block
-    config["NEWS_LEARNING_MIN_CORRELATION"] = minimum_correlation
     decision_defaults = {
         "DECISION_MEMORY_ENABLED": True,
         "DECISION_MEMORY_BLOCK_ENABLED": False,
@@ -813,29 +779,7 @@ def build_strategy(
             "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
             "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
             "news_max_articles": config["NEWS_MAX_ARTICLES"],
-            "news_block_on_high_risk": config["NEWS_BLOCK_ON_HIGH_RISK"],
-            "news_fail_closed_on_unavailable": config[
-                "NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
-            ],
             "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
-            "news_learning_enabled": config["NEWS_LEARNING_ENABLED"],
-            "news_learning_block_enabled": config[
-                "NEWS_LEARNING_BLOCK_ENABLED"
-            ],
-            "news_learning_min_observations": config[
-                "NEWS_LEARNING_MIN_OBSERVATIONS"
-            ],
-            "news_learning_max_observations": config[
-                "NEWS_LEARNING_MAX_OBSERVATIONS"
-            ],
-            "news_learning_min_correlation": config[
-                "NEWS_LEARNING_MIN_CORRELATION"
-            ],
-            "news_predicted_return_block_percent": config[
-                "NEWS_PREDICTED_RETURN_BLOCK_PERCENT"
-            ],
-            "news_learning_state_file": str(base_dir / ".news_learning_state.duckdb"),
-            "news_learning_llm_state_file": str(base_dir / ".news_learning_state_llm.duckdb"),
             "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
             "news_rss_enabled": config["NEWS_RSS_ENABLED"],
             "news_rss_feed_urls": config["NEWS_RSS_FEED_URLS"],

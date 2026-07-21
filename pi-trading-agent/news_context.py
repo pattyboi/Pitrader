@@ -117,10 +117,9 @@ class WorldEventAnalyzer:
         self.lookback_hours = lookback_hours
         self.max_articles = max_articles
         self.block_score = block_score
-        # Off by default: this changes the exact value of `score`, which
-        # feeds NEWS_HIGH_RISK_SCORE and the adaptive model's training
-        # target, so it is an explicit opt-in rather than a silent change to
-        # an existing trade-blocking guard's behavior.
+        # Off by default: this changes the displayed score and the article
+        # priority metadata supplied to the LLM, so it remains an explicit
+        # opt-in rather than a silent reporting change.
         self.refine_scoring = refine_scoring
         # Free, no-API-key supplementary headlines (rss_news.py) merged in
         # alongside Alpaca's own feed -- see analyze() below. Off by default,

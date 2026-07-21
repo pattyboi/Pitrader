@@ -23,9 +23,13 @@ import decision_math
 import email_render
 import signal_snapshot
 import trade_counter
-from adaptive_news_model import AdaptiveNewsModel, LearningResult
 from autonomous_universe import AutonomousUniverse
-from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, RedFlagCheck
+from llm_news import (
+    LLMNewsAnalyzer,
+    LLMNewsAssessment,
+    RedFlagCheck,
+    purchase_veto_reason,
+)
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
@@ -43,7 +47,6 @@ class AssetRotationStrategy(Strategy):
         "recent_high_lookback_days": 20,
         "email_report_enabled": False,
         "news_context_enabled": True,
-        "news_learning_enabled": True,
         "llm_news_enabled": False,
         "decision_memory_enabled": True,
         "decision_memory_block_enabled": False,
@@ -66,7 +69,6 @@ class AssetRotationStrategy(Strategy):
     # sites (self._posture_adjusted_edge(...), etc.) and tests are unaffected.
     _POSTURE_VARIANCE_PENALTY = decision_math.POSTURE_VARIANCE_PENALTY
     _POSTURE_CONSISTENCY_WEIGHT = decision_math.POSTURE_CONSISTENCY_WEIGHT
-    _POSTURE_NEWS_DISCOUNT_PER_POINT = decision_math.POSTURE_NEWS_DISCOUNT_PER_POINT
     _POSTURE_LLM_SCORE_WEIGHT = decision_math.POSTURE_LLM_SCORE_WEIGHT
     _POSTURE_LEARNED_EDGE_WEIGHT = decision_math.POSTURE_LEARNED_EDGE_WEIGHT
     _POSTURE_MAX_ADJUSTMENT_PERCENT = decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
@@ -669,12 +671,6 @@ class AssetRotationStrategy(Strategy):
                 f"LLM score: {report.get('llm_score', 'unavailable')}",
                 f"LLM reasoning: {report.get('llm_reasoning', 'unavailable')}",
                 nightly_learned_line,
-                f"Learning observations: {report.get('learning_observations', 'unavailable')}",
-                f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
-                f"Learning explanation: {report.get('learning_explanation', 'unavailable')}",
-                f"LLM-score learning observations: {report.get('llm_learning_observations', 'unavailable')}",
-                f"LLM-score learned return forecast: {report.get('llm_learned_forecast', 'not ready')}",
-                f"LLM-score learning explanation: {report.get('llm_learning_explanation', 'unavailable')}",
                 f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
                 f"Opportunistic Opportunity probability: {report.get('opportunistic_opportunity_probability', 'unavailable')}",
                 f"Opportunistic Opportunity evidence: {report.get('opportunistic_opportunity_explanation', 'unavailable')}",
@@ -760,21 +756,6 @@ class AssetRotationStrategy(Strategy):
         ]
 
         forecast_rows = [
-            ("Learning observations", report.get("learning_observations", "unavailable")),
-            ("Learned return forecast", report.get("learned_forecast", "not ready")),
-            ("Learning explanation", report.get("learning_explanation", "unavailable")),
-            (
-                "LLM-score learning observations",
-                report.get("llm_learning_observations", "unavailable"),
-            ),
-            (
-                "LLM-score learned return forecast",
-                report.get("llm_learned_forecast", "not ready"),
-            ),
-            (
-                "LLM-score learning explanation",
-                report.get("llm_learning_explanation", "unavailable"),
-            ),
             (
                 "Opportunistic Opportunity",
                 report.get("opportunistic_opportunity_status", "unavailable"),
@@ -871,12 +852,12 @@ class AssetRotationStrategy(Strategy):
         """Ask the local Ollama model to assess today's headlines, failing open on problems.
 
         `symbols`/`held_symbols`/`symbol_news_scores` give the model today's
-        actual evaluation universe and per-symbol coverage (the same
-        cross-checked scores ranking uses -- see `_symbol_news_scores`) so it
+        actual evaluation universe and cross-checked per-symbol coverage (see
+        `_symbol_news_scores`) so it
         can reason about risk to the symbols this agent might actually trade
         today, not just generic market headlines. The score it returns is
-        still aggregate market risk (the only thing `_market_veto_reason`
-        consumes); this only makes that judgment better-informed.
+        remains one aggregate opinion; the symbol context makes that judgment
+        better-informed without adding a competing per-symbol decision rule.
         """
         if not bool(self.parameters.get("llm_news_enabled", False)):
             return LLMNewsAssessment(
@@ -924,106 +905,12 @@ class AssetRotationStrategy(Strategy):
                 ),
             )
 
-    def _llm_assessment_for_iteration(
-        self,
-        news_context: NewsContext,
-        symbols: list[str],
-        held_symbols: set[str],
-        symbol_news_scores: dict[str, int],
-    ) -> LLMNewsAssessment:
-        """Return the current iteration's assessment before any order decision."""
-        return self._get_llm_news_assessment(
-            news_context, symbols, held_symbols, symbol_news_scores
-        )
-
-    def _update_news_learning(
-        self,
-        price_b: float,
-        state_file_key: str,
-        news_score: int | None,
-        log_prefix: str = "",
-    ) -> LearningResult:
-        """Shared body for _update_adaptive_learning/_update_llm_adaptive_learning:
-        persist one day's (price, news_score) observation to the named state
-        file and return its explainable forecast."""
-        if not bool(self.parameters.get("news_learning_enabled", True)):
-            return LearningResult(
-                observations=0,
-                ready=False,
-                predicted_return_percent=None,
-                slope=None,
-                correlation=None,
-                explanation="Adaptive news learning is disabled in config.json.",
-            )
-        try:
-            model = AdaptiveNewsModel(
-                state_path=Path(str(self.parameters[state_file_key])),
-                minimum_observations=int(
-                    self.parameters["news_learning_min_observations"]
-                ),
-                maximum_observations=int(
-                    self.parameters["news_learning_max_observations"]
-                ),
-            )
-            result = model.update(
-                evaluation_date=self.get_datetime().date().isoformat(),
-                current_price=price_b,
-                news_score=news_score,
-            )
-            self.log_message(f"{log_prefix}{result.explanation}", color="blue")
-            return result
-        except Exception as exc:
-            self.log_message(
-                f"{log_prefix}Adaptive news learning failed safely: {type(exc).__name__}: {exc}",
-                color="red",
-            )
-            return LearningResult(
-                0,
-                False,
-                None,
-                None,
-                None,
-                f"Learning update failed: {type(exc).__name__}: {exc}",
-            )
-
-    def _update_adaptive_learning(
-        self,
-        price_b: float,
-        news_context: NewsContext,
-    ) -> LearningResult:
-        """Update the persistent model and return its explainable forecast."""
-        return self._update_news_learning(
-            price_b,
-            "news_learning_state_file",
-            news_context.score if news_context.available else None,
-        )
-
-    def _update_llm_adaptive_learning(
-        self,
-        price_b: float,
-        llm_assessment: LLMNewsAssessment,
-    ) -> LearningResult:
-        """Same regression as _update_adaptive_learning, trained on the LLM
-        score instead of the deterministic keyword score, in its own state
-        file. The two scores can diverge on the same day's news (a keyword
-        scorer only matches a fixed phrase list; the LLM reads the full
-        headline set) -- training both against realized next-session returns
-        is how that disagreement gets resolved with evidence instead of by
-        assumption. Purely observational for now: this forecast is reported
-        alongside the keyword one but does not feed _market_veto_reason."""
-        return self._update_news_learning(
-            price_b,
-            "news_learning_llm_state_file",
-            llm_assessment.score if llm_assessment.available else None,
-            log_prefix="LLM-score ",
-        )
-
     def _update_decision_memory(
         self,
         price_a: float,
         price_b: float,
         dip_percent: float,
-        news_context: NewsContext,
+        llm_score: int | None,
     ) -> RotationForecast:
         """Learn whether comparable past rotations favored B over A."""
         if not bool(self.parameters.get("decision_memory_enabled", True)):
@@ -1041,7 +928,7 @@ class AssetRotationStrategy(Strategy):
                 price_a=price_a,
                 price_b=price_b,
                 dip_percent=dip_percent,
-                news_score=news_context.score if news_context.available else None,
+                llm_score=llm_score,
                 signal_present=dip_percent >= float(self.parameters["dip_threshold_percent"]),
             )
             self.log_message(result.explanation, color="blue")
@@ -1065,7 +952,7 @@ class AssetRotationStrategy(Strategy):
         asset_b: str,
         price_a: float | None,
         price_b: float | None,
-        news_context: NewsContext,
+        llm_score: int | None,
     ) -> dict[str, float | int | str | None]:
         """Evaluate the A/B rotation as a portfolio-only, data-backed option."""
         unavailable: dict[str, float | int | str | None] = {
@@ -1084,7 +971,7 @@ class AssetRotationStrategy(Strategy):
         recent_high = max(highs)
         dip = ((recent_high - float(price_b)) / recent_high) * 100.0
         self._backfill_decision_memory(asset_a, asset_b)
-        forecast = self._update_decision_memory(float(price_a), float(price_b), dip, news_context)
+        forecast = self._update_decision_memory(float(price_a), float(price_b), dip, llm_score)
         try:
             probability = self._decision_memory(1, 1).opportunity_probability()
         except Exception as exc:
@@ -1211,8 +1098,7 @@ class AssetRotationStrategy(Strategy):
     def _update_portfolio_memories(
         self,
         signals: list[dict[str, Any]],
-        symbol_news_scores: dict[str, int],
-        market_wide_news_score: int | None,
+        llm_score: int | None,
     ) -> dict[str, RotationForecast]:
         """Record and forecast every evaluated symbol with one pooled fit."""
         if not signals:
@@ -1227,9 +1113,7 @@ class AssetRotationStrategy(Strategy):
                 symbol=str(signal["symbol"]),
                 price=float(signal["price"]),
                 dip_percent=float(signal["dip"]),
-                news_score=symbol_news_scores.get(
-                    str(signal["symbol"]), market_wide_news_score
-                ),
+                llm_score=llm_score,
                 signal_present=bool(signal.get("qualifies")),
                 live_spread_percent=signal.get("live_spread_percent"),
                 recent_avg_volume=signal.get("recent_avg_volume"),
@@ -1252,58 +1136,6 @@ class AssetRotationStrategy(Strategy):
                 0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
             )
             return {item.symbol: failed for item in inputs}
-
-    def _update_portfolio_memory(
-        self,
-        symbol: str,
-        price: float,
-        dip_percent: float,
-        news_score: int | None,
-        signal_present: bool,
-        live_spread_percent: float | None = None,
-        recent_avg_volume: float | None = None,
-        historical_expected_profit: float | None = None,
-        historical_win_probability: float | None = None,
-        historical_return_stdev: float | None = None,
-    ) -> RotationForecast:
-        """Record today's context for one symbol and forecast its next-session return.
-
-        Called once per *evaluated* symbol per day -- not just one clearing
-        today's dip threshold -- pooling every symbol's history into one
-        model; see PortfolioMemory for why a pooled fit (rather than one
-        model per symbol) is what lets many symbols a day actually accelerate
-        warm-up. `signal_present` keeps the forecast itself trained only on
-        decision-specific dip days, exactly like trade_memory.py's own
-        signal_present column, even though every symbol's daily context is
-        now durably recorded regardless.
-        """
-        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
-            return RotationForecast(
-                0, False, None, None, "Portfolio memory is disabled in config.json."
-            )
-        try:
-            result = self._portfolio_memory().update_and_forecast(
-                evaluation_date=self.get_datetime().date().isoformat(),
-                symbol=symbol,
-                price=price,
-                dip_percent=dip_percent,
-                news_score=news_score,
-                signal_present=signal_present,
-                live_spread_percent=live_spread_percent,
-                recent_avg_volume=recent_avg_volume,
-                historical_expected_profit=historical_expected_profit,
-                historical_win_probability=historical_win_probability,
-                historical_return_stdev=historical_return_stdev,
-            )
-            return result
-        except Exception as exc:
-            self.log_message(
-                f"Portfolio memory update failed safely for {symbol}: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
-            return RotationForecast(
-                0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
-            )
 
     def _backfill_portfolio_memory(
         self,
@@ -1461,62 +1293,6 @@ class AssetRotationStrategy(Strategy):
                     except (TypeError, ValueError):
                         pass
         return held, entry_prices
-
-    def _market_veto_reason(
-        self,
-        news_context: NewsContext,
-        llm_assessment: LLMNewsAssessment,
-        learning_result: LearningResult | None,
-    ) -> str | None:
-        """Return the first market-level veto that blocks opening a trade.
-
-        Used by the portfolio path so it honors the same configured guards as
-        the A/B path. Completing an in-flight rotation is never vetoed.
-        """
-        news_blocking_enabled = bool(
-            self.parameters.get("news_context_enabled", True)
-        ) and bool(self.parameters["news_block_on_high_risk"])
-        if (
-            news_blocking_enabled
-            and bool(self.parameters.get("news_fail_closed_on_unavailable", True))
-            and not news_context.available
-        ):
-            return "Trade blocked: world-event risk context is unavailable"
-        if (
-            news_context.available
-            and news_blocking_enabled
-            and news_context.score <= int(self.parameters["news_high_risk_score"])
-        ):
-            return f"Trade blocked: high world-event risk score {news_context.score}"
-        llm_blocking_enabled = bool(self.parameters.get("llm_news_enabled", False))
-        if (
-            llm_blocking_enabled
-            and bool(self.parameters.get("llm_news_fail_closed_on_unavailable", True))
-            and not llm_assessment.available
-        ):
-            return "Trade blocked: LLM news assessment is unavailable"
-        if (
-            llm_assessment.available
-            and llm_blocking_enabled
-            and llm_assessment.score <= int(self.parameters["llm_news_block_score"])
-        ):
-            return f"Trade blocked: LLM news assessment score {llm_assessment.score:+d}"
-        if (
-            learning_result is not None
-            and bool(self.parameters["news_learning_block_enabled"])
-            and learning_result.ready
-            and learning_result.predicted_return_percent is not None
-            and learning_result.correlation is not None
-            and abs(learning_result.correlation)
-            >= float(self.parameters["news_learning_min_correlation"])
-            and learning_result.predicted_return_percent
-            <= float(self.parameters["news_predicted_return_block_percent"])
-        ):
-            return (
-                "Trade blocked: adaptive model forecast "
-                f"{learning_result.predicted_return_percent:+.2f}%"
-            )
-        return None
 
     _ACCOUNT_VALUE_CACHE_SECONDS = 30.0
 
@@ -2035,7 +1811,6 @@ class AssetRotationStrategy(Strategy):
                 f"(score {report.get('news_score', 'unavailable')})",
                 f"LLM risk assessment: {report.get('llm_risk_level', 'unavailable')} "
                 f"- {report.get('llm_reasoning', '')}",
-                f"Learned return forecast: {report.get('learned_forecast', 'not ready')}",
                 f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
                 "Actions taken this iteration:",
                 *[f"- {action}" for action in actions],
@@ -2759,13 +2534,11 @@ class AssetRotationStrategy(Strategy):
             news_explanation=news_context.explanation,
             news_headlines=news_context.headlines,
         )
-        # Computed once here and reused by the ranking step below (symbol_news_scores
-        # at its original call site) so the LLM sees exactly the same cross-checked,
-        # deduped per-symbol coverage that ranking trusts, not the rawer
-        # NewsContext.per_symbol_scores, and so the pipeline doesn't scan for
-        # untagged symbol mentions twice in one iteration.
+        # Deterministic scoring remains preprocessing only: it attributes and
+        # prioritizes articles for the LLM, but no longer casts a second vote
+        # in ranking, learned forecasts, or purchase vetoes.
         symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
-        llm_assessment = self._llm_assessment_for_iteration(
+        llm_assessment = self._get_llm_news_assessment(
             news_context, symbols, set(held), symbol_news_scores
         )
         report.update(
@@ -2795,40 +2568,15 @@ class AssetRotationStrategy(Strategy):
         if excluded_symbols:
             symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
 
-        # The adaptive model keeps learning from the configured market proxy
-        # (Asset B) so its forecast can veto portfolio trades exactly as it
-        # vetoes A/B rotations. A missing proxy price fails open.
-        learning_result: LearningResult | None = None
         proxy_price = self.get_last_price(str(self.parameters["asset_b"]).upper())
-        if proxy_price is not None and math.isfinite(float(proxy_price)) and float(proxy_price) > 0:
-            learning_result = self._update_adaptive_learning(float(proxy_price), news_context)
-            report.update(
-                learning_observations=learning_result.observations,
-                learned_forecast=(
-                    f"{learning_result.predicted_return_percent:+.2f}%"
-                    if learning_result.ready
-                    and learning_result.predicted_return_percent is not None
-                    else "not ready"
-                ),
-                learning_explanation=learning_result.explanation,
-            )
-            # Same regression, trained on the LLM's score instead, so the two
-            # signals' predictive value can be compared once both have
-            # enough history -- see _update_llm_adaptive_learning.
-            llm_learning_result = self._update_llm_adaptive_learning(
-                float(proxy_price), llm_assessment
-            )
-            report.update(
-                llm_learning_observations=llm_learning_result.observations,
-                llm_learned_forecast=(
-                    f"{llm_learning_result.predicted_return_percent:+.2f}%"
-                    if llm_learning_result.ready
-                    and llm_learning_result.predicted_return_percent is not None
-                    else "not ready"
-                ),
-                llm_learning_explanation=llm_learning_result.explanation,
-            )
-        veto_reason = self._market_veto_reason(news_context, llm_assessment, learning_result)
+        veto_reason = purchase_veto_reason(
+            llm_assessment,
+            enabled=bool(self.parameters.get("llm_news_enabled", False)),
+            fail_closed_on_unavailable=bool(
+                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
+            ),
+            block_score=int(self.parameters.get("llm_news_block_score", -6)),
+        )
 
         # A/B is no longer an alternate strategy mode. It is a separately
         # labelled opportunity inside portfolio mode, trained only on the
@@ -2842,7 +2590,11 @@ class AssetRotationStrategy(Strategy):
         # the opportunity is eligible, instead of a second read.
         asset_a_price = self.get_last_price(asset_a)
         opportunity = self._opportunistic_opportunity(
-            asset_a, asset_b, asset_a_price, proxy_price, news_context
+            asset_a,
+            asset_b,
+            asset_a_price,
+            proxy_price,
+            llm_assessment.score if llm_assessment.available else None,
         )
         probability = opportunity.get("probability")
         report.update(
@@ -2903,7 +2655,6 @@ class AssetRotationStrategy(Strategy):
         # tie-breaking below; the eligibility floor two lines down still
         # gates on the raw historical expected_profit, unaffected by posture.
         risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
-        market_wide_news_score = news_context.score if news_context.available else None
         llm_purchase_score = llm_assessment.score if llm_assessment.available else None
         pending_backfill = {
             str(signal["symbol"]): signal.get("_memory_history", [])
@@ -2924,15 +2675,9 @@ class AssetRotationStrategy(Strategy):
                     f"Portfolio-memory batch backfill failed safely: {type(exc).__name__}: {exc}",
                     color="yellow",
                 )
-        forecasts = self._update_portfolio_memories(
-            signals, symbol_news_scores, market_wide_news_score
-        )
+        forecasts = self._update_portfolio_memories(signals, llm_purchase_score)
         for signal in signals:
             symbol = str(signal["symbol"])
-            # A symbol with dedicated coverage today (even a genuinely
-            # neutral 0) is trusted over the market-wide score; only a
-            # symbol with no coverage at all falls back to it.
-            news_score = symbol_news_scores.get(symbol, market_wide_news_score)
             qualifies = bool(signal.get("qualifies"))
             # Every symbol reaching this point has usable bars/price/liquidity
             # (see _portfolio_signal), so every one of them -- not just those
@@ -2962,7 +2707,7 @@ class AssetRotationStrategy(Strategy):
                 else None
             )
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
-                signal, risk_posture, news_score, llm_purchase_score
+                signal, risk_posture, llm_purchase_score
             )
         report["portfolio_risk_posture"] = risk_posture
         signal_snapshot.write_snapshot(

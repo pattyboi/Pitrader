@@ -37,7 +37,6 @@ understand the risks.
   - [World-event and news awareness](#world-event-and-news-awareness)
   - [Local symbol cross-reference](#local-symbol-cross-reference)
   - [LLM news assessment](#llm-news-assessment)
-  - [Adaptive news learning](#adaptive-news-learning)
   - [Decision memory: learning from its own rotations](#decision-memory-learning-from-its-own-rotations)
   - [Portfolio memory: learning across the whole watchlist](#portfolio-memory-learning-across-the-whole-watchlist)
 - [Crypto trading mode](#crypto-trading-mode)
@@ -152,9 +151,9 @@ manages only symbols explicitly listed in `PORTFOLIO_SYMBOLS` plus discovery
 symbols it previously persisted after they qualified; it never adopts or
 sells unrelated stocks in the same Alpaca account. Managed holdings always
 stay in the daily evaluation universe, so a position bought by the strategy
-can never become invisible to it. The world-event keyword guard, the
-optional LLM assessment, and the mature adaptive-news forecast can each veto
-a *new* portfolio purchase or replacement; completing an in-flight
+can never become invisible to it. The LLM assessment is the single
+news-derived opinion that can veto a *new* portfolio purchase or replacement;
+completing an in-flight
 replacement is never vetoed. This estimated historical return is not a real or
 guaranteed profit; it is a filter for paper-trading and must be validated before
 any live use.
@@ -222,7 +221,6 @@ pi-trading-agent/
 ├── config.json         Credentials, symbols, and strategy settings
 ├── requirements.txt    Python package requirements
 ├── main.py             Configuration validation and application startup
-├── adaptive_news_model.py  Persistent learning from news and later returns
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
 ├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
 ├── runtime_state.py    Transactional DuckDB store for restart-critical process state
@@ -254,10 +252,7 @@ The installer later creates `.venv/`, which contains an isolated Python
 environment. Do not edit that directory. Restart-critical equity state,
 including the most recently sent report date, holding dates, pending rotations,
 iteration windows, and nightly pre-evaluation results, is stored transactionally
-in `.runtime_state.duckdb`. The adaptive models create
-`.news_learning_state.duckdb` and `.news_learning_state_llm.duckdb` to preserve
-their observations.
-Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
+in `.runtime_state.duckdb`. Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances). Portfolio
 memory keeps its own DuckDB database, `.portfolio_memory.duckdb`, of every
 evaluated symbol's daily context and settled next-session returns (see
@@ -354,15 +349,7 @@ The initial file is:
   "NEWS_CONTEXT_ENABLED": true,
   "NEWS_LOOKBACK_HOURS": 24,
   "NEWS_MAX_ARTICLES": 50,
-  "NEWS_BLOCK_ON_HIGH_RISK": true,
-  "NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
   "NEWS_HIGH_RISK_SCORE": -6,
-  "NEWS_LEARNING_ENABLED": true,
-  "NEWS_LEARNING_BLOCK_ENABLED": true,
-  "NEWS_LEARNING_MIN_OBSERVATIONS": 20,
-  "NEWS_LEARNING_MAX_OBSERVATIONS": 120,
-  "NEWS_LEARNING_MIN_CORRELATION": 0.15,
-  "NEWS_PREDICTED_RETURN_BLOCK_PERCENT": -1.0,
   "DECISION_MEMORY_ENABLED": true,
   "DECISION_MEMORY_BLOCK_ENABLED": false,
   "DECISION_MEMORY_MIN_OBSERVATIONS": 40,
@@ -436,7 +423,7 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
-| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news harder); `risky` favors raw historical edge. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
+| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency; `risky` gives the LLM opinion and learned edge more ranking weight. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -448,19 +435,11 @@ source owner-readable only; never place secrets in command-line arguments.
 | `NEWS_CONTEXT_ENABLED` | Fetches and scores recent Alpaca news | `true` |
 | `NEWS_LOOKBACK_HOURS` | Age window for news articles | `24` |
 | `NEWS_MAX_ARTICLES` | Maximum articles checked daily | `50` |
-| `NEWS_BLOCK_ON_HIGH_RISK` | Allows severe news context to block a rotation | `true` |
-| `NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | Blocks opening trades when enabled news protection cannot obtain evidence | `true` |
-| `NEWS_HIGH_RISK_SCORE` | Score at or below which a trade is blocked | `-6` |
-| `NEWS_LEARNING_ENABLED` | Learns news-score/next-return relationships | `true` |
-| `NEWS_LEARNING_BLOCK_ENABLED` | Allows a mature learned forecast to block rotation | `true` |
-| `NEWS_LEARNING_MIN_OBSERVATIONS` | Samples required before forecasts affect decisions | `20` |
-| `NEWS_LEARNING_MAX_OBSERVATIONS` | Rolling history retained by the model | `120` |
-| `NEWS_LEARNING_MIN_CORRELATION` | Minimum relationship strength for a learned veto | `0.15` |
-| `NEWS_PREDICTED_RETURN_BLOCK_PERCENT` | Forecast at or below which rotation is blocked | `-1.0` |
+| `NEWS_HIGH_RISK_SCORE` | Keyword score used to label and prioritize article context for the LLM; it does not veto trades | `-6` |
 | `NEWS_SCORE_REFINEMENT_ENABLED` | Applies recency decay and duplicate-event dampening to the keyword score; changes its exact value, so off by default | `false` |
 | `NEWS_RSS_ENABLED` | Merges free, no-API-key RSS headlines into the same article set as Alpaca's | `false` |
 | `NEWS_RSS_FEED_URLS` | RSS 2.0 feed URLs to merge in when the above is `true` (max 10) | Yahoo Finance, MarketWatch, CNBC |
-| `SYMBOL_REFERENCE_ENABLED` | Cross-checks Alpaca's per-article symbol tags against a second source before trusting them for per-symbol ranking | `true` |
+| `SYMBOL_REFERENCE_ENABLED` | Cross-checks Alpaca's per-article symbol tags before passing symbol context to the LLM | `true` |
 | `SYMBOL_REFERENCE_REFRESH_DAYS` | Days between local symbol-mapping refreshes | `7` |
 | `DECISION_MEMORY_ENABLED` | Records dip decisions and their subsequent relative result | `true` |
 | `DECISION_MEMORY_BLOCK_ENABLED` | Allows mature decision memory to veto a rotation | `false` |
@@ -655,7 +634,8 @@ This is **not machine learning**, artificial general intelligence, or an
 understanding of geopolitics. It is a small, auditable rule system. It does not
 learn facts permanently, predict the truth of a story, read articles behind
 links, or understand irony and subtle context. Its useful property is that a
-novice can inspect exactly which words affected a decision.
+novice can inspect exactly which words affected article prioritization and the
+context supplied to the LLM.
 
 #### How scoring works
 
@@ -677,7 +657,6 @@ The daily log can look like:
 ```text
 World-event context: risk=high, score=-7, articles=50.
 News evidence: [-3] Example headline text (matched: invasion)
-Dip signal met, but rotation was blocked by the configured world-event risk guard.
 ```
 
 Headlines in that example are illustrative. Actual output comes from Alpaca.
@@ -721,54 +700,25 @@ In portfolio mode, Alpaca tags each article with the symbols it mentions.
 When [Local symbol cross-reference](#local-symbol-cross-reference) is
 enabled (the default), that per-symbol coverage — cross-checked against the
 local reference, and extended with a bounded company-name text scan for a
-mention Alpaca's own tagging missed — replaces the market-wide score when
-ranking candidates in `_posture_adjusted_edge`: a headline about one
-company's layoffs no longer discounts an unrelated symbol as much as it
-discounts the company it is actually about. A symbol with no dedicated
-coverage still falls back to the market-wide score exactly as before. This
-never changes the market-wide `NEWS_BLOCK_ON_HIGH_RISK` veto itself, which
-still reads the same aggregate score it always has.
+mention Alpaca's own tagging missed — is supplied to the LLM as attribution
+context. It helps the model connect a headline to the right candidate, but the
+keyword score does not independently rank or veto a purchase.
 
 Separately, `NEWS_SCORE_REFINEMENT_ENABLED` (`false` by default) applies
 recency decay — an article near the edge of `NEWS_LOOKBACK_HOURS` counts for
 less than one from minutes ago — and duplicate-event dampening — repeated
 wire-service copies of the same matched phrase count for progressively less.
-This changes the exact value of the aggregate score, which feeds
-`NEWS_HIGH_RISK_SCORE` and the adaptive model's training target, so it ships
-off by default; review several weeks of paper-trading logs with it enabled
-before trusting it the same way you would the existing threshold.
+This changes the displayed/prioritization score, so it ships off by default.
 
 #### How news changes a trade decision
 
-News does not create a buy signal by itself. The normal price-dip test still has
-to pass, and the account must still own Asset A.
-
-When all normal trading conditions pass:
-
-1. If the news score is above the high-risk threshold, rotation proceeds.
-2. If the score is at or below the threshold and
-   `NEWS_BLOCK_ON_HIGH_RISK` is `true`, the agent does not sell Asset A that day.
-3. The blocked decision, score, and matching headlines are logged and included
-   in the email report.
-4. The agent evaluates conditions again on its next scheduled iteration.
-
-If Alpaca news or the internet is unavailable, news status becomes
-`unavailable`. The error is logged and the original price strategy continues.
-This is called **fail-open** behavior. It prevents a news-provider outage from
-silently shutting down the price strategy, but it also means news protection is
-absent during that outage.
-
-#### Advisory-only mode
-
-To see news context without allowing it to block trades, use:
-
-```json
-"NEWS_CONTEXT_ENABLED": true,
-"NEWS_BLOCK_ON_HIGH_RISK": false
-```
-
-This is a sensible first paper-trading mode. Headlines, scores, and risk levels
-still appear in logs and emails, but the score cannot veto a rotation.
+News is collected and attributed first, then the LLM produces the single signed
+opinion used by decision making. Positive scores improve bounded candidate
+ranking; negative scores reduce it; scores at or below `LLM_NEWS_BLOCK_SCORE`
+block new purchases. The price-dip, historical-profit, out-of-sample, liquidity,
+cash, and position limits must still pass. When enabled, LLM unavailability is
+governed by `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE`; protective exits never depend
+on news or the LLM.
 
 To disable news fetching entirely:
 
@@ -975,123 +925,23 @@ places reuse it. None can create a buy signal, and none run unless
   so than a large hosted one.
 - If `ollama.service` is down or the model fails to load, opening trades are
   blocked when `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` is `true` (the default).
-- Scores are not comparable to the keyword score; the two guards use separate
-  thresholds and either can veto independently once enabled.
-
-### Adaptive news learning
-
-In addition to fixed headline rules, the agent now learns a simple relationship
-from its own daily observations. This is genuine statistical adaptation, but it
-is intentionally much smaller and more explainable than an AI language model.
-
-Each daily evaluation records:
-
-1. The date.
-2. That day's aggregate news score.
-3. Asset B's current price.
-
-At the next evaluation, it calculates Asset B's percentage return since the
-previous observation and pairs that return with the previous news score. After
-the configured minimum number of completed observations, it fits a stabilized
-linear regression:
-
-```text
-predicted next return = baseline return + learned sensitivity × current news score
-```
-
-The model reports its observation count, predicted next-session return,
-news-score sensitivity, and historical correlation. These values appear in the
-system log and email summary.
-
-#### Warm-up period
-
-The default minimum is 20 completed observations. Until then, logs say something
-like:
-
-```text
-Learning safely: 7/20 required completed observations collected.
-```
-
-During warm-up, the adaptive forecast cannot block a trade. At roughly one
-observation per trading day, 20 observations usually require about four market
-weeks. Restarts do not erase progress because observations are stored in
-`.news_learning_state.duckdb`.
-
-#### Learned risk veto
-
-Once mature, the adaptive model can block a rotation when its forecast is at or
-below `NEWS_PREDICTED_RETURN_BLOCK_PERCENT`. With the default `-1.0`, a predicted
-next-session Asset B return of `-1.00%` or lower blocks that day's rotation. The
-absolute historical correlation must also meet `NEWS_LEARNING_MIN_CORRELATION`;
-the default requires at least `0.15`. If news scores do not vary enough, the
-model remains non-authoritative even after collecting the minimum sample count.
-
-This veto is separate from the fixed high-risk keyword veto. Either can block a
-trade, in both A/B and portfolio mode (in portfolio mode the model keeps
-learning from Asset B as a market proxy and its veto applies to new portfolio
-purchases and replacements). To collect learning data without allowing learned
-forecasts to affect orders, temporarily use:
-
-```json
-"NEWS_LEARNING_ENABLED": true,
-"NEWS_LEARNING_BLOCK_ENABLED": false
-```
-
-To stop collection as well, set `NEWS_LEARNING_ENABLED` to `false`. Existing
-state is preserved and becomes available again if learning is re-enabled.
-
-#### A second model, trained on the LLM score
-
-When `LLM_NEWS_ENABLED` is on, the agent trains a second copy of this same
-regression against the LLM assessment's score instead of the keyword score,
-in its own database (`.news_learning_state_llm.duckdb`) so the two never mix.
-It appears in logs and the email as the "LLM-score" learned forecast,
-alongside the keyword-based one above. This second model is purely
-observational for now — it does not veto trades — so over time the two
-forecasts' actual correlation with realized returns can be compared before
-deciding whether the LLM-trained one should ever be allowed to block a
-rotation too.
-
-#### Rolling and bounded behavior
-
-- Only the newest configured number of completed observations is retained.
-- The default rolling maximum is 120 observations.
-- Single-session returns stored for training are capped to the range `-25%` to
-  `+25%` to reduce the influence of corrupt prices or extreme outliers.
-- Forecasts are capped to `-10%` through `+10%`.
-- A small ridge stabilizer prevents huge coefficients when news scores barely
-  change.
-- The model uses only information available at each daily observation; it does
-  not use future prices when producing that day's forecast.
-
-#### Learning limitations
-
-- Twenty observations is only a safety minimum, not proof of accuracy.
-- Correlation does not establish that headlines caused later returns.
-- Market relationships change, so previously learned behavior can stop working.
-- One daily Asset B price cannot measure intraday reactions or execution prices.
-- The model has only one predictor: the aggregate news score.
-- A statistically produced forecast can still be completely wrong.
-
-Keep the agent in paper mode throughout warm-up and review many mature forecasts
-before considering whether this feature is useful.
+- Keyword scores are preprocessing metadata, not a competing trading opinion.
 
 ### Decision memory: learning from its own rotations
 
-The news learner estimates Asset B's absolute return. Decision memory adds the
-question this strategy needs to answer: after a comparable dip, would owning
+Decision memory answers the strategy-specific question: after a comparable dip, would owning
 Asset B have done better than continuing to own Asset A? Because it models the
 A/B pair specifically, portfolio mode uses it only for the separately labelled
 Opportunistic Opportunity; it is not mixed into ordinary portfolio rankings.
 
 For each evaluable day, its local DuckDB database records the two prices, dip,
-available news score, signal state, and final decision. At the next market
+available LLM score, signal state, and final decision. At the next market
 evaluation it settles the earlier record using `Asset B return - Asset A
 return`. A record is only settled when the next evaluation happens within a
 few calendar days; after a longer outage the stale record is left unsettled
 rather than recording a multi-day return as if it were one session. Only prior
 dip signals train its conservative, ridge-stabilized model; the inputs are dip
-size and news score. Broker-confirmed fills are recorded separately for
+size and LLM score. Broker-confirmed fills are recorded separately for
 auditability.
 
 It is advisory by default. After at least 40 comparable settled signals, you
@@ -1110,10 +960,6 @@ next-session outcomes that were already complete. Existing dates are never
 overwritten, so restarts are safe; a transient data failure is retried on the
 next daily evaluation. Set the value to `0` to disable this request.
 
-The adaptive news learner is not backfilled: it needs the actual news score
-known on each historical date. Reusing today's score for earlier prices would
-produce misleading training data. Its daily warm-up therefore remains intact.
-
 #### Resetting learned history
 
 Normally, do not edit the learning database. To deliberately start learning
@@ -1121,13 +967,10 @@ from zero, stop the service, preserve a backup, and restart:
 
 ```bash
 sudo systemctl stop trading-agent.service
-cp .news_learning_state.duckdb .news_learning_state.duckdb.backup
-rm .news_learning_state.duckdb
+cp .trade_memory.duckdb .trade_memory.duckdb.backup
+rm .trade_memory.duckdb
 sudo systemctl start trading-agent.service
 ```
-
-Older `.news_learning_state.json` files are imported automatically the first
-time the DuckDB-backed model starts.
 
 ### Portfolio memory: learning across the whole watchlist
 
@@ -1135,14 +978,14 @@ Decision memory only ever learns from the Asset A/B pair. Portfolio memory
 answers a broader question: across *every* symbol the strategy evaluates each
 day — the static watchlist, current holdings, and anything autonomous
 discovery has surfaced — which ones have historically kept resolving well
-after a dip, once today's dip size and that symbol's own news score are
+after a dip, once today's dip size and the LLM opinion are
 accounted for?
 
 Every symbol the strategy evaluates on a given day — not just one showing a
 qualifying dip signal — adds one observation to a single local DuckDB
 database, `.portfolio_memory.duckdb`, keyed by date and symbol. Each
-observation carries at least five learned facts: today's dip percentage, that
-symbol's own news score, its live bid/ask spread, its recent average trading
+observation carries today's dip percentage, the aggregate LLM score, its live
+bid/ask spread, its recent average trading
 volume, and its historical backtest edge (expected profit, win probability,
 and return spread from prior comparable dips) — so a watched or held symbol
 that does not dip today still contributes durable context, not just the
@@ -1161,8 +1004,8 @@ Once at least `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` pooled signals are settled
 which already-qualifying candidate looks best or which current holding looks
 weakest, the same way the risky/conservative posture reasoning already does.
 It never changes eligibility — `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and the
-out-of-sample floor are untouched by it, exactly like the posture and
-per-symbol-news adjustments. A risky posture leans into this learned edge
+out-of-sample floor are untouched by it, exactly like the posture adjustment.
+A risky posture leans into this learned edge
 more; a conservative posture trusts the raw historical backtest more until
 the learned edge has proven itself.
 
@@ -1607,15 +1450,15 @@ sudo journalctl -u trading-agent.service -n 100 --no-pager
 ```
 
 The account's market-data entitlement or the news service may also affect
-availability. Trading continues using price logic while news is unavailable.
+availability. Protective exits continue; new purchases follow
+`LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` when the LLM is enabled.
 
-### News blocks too many paper trades
+### LLM blocks too many paper trades
 
 Do not tune settings based on one surprising headline. Review several weeks of
-paper logs first. For an immediate non-trading-impact test, switch to advisory
-mode by setting `NEWS_BLOCK_ON_HIGH_RISK` to `false` and restart the service.
-Avoid changing the term lists unless you understand Python and can test the
-consequences.
+paper logs first. Adjust `LLM_NEWS_BLOCK_SCORE` only after reviewing the model's
+scores and reasoning alongside subsequent outcomes. Keyword term lists affect
+article prioritization and reporting, not the purchase decision itself.
 
 ### The Pi rebooted or lost power
 
@@ -1700,7 +1543,8 @@ Even an automated service needs supervision. A sensible routine is to:
 
 - Check service health and Alpaca activity each trading day.
 - Review all filled, rejected, and canceled orders.
-- Compare news scores with the underlying headlines and note false matches.
+- Compare LLM scores and reasoning with the underlying headlines; keyword
+  scores help explain article prioritization but do not decide trades.
 - Check disk usage and system updates regularly.
 - Confirm system time remains synchronized.
 - Test reboot recovery periodically while still in paper mode.

@@ -85,6 +85,24 @@ class LLMNewsAssessment:
     explanation: str = "LLM news assessment was not evaluated."
 
 
+def purchase_veto_reason(
+    assessment: LLMNewsAssessment,
+    *,
+    enabled: bool,
+    fail_closed_on_unavailable: bool,
+    block_score: int,
+    label: str = "Trade",
+) -> str | None:
+    """Apply the one shared LLM guard used by equity and crypto purchases."""
+    if not enabled:
+        return None
+    if fail_closed_on_unavailable and not assessment.available:
+        return f"{label} blocked: LLM news assessment is unavailable"
+    if assessment.available and assessment.score <= block_score:
+        return f"{label} blocked: LLM news assessment score {assessment.score:+d}"
+    return None
+
+
 @dataclass
 class RedFlagCheck:
     """Whether a discovery candidate's own coverage suggests a severe,
@@ -410,7 +428,7 @@ class LLMNewsAnalyzer:
         # pipeline's score thresholds (e.g. "normal" at a negative score)
         # would otherwise pass validation silently and mislead anyone
         # skimming the daily report/log line, even though it never affects
-        # trade-blocking (_market_veto_reason only checks score).
+        # trade-blocking (purchase_veto_reason only checks score).
         risk_level = cls._risk_level_for_score(score, block_score)
         reasoning = str(data.get("reasoning", "")).strip()
         return LLMNewsAssessment(

@@ -96,8 +96,6 @@ def build_crypto_strategy(
             "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
             "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
             "news_max_articles": config["NEWS_MAX_ARTICLES"],
-            "news_block_on_high_risk": config["NEWS_BLOCK_ON_HIGH_RISK"],
-            "news_fail_closed_on_unavailable": config["NEWS_FAIL_CLOSED_ON_UNAVAILABLE"],
             "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
             "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
             "llm_news_enabled": config["LLM_NEWS_ENABLED"],

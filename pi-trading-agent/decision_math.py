@@ -19,7 +19,6 @@ import numpy as np
 # candidate looks best and which holding looks weakest.
 POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
 POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
-POSTURE_NEWS_DISCOUNT_PER_POINT = {"conservative": 0.15, "risky": 0.05}
 # The LLM score is a signed purchase signal: constructive assessments improve
 # ranking, while negative assessments reduce it.  The deliberately small
 # weights and the shared clamp below keep it subordinate to the measured
@@ -109,17 +108,15 @@ def historical_dips(
 def posture_adjusted_edge(
     signal: dict[str, float | int | str | None],
     posture: str,
-    news_score: float | int | None,
     llm_score: float | int | None = None,
 ) -> float:
     """Reshape a symbol's historical edge through a risky or conservative lens.
 
-    Conservative leans on consistency: it penalizes return variance and a
-    negative news day harder. A signed LLM assessment contributes a bounded
-    purchase signal: positive scores improve ranking and negative scores
-    reduce it. This never changes the expected-profit eligibility threshold
-    itself; it only reweights which already-qualifying candidate looks best
-    and which current holding looks weakest.
+    Conservative leans on consistency. A signed LLM assessment contributes a
+    bounded purchase signal: positive scores improve ranking and negative
+    scores reduce it. This never changes the expected-profit eligibility
+    threshold itself; it only reweights which already-qualifying candidate
+    looks best and which current holding looks weakest.
     """
     posture = posture if posture in ("conservative", "risky") else "conservative"
     expected_profit = float(signal["expected_profit"])
@@ -127,9 +124,6 @@ def posture_adjusted_edge(
     win_probability = float(signal.get("win_probability") or 0.5)
     adjustment = -POSTURE_VARIANCE_PENALTY[posture] * stdev
     adjustment += (win_probability - 0.5) * 2.0 * POSTURE_CONSISTENCY_WEIGHT[posture]
-    if news_score is not None:
-        capped_score = max(-10.0, min(10.0, float(news_score)))
-        adjustment -= max(0.0, -capped_score) * POSTURE_NEWS_DISCOUNT_PER_POINT[posture]
     if llm_score is not None:
         capped_llm_score = max(-10.0, min(10.0, float(llm_score)))
         adjustment += capped_llm_score * POSTURE_LLM_SCORE_WEIGHT[posture]

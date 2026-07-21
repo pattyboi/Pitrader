@@ -43,7 +43,7 @@ import signal_snapshot
 import trade_counter
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
-from llm_news import LLMNewsAnalyzer, LLMNewsAssessment
+from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, purchase_veto_reason
 from news_context import NewsContext, WorldEventAnalyzer
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
@@ -108,8 +108,6 @@ class CryptoRotationStrategy(Strategy):
         "news_context_enabled": True,
         "news_lookback_hours": 24,
         "news_max_articles": 50,
-        "news_block_on_high_risk": True,
-        "news_fail_closed_on_unavailable": True,
         "news_high_risk_score": -6,
         "news_score_refinement_enabled": False,
         "llm_news_enabled": False,
@@ -906,42 +904,8 @@ class CryptoRotationStrategy(Strategy):
         )
         return context, assessment, symbol_scores
 
-    def _crypto_market_veto_reason(
-        self, context: NewsContext, assessment: LLMNewsAssessment
-    ) -> str | None:
-        """Block new crypto purchases on configured news/LLM safety guards."""
-        news_blocking = bool(self.parameters.get("news_context_enabled", True)) and bool(
-            self.parameters.get("news_block_on_high_risk", True)
-        )
-        if (
-            news_blocking
-            and bool(self.parameters.get("news_fail_closed_on_unavailable", True))
-            and not context.available
-        ):
-            return "Crypto purchase blocked: news context is unavailable"
-        if (
-            news_blocking
-            and context.available
-            and context.score <= int(self.parameters.get("news_high_risk_score", -6))
-        ):
-            return f"Crypto purchase blocked: high news risk score {context.score:+d}"
-        llm_blocking = bool(self.parameters.get("llm_news_enabled", False))
-        if (
-            llm_blocking
-            and bool(self.parameters.get("llm_news_fail_closed_on_unavailable", True))
-            and not assessment.available
-        ):
-            return "Crypto purchase blocked: LLM news assessment is unavailable"
-        if (
-            llm_blocking
-            and assessment.available
-            and assessment.score <= int(self.parameters.get("llm_news_block_score", -6))
-        ):
-            return f"Crypto purchase blocked: LLM news score {assessment.score:+d}"
-        return None
-
     # -- Pooled cross-symbol memory (mirrors AssetRotationStrategy's
-    # _portfolio_memory/_update_portfolio_memory/_backfill_portfolio_memory
+    # _portfolio_memory/_update_portfolio_memories/_backfill_portfolio_memory
     # in strategy.py, using PortfolioMemory's crypto-appropriate
     # next_session_predicate instead of the NYSE-session-based default) -----
 
@@ -1018,49 +982,11 @@ class CryptoRotationStrategy(Strategy):
                 color="yellow",
             )
 
-    def _update_crypto_memory(
-        self,
-        symbol: str,
-        price: float,
-        dip_percent: float,
-        signal_present: bool,
-        live_spread_percent: float | None = None,
-        historical_expected_profit: float | None = None,
-        historical_win_probability: float | None = None,
-        historical_return_stdev: float | None = None,
-    ) -> RotationForecast:
-        """Record today's context for one symbol and forecast its next-session return."""
-        if not bool(self.parameters.get("crypto_memory_enabled", True)):
-            return RotationForecast(0, False, None, None, "Crypto memory is disabled in config.json.")
-        try:
-            return self._crypto_memory().update_and_forecast(
-                evaluation_date=datetime.now(timezone.utc).date().isoformat(),
-                symbol=symbol,
-                price=price,
-                dip_percent=dip_percent,
-                # Crypto has no news-scoring layer yet (phase 4+), unlike
-                # AssetRotationStrategy's news_score column.
-                news_score=None,
-                signal_present=signal_present,
-                live_spread_percent=live_spread_percent,
-                recent_avg_volume=None,
-                historical_expected_profit=historical_expected_profit,
-                historical_win_probability=historical_win_probability,
-                historical_return_stdev=historical_return_stdev,
-            )
-        except Exception as exc:
-            self.log_message(
-                f"Crypto memory update failed safely for {symbol}: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
-            return RotationForecast(0, False, None, None, f"Crypto memory failed: {type(exc).__name__}: {exc}")
-
     def _update_crypto_memories(
         self,
         signals: list[dict[str, Any]],
         evaluation_date: str,
-        symbol_news_scores: dict[str, int] | None = None,
-        market_news_score: int | None = None,
+        llm_score: int | None,
     ) -> dict[str, RotationForecast]:
         if not signals:
             return {}
@@ -1074,9 +1000,7 @@ class CryptoRotationStrategy(Strategy):
                 symbol=str(signal["symbol"]),
                 price=float(signal["price"]),
                 dip_percent=float(signal["dip"]),
-                news_score=(symbol_news_scores or {}).get(
-                    str(signal["symbol"]), market_news_score
-                ),
+                llm_score=llm_score,
                 signal_present=bool(signal.get("qualifies")),
                 live_spread_percent=signal.get("live_spread_percent"),
                 historical_expected_profit=signal.get("expected_profit"),
@@ -1295,7 +1219,9 @@ class CryptoRotationStrategy(Strategy):
                 color="yellow",
             )
 
-    def _update_crypto_decision_memory(self, price_a: float, price_b: float, dip_percent: float) -> RotationForecast:
+    def _update_crypto_decision_memory(
+        self, price_a: float, price_b: float, dip_percent: float, llm_score: int | None
+    ) -> RotationForecast:
         try:
             memory = self._crypto_decision_memory(int(self.parameters.get("crypto_memory_max_observations", 500)))
             result = memory.update_and_forecast(
@@ -1303,9 +1229,7 @@ class CryptoRotationStrategy(Strategy):
                 price_a=price_a,
                 price_b=price_b,
                 dip_percent=dip_percent,
-                # Crypto has no news-scoring layer yet, unlike
-                # AssetRotationStrategy's news_score column.
-                news_score=None,
+                llm_score=llm_score,
                 signal_present=dip_percent >= float(self.parameters["crypto_dip_threshold_percent"]),
             )
             self.log_message(result.explanation, color="blue")
@@ -1315,7 +1239,12 @@ class CryptoRotationStrategy(Strategy):
             return RotationForecast(0, False, None, None, f"Crypto decision memory failed: {type(exc).__name__}: {exc}")
 
     def _crypto_opportunistic_opportunity(
-        self, asset_a: str, asset_b: str, price_a: float | None, price_b: float | None
+        self,
+        asset_a: str,
+        asset_b: str,
+        price_a: float | None,
+        price_b: float | None,
+        llm_score: int | None,
     ) -> dict[str, float | int | str | None]:
         unavailable: dict[str, float | int | str | None] = {"status": "unavailable", "probability": None}
         if price_a is None or price_b is None or min(float(price_a), float(price_b)) <= 0:
@@ -1334,7 +1263,9 @@ class CryptoRotationStrategy(Strategy):
         recent_high = max(highs)
         dip = ((recent_high - float(price_b)) / recent_high) * 100.0
         self._backfill_crypto_decision_memory(asset_a, asset_b)
-        forecast = self._update_crypto_decision_memory(float(price_a), float(price_b), dip)
+        forecast = self._update_crypto_decision_memory(
+            float(price_a), float(price_b), dip, llm_score
+        )
         try:
             probability = self._crypto_decision_memory().opportunity_probability()
         except Exception as exc:
@@ -1550,7 +1481,15 @@ class CryptoRotationStrategy(Strategy):
         news_context, llm_assessment, symbol_news_scores = self._crypto_news_signals(
             symbols, set(held)
         )
-        veto_reason = self._crypto_market_veto_reason(news_context, llm_assessment)
+        veto_reason = purchase_veto_reason(
+            llm_assessment,
+            enabled=bool(self.parameters.get("llm_news_enabled", False)),
+            fail_closed_on_unavailable=bool(
+                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
+            ),
+            block_score=int(self.parameters.get("llm_news_block_score", -6)),
+            label="Crypto purchase",
+        )
         report.update(
             crypto_news_risk=news_context.risk_level,
             crypto_news_score=(
@@ -1610,9 +1549,9 @@ class CryptoRotationStrategy(Strategy):
                     f"Crypto-memory batch backfill failed safely: {type(exc).__name__}: {exc}",
                     color="yellow",
                 )
-        market_news_score = news_context.score if news_context.available else None
+        llm_purchase_score = llm_assessment.score if llm_assessment.available else None
         forecasts = self._update_crypto_memories(
-            signals, today.isoformat(), symbol_news_scores, market_news_score
+            signals, today.isoformat(), llm_purchase_score
         )
         # Every evaluated symbol -- not just one clearing today's dip
         # threshold -- contributes a daily learning observation to the pooled
@@ -1637,10 +1576,8 @@ class CryptoRotationStrategy(Strategy):
                 if forecast.ready and forecast.predicted_edge_percent is not None
                 else None
             )
-            symbol_news_score = symbol_news_scores.get(symbol, market_news_score)
-            llm_purchase_score = llm_assessment.score if llm_assessment.available else None
             signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(
-                signal, posture, symbol_news_score, llm_purchase_score
+                signal, posture, llm_purchase_score
             )
             eligible.append(signal)
         eligible.sort(key=lambda signal: float(signal["posture_adjusted_edge"]), reverse=True)
@@ -1664,7 +1601,9 @@ class CryptoRotationStrategy(Strategy):
         asset_b = str(self.parameters.get("crypto_asset_b", "ETH")).upper()
         price_a = self.get_last_price(self._crypto_asset(asset_a), quote=self.quote_asset)
         price_b = self.get_last_price(self._crypto_asset(asset_b), quote=self.quote_asset)
-        opportunity = self._crypto_opportunistic_opportunity(asset_a, asset_b, price_a, price_b)
+        opportunity = self._crypto_opportunistic_opportunity(
+            asset_a, asset_b, price_a, price_b, llm_purchase_score
+        )
         opportunity_probability = opportunity.get("probability")
         opportunity_edge = opportunity.get("predicted_edge")
         report["crypto_opportunistic_status"] = opportunity.get("status")

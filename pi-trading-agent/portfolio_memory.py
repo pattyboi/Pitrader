@@ -27,7 +27,7 @@ class PortfolioMemoryInput:
     symbol: str
     price: float
     dip_percent: float
-    news_score: int | None
+    llm_score: int | None
     signal_present: bool = True
     live_spread_percent: float | None = None
     recent_avg_volume: float | None = None
@@ -62,7 +62,7 @@ class PortfolioMemory:
         symbol: str,
         price: float,
         dip_percent: float,
-        news_score: int | None,
+        llm_score: int | None,
         signal_present: bool = True,
         live_spread_percent: float | None = None,
         recent_avg_volume: float | None = None,
@@ -86,7 +86,7 @@ class PortfolioMemory:
             symbol=symbol,
             price=price,
             dip_percent=dip_percent,
-            news_score=news_score,
+            llm_score=llm_score,
             signal_present=signal_present,
             live_spread_percent=live_spread_percent,
             recent_avg_volume=recent_avg_volume,
@@ -116,7 +116,7 @@ class PortfolioMemory:
                         "symbol": item.symbol,
                         "price": item.price,
                         "dip_percent": item.dip_percent,
-                        "news_score": item.news_score,
+                        "llm_score": item.llm_score,
                         "signal_present": int(item.signal_present),
                         "live_spread_percent": item.live_spread_percent,
                         "recent_avg_volume": item.recent_avg_volume,
@@ -132,10 +132,10 @@ class PortfolioMemory:
                 conn.execute(
                     """
                     INSERT INTO observations
-                        (evaluation_date, symbol, price, dip_percent, news_score, signal_present,
+                        (evaluation_date, symbol, price, dip_percent, llm_score, signal_present,
                          live_spread_percent, recent_avg_volume, historical_expected_profit,
                          historical_win_probability, historical_return_stdev)
-                    SELECT evaluation_date, symbol, price, dip_percent, news_score, signal_present,
+                    SELECT evaluation_date, symbol, price, dip_percent, llm_score, signal_present,
                            live_spread_percent, recent_avg_volume, historical_expected_profit,
                            historical_win_probability, historical_return_stdev
                     FROM portfolio_memory_inputs
@@ -147,7 +147,7 @@ class PortfolioMemory:
             conn.commit()
             rows = conn.execute(
                 """
-                SELECT dip_percent, news_score, next_session_return_percent
+                SELECT dip_percent, llm_score, next_session_return_percent
                 FROM observations
                 WHERE next_session_return_percent IS NOT NULL AND signal_present = 1
                 ORDER BY evaluation_date DESC LIMIT ?
@@ -160,7 +160,7 @@ class PortfolioMemory:
         """Import completed daily (date, dip, next_session_return) rows for one symbol.
 
         Deliberately price-only, like ``TradeMemory.backfill_history``:
-        inventing historic news scores would make the learned relationship
+        inventing historic LLM scores would make the learned relationship
         look more certain than it is.
         """
         return self.backfill_many({symbol: rows})
@@ -188,7 +188,7 @@ class PortfolioMemory:
                 conn.execute(
                     """
                     INSERT INTO observations
-                        (evaluation_date, symbol, price, dip_percent, news_score, next_session_return_percent)
+                        (evaluation_date, symbol, price, dip_percent, llm_score, next_session_return_percent)
                     SELECT evaluation_date, symbol, NULL, dip_percent, NULL,
                            next_session_return_percent
                     FROM portfolio_memory_backfill
@@ -210,7 +210,7 @@ class PortfolioMemory:
                 symbol TEXT NOT NULL,
                 price REAL,
                 dip_percent REAL NOT NULL,
-                news_score INTEGER,
+                llm_score INTEGER,
                 next_session_return_percent REAL,
                 signal_present INTEGER NOT NULL DEFAULT 1,
                 live_spread_percent REAL,
@@ -236,6 +236,7 @@ class PortfolioMemory:
             ).fetchall()
         }
         new_columns = {
+            "llm_score": "INTEGER",
             "signal_present": "INTEGER",
             "live_spread_percent": "REAL",
             "recent_avg_volume": "REAL",
@@ -322,7 +323,7 @@ class PortfolioMemory:
             return {item.symbol: forecast for item in observations}
         forecasts: dict[str, RotationForecast] = {}
         for item in observations:
-            predicted = model.predict(item.dip_percent, item.news_score)
+            predicted = model.predict(item.dip_percent, item.llm_score)
             forecasts[item.symbol] = RotationForecast(
                 count,
                 True,

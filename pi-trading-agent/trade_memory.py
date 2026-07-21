@@ -59,7 +59,7 @@ class TradeMemory:
         price_a: float,
         price_b: float,
         dip_percent: float,
-        news_score: int | None,
+        llm_score: int | None,
         signal_present: bool,
     ) -> RotationForecast:
         """Settle prior observations, retain today's snapshot, and forecast.
@@ -74,23 +74,23 @@ class TradeMemory:
             conn.execute(
                 """
                 INSERT INTO observations
-                    (evaluation_date, price_a, price_b, dip_percent, news_score, signal_present)
+                    (evaluation_date, price_a, price_b, dip_percent, llm_score, signal_present)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(evaluation_date) DO NOTHING
                 """,
-                (evaluation_date, price_a, price_b, dip_percent, news_score, int(signal_present)),
+                (evaluation_date, price_a, price_b, dip_percent, llm_score, int(signal_present)),
             )
             conn.commit()
             rows = conn.execute(
                 """
-                SELECT dip_percent, news_score, relative_return_percent
+                SELECT dip_percent, llm_score, relative_return_percent
                 FROM observations
                 WHERE signal_present = 1 AND relative_return_percent IS NOT NULL
                 ORDER BY evaluation_date DESC LIMIT ?
                 """,
                 (self.maximum_observations,),
             ).fetchall()
-        return self._fit(list(reversed(rows)), dip_percent, news_score)
+        return self._fit(list(reversed(rows)), dip_percent, llm_score)
 
     def backfill_history(
         self,
@@ -101,7 +101,7 @@ class TradeMemory:
         Each row is ``(date, asset_a_close, asset_b_close, dip, signal)``.
         The following row supplies the already-known next-session outcome, so
         only rows with a subsequent valid close are stored as settled.  This is
-        deliberately price-only: inventing historic news scores would make the
+        deliberately price-only: inventing historic LLM scores would make the
         learned relationship look more certain than it is.
         """
         if len(rows) < 2:
@@ -127,7 +127,7 @@ class TradeMemory:
                 conn.execute(
                     """
                     INSERT INTO observations
-                        (evaluation_date, price_a, price_b, dip_percent, news_score,
+                        (evaluation_date, price_a, price_b, dip_percent, llm_score,
                          signal_present, relative_return_percent)
                     VALUES (?, ?, ?, ?, NULL, ?, ?)
                     ON CONFLICT(evaluation_date) DO NOTHING
@@ -203,7 +203,7 @@ class TradeMemory:
                 price_a REAL NOT NULL,
                 price_b REAL NOT NULL,
                 dip_percent REAL NOT NULL,
-                news_score INTEGER,
+                llm_score INTEGER,
                 signal_present INTEGER NOT NULL,
                 decision TEXT,
                 decision_reason TEXT,
@@ -223,6 +223,14 @@ class TradeMemory:
             )
             """
         )
+        existing_columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'observations'"
+            ).fetchall()
+        }
+        if "llm_score" not in existing_columns:
+            conn.execute("ALTER TABLE observations ADD COLUMN llm_score INTEGER")
 
     def _settle_prior_observations_with_predicate(
         self, conn: duckdb.DuckDBPyConnection, date: str, price_a: float, price_b: float
