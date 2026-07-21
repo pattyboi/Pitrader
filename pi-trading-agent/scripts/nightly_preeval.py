@@ -33,6 +33,11 @@ def main() -> int:
         os.environ["EMAIL_SMTP_PASSWORD"] = str(config["EMAIL_SMTP_PASSWORD"])
 
         broker, strategy = build_strategy(config, BASE_DIR)
+        # This helper runs outside Lumibot's Trader lifecycle, so initialize
+        # the strategy explicitly before reading persisted holdings/rotation
+        # state. Without this, Vars lacks portfolio_pending_rotation and the
+        # nightly pass exits before making a single LLM call.
+        strategy.initialize()
 
         try:
             market_open = broker.market_hours(close=False, next=False)

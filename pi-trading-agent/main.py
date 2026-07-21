@@ -228,7 +228,6 @@ def load_config(path: Path) -> dict[str, Any]:
         "LLM_NEWS_ENABLED",
         "LLM_NEWS_MODEL",
         "LLM_NEWS_BASE_URL",
-        "LLM_NEWS_BLOCK_ON_HIGH_RISK",
         "LLM_NEWS_BLOCK_SCORE",
     }
     missing = sorted(required.difference(config))
@@ -279,7 +278,6 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
         "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
         "PORTFOLIO_RISK_POSTURE": "conservative",
-        "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED": False,
         "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES": 210,
         "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED": True,
     }
@@ -351,7 +349,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if risk_posture not in ("conservative", "risky"):
         raise ValueError("PORTFOLIO_RISK_POSTURE must be conservative or risky")
     _require_booleans(
-        config, "PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED", "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED"
+        config, "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED"
     )
     config["PORTFOLIO_RISK_POSTURE"] = risk_posture
     config["PORTFOLIO_SYMBOLS"] = portfolio_symbols
@@ -565,7 +563,6 @@ def load_config(path: Path) -> dict[str, Any]:
     _require_booleans(
         config,
         "LLM_NEWS_ENABLED",
-        "LLM_NEWS_BLOCK_ON_HIGH_RISK",
         "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE",
     )
     llm_block_score = int(config["LLM_NEWS_BLOCK_SCORE"])
@@ -809,7 +806,6 @@ def build_strategy(
             "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
             "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
             "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
-            "portfolio_discovery_llm_block_enabled": config["PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED"],
             "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
             "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
             "news_max_articles": config["NEWS_MAX_ARTICLES"],
@@ -857,7 +853,6 @@ def build_strategy(
             "llm_news_enabled": config["LLM_NEWS_ENABLED"],
             "llm_news_model": config["LLM_NEWS_MODEL"],
             "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
-            "llm_news_block_on_high_risk": config["LLM_NEWS_BLOCK_ON_HIGH_RISK"],
             "llm_news_fail_closed_on_unavailable": config[
                 "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
             ],

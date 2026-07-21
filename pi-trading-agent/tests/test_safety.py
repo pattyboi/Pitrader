@@ -20,6 +20,7 @@ import autonomous_universe
 import decision_math
 import llm_news
 import signal_snapshot
+import scripts.nightly_preeval as nightly_preeval
 import token_estimate
 import trade_counter
 from adaptive_news_model import AdaptiveNewsModel
@@ -1109,7 +1110,7 @@ def test_unavailable_news_blocks_when_fail_closed_is_enabled() -> None:
     assert reason == "Trade blocked: world-event risk context is unavailable"
 
 
-def test_unavailable_llm_blocks_only_when_llm_blocking_is_enabled() -> None:
+def test_unavailable_llm_blocks_when_llm_is_enabled() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {
         "news_context_enabled": True,
@@ -1117,7 +1118,6 @@ def test_unavailable_llm_blocks_only_when_llm_blocking_is_enabled() -> None:
         "news_fail_closed_on_unavailable": True,
         "news_high_risk_score": -6,
         "llm_news_enabled": True,
-        "llm_news_block_on_high_risk": True,
         "llm_news_fail_closed_on_unavailable": True,
         "llm_news_block_score": -6,
         "news_learning_block_enabled": False,
@@ -1130,6 +1130,27 @@ def test_unavailable_llm_blocks_only_when_llm_blocking_is_enabled() -> None:
     )
 
     assert reason == "Trade blocked: LLM news assessment is unavailable"
+
+
+def test_high_risk_llm_score_blocks_when_llm_is_enabled() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.parameters = {
+        "news_context_enabled": True,
+        "news_block_on_high_risk": False,
+        "news_high_risk_score": -6,
+        "llm_news_enabled": True,
+        "llm_news_fail_closed_on_unavailable": True,
+        "llm_news_block_score": -6,
+        "news_learning_block_enabled": False,
+    }
+
+    reason = strategy._market_veto_reason(
+        NewsContext(available=True),
+        llm_news.LLMNewsAssessment(available=True, score=-7),
+        None,
+    )
+
+    assert reason == "Trade blocked: LLM news assessment score -7"
 
 
 def test_due_iteration_window_returns_midday_after_the_configured_offset() -> None:
@@ -2188,7 +2209,7 @@ def test_extract_financial_context_parses_a_valid_model_response(
     assert stored == expected
 
 
-def test_discovery_article_context_is_advisory_and_scoped_to_the_symbols_own_url(
+def test_bearish_discovery_article_context_excludes_the_symbol_and_uses_its_own_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
@@ -2224,9 +2245,12 @@ def test_discovery_article_context_is_advisory_and_scoped_to_the_symbols_own_url
     monkeypatch.setattr(article_filter, "extract_financial_context", fake_extract)
 
     report: dict = {}
-    strategy._check_discovery_article_context(["ZZZZ"], news_context, {"ZZZZ": -3}, report)
+    excluded = strategy._check_discovery_article_context(
+        ["ZZZZ"], news_context, {"ZZZZ": -3}, report
+    )
 
     assert captured == {"url": "https://example.com/widget-co", "watchlist": ["ZZZZ"]}
+    assert excluded == {"ZZZZ"}
     assert report["discovery_article_context"] == "ZZZZ: bearish (corporate): regulatory investigation"
     assert any("Discovery article context: ZZZZ" in message for message in logged)
 
@@ -2292,63 +2316,45 @@ def test_discovery_article_context_checks_every_symbol_when_negative_score_not_r
     assert report["discovery_article_context"] == "AAAA: neutral (other): no specific risks cited"
 
 
-def test_advisory_discovery_analysis_is_queued_without_blocking() -> None:
+def test_discovery_analysis_runs_all_negative_symbols_before_trading() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "llm_news_enabled": True,
-        "portfolio_discovery_llm_block_enabled": False,
-    }
-    strategy._check_discovery_red_flags = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("advisory analysis must not run in the trading path")
-    )
-    strategy._check_discovery_article_context = strategy._check_discovery_red_flags
-    report: dict = {}
-
-    excluded = strategy._defer_or_run_discovery_analysis(
-        ["AAAA", "BBBB"], NewsContext(available=True), {"AAAA": -2}, report
-    )
-
-    assert excluded == set()
-    assert strategy._pending_discovery_analysis[0] == ["AAAA", "BBBB"]
-    assert report["discovery_analysis_status"].startswith("Deferred advisory")
-
-
-def test_blocking_discovery_analysis_is_capped_to_one_symbol() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "llm_news_enabled": True,
-        "portfolio_discovery_llm_block_enabled": True,
-    }
-    checked: list[list[str]] = []
+    strategy.parameters = {"llm_news_enabled": True}
+    checked: list[tuple[str, list[str]]] = []
     strategy._check_discovery_red_flags = (
-        lambda symbols, *args, **kwargs: checked.append(symbols) or {symbols[0]}
+        lambda symbols, *args, **kwargs: checked.append(("red_flags", symbols))
+        or {"CCCC"}
     )
     strategy._check_discovery_article_context = (
-        lambda symbols, *args, **kwargs: checked.append(symbols)
+        lambda symbols, *args, **kwargs: checked.append(("articles", symbols))
+        or {"BBBB"}
     )
     report: dict = {}
 
-    excluded = strategy._defer_or_run_discovery_analysis(
+    excluded = strategy._run_pretrade_discovery_analysis(
         ["AAAA", "BBBB", "CCCC"],
         NewsContext(available=True),
         {"AAAA": 0, "BBBB": -2, "CCCC": -7},
         report,
     )
 
-    assert checked == [["CCCC"], ["CCCC"]]
-    assert excluded == {"CCCC"}
-    assert "1 lower-priority" in report["discovery_analysis_status"]
+    assert checked == [
+        ("red_flags", ["CCCC", "BBBB"]),
+        ("articles", ["CCCC", "BBBB"]),
+    ]
+    assert excluded == {"BBBB", "CCCC"}
+    assert report["discovery_analysis_status"] == (
+        "Pre-trade LLM analysis checked 2 negative-news symbol(s)"
+    )
 
 
-def test_nonblocking_market_llm_assessment_is_deferred() -> None:
+def test_market_llm_assessment_is_synchronous_even_with_legacy_advisory_setting() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {
         "llm_news_enabled": True,
         "llm_news_block_on_high_risk": False,
     }
-    strategy._get_llm_news_assessment = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("advisory assessment must not run in the trading path")
-    )
+    expected = llm_news.LLMNewsAssessment(available=True, score=-1, risk_level="elevated")
+    strategy._get_llm_news_assessment = lambda *args, **kwargs: expected
     context = NewsContext(
         available=True,
         articles=[{"headline": "Market update", "summary": "", "symbols": []}],
@@ -2359,28 +2365,10 @@ def test_nonblocking_market_llm_assessment_is_deferred() -> None:
         context, ["SPY"], set(), {"SPY": -1}
     )
 
-    assert not assessment.available
-    assert assessment.risk_level == "deferred"
-    assert strategy._pending_market_llm_analysis[1] == ["SPY"]
-
-
-def test_blocking_market_llm_assessment_stays_synchronous() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {
-        "llm_news_enabled": True,
-        "llm_news_block_on_high_risk": True,
-    }
-    expected = llm_news.LLMNewsAssessment(available=True, score=-5, risk_level="high")
-    strategy._get_llm_news_assessment = lambda *args, **kwargs: expected
-
-    assessment = strategy._llm_assessment_for_iteration(
-        NewsContext(available=True), ["SPY"], set(), {}
-    )
-
     assert assessment is expected
 
 
-def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
+def test_trading_iteration_starts_only_exit_narratives_after_reporting() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {"dip_threshold_percent": 5.0}
     events: list[str] = []
@@ -2392,7 +2380,7 @@ def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
     strategy._record_memory_decision = lambda report: events.append("memory")
     strategy._generate_daily_narrative = lambda report: events.append("narrative") or "done"
     strategy._send_daily_email = lambda report: events.append("email")
-    strategy._start_deferred_llm_analysis = lambda: events.append("deferred")
+    strategy._start_deferred_exit_narratives = lambda: events.append("exit-narratives")
 
     strategy.on_trading_iteration()
 
@@ -2402,7 +2390,7 @@ def test_trading_iteration_starts_deferred_analysis_after_reporting() -> None:
         "memory",
         "narrative",
         "email",
-        "deferred",
+        "exit-narratives",
     ]
 
 
@@ -2424,7 +2412,7 @@ def test_failed_trading_iteration_does_not_consume_the_window() -> None:
     strategy._record_memory_decision = lambda report: events.append("memory")
     strategy._generate_daily_narrative = lambda report: ""
     strategy._send_daily_email = lambda report: None
-    strategy._start_deferred_llm_analysis = lambda: None
+    strategy._start_deferred_exit_narratives = lambda: None
 
     strategy.on_trading_iteration()
 
@@ -2471,10 +2459,8 @@ def test_exit_phase_submits_every_order_without_generating_narratives() -> None:
 def test_deferred_worker_generates_exit_note_after_the_iteration() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {}
-    strategy._discovery_analysis_lock = threading.Lock()
-    strategy._discovery_analysis_running = False
-    strategy._pending_market_llm_analysis = None
-    strategy._pending_discovery_analysis = None
+    strategy._exit_narrative_lock = threading.Lock()
+    strategy._exit_narrative_worker_running = False
     strategy._pending_exit_narratives = [
         ("SPY", "take-profit", NewsContext(available=True))
     ]
@@ -2485,7 +2471,7 @@ def test_deferred_worker_generates_exit_note_after_the_iteration() -> None:
         lambda message, **kwargs: logged.append(message) or completed.set()
     )
 
-    strategy._start_deferred_llm_analysis()
+    strategy._start_deferred_exit_narratives()
 
     assert completed.wait(timeout=1)
     assert logged == ["Exit note: SPY - price strength confirmed"]
@@ -2544,7 +2530,7 @@ def test_portfolio_orchestrator_completes_a_no_signal_broker_cycle() -> None:
         available=False, explanation="news unavailable"
     )
     strategy._load_nightly_preeval_learnings = lambda: {}
-    strategy._defer_or_run_discovery_analysis = lambda *args: set()
+    strategy._run_pretrade_discovery_analysis = lambda *args: set()
     strategy.get_last_price = lambda symbol: None
     strategy._opportunistic_opportunity = lambda *args: {
         "status": "unavailable",
@@ -2740,6 +2726,48 @@ def test_nightly_preevaluation_never_consumes_a_discovery_batch() -> None:
 
     assert captured["symbols"] == ["AAPL", "MSFT"]
     assert captured["require_negative_score"] is False
+
+
+def test_nightly_runner_initializes_strategy_before_preevaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    today = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+
+    class FakeBroker:
+        def market_hours(self, **kwargs):
+            events.append("market-hours")
+            return today
+
+    class FakeStrategy:
+        def initialize(self) -> None:
+            events.append("initialize")
+
+        def get_datetime(self) -> datetime:
+            return today
+
+        def _run_nightly_preevaluation(self) -> dict:
+            events.append("preevaluate")
+            return {"status": "ok"}
+
+    monkeypatch.setattr(
+        nightly_preeval,
+        "load_config",
+        lambda path: {
+            "ALPACA_API_KEY": "paper-key",
+            "ALPACA_SECRET_KEY": "paper-secret",
+            "IS_PAPER_TRADING": True,
+            "EMAIL_SMTP_PASSWORD": "smtp-secret",
+        },
+    )
+    monkeypatch.setattr(
+        nightly_preeval,
+        "build_strategy",
+        lambda config, base_dir: (FakeBroker(), FakeStrategy()),
+    )
+
+    assert nightly_preeval.main() == 0
+    assert events == ["initialize", "market-hours", "preevaluate"]
 
 
 def test_nightly_preevaluation_short_circuits_when_llm_news_disabled() -> None:

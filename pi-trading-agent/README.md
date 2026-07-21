@@ -376,7 +376,6 @@ The initial file is:
   "LLM_NEWS_ENABLED": false,
   "LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
   "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
-  "LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
   "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
   "LLM_NEWS_BLOCK_SCORE": -6
 }
@@ -438,7 +437,6 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
 | `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency (penalizes variance/bad news harder); `risky` favors raw historical edge. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
-| `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` | Lets a discovery red-flag check (see below) actually exclude a flagged symbol for the day instead of only logging it | `false` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -474,11 +472,10 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_MEMORY_ENABLED` | Records every evaluated symbol's dip signal and pools them into one learned-edge forecast used in ranking | `true` |
 | `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` | Pooled settled dip signals (across every symbol) needed before the forecast is used | `20` |
 | `PORTFOLIO_MEMORY_MAX_OBSERVATIONS` | Rolling pooled-signal history retained | `500` |
-| `LLM_NEWS_ENABLED` | Sends the day's headlines to the local Ollama model for one risk assessment | `false` |
+| `LLM_NEWS_ENABLED` | Runs the local LLM assessment before order decisions and enables its veto | `false` |
 | `LLM_NEWS_MODEL` | Ollama model tag used for the assessment | `"hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"` |
 | `LLM_NEWS_BASE_URL` | Ollama's OpenAI-compatible endpoint | `"http://127.0.0.1:11434/v1"` |
-| `LLM_NEWS_BLOCK_ON_HIGH_RISK` | Allows the LLM assessment to block a rotation | `false` |
-| `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | When LLM blocking is enabled, blocks opening trades if the assessment fails | `true` |
+| `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` | When the LLM is enabled, blocks opening trades if its assessment fails | `true` |
 | `LLM_NEWS_BLOCK_SCORE` | LLM score at or below which a trade is blocked | `-6` |
 
 JSON is strict:
@@ -883,10 +880,10 @@ This Pi's CPU-only inference is slow regardless of which small (~3-4B) model
 is configured — roughly 27-31 tokens/sec reading the prompt and ~4
 tokens/sec writing the reply, measured directly against this model. The
 request timeout is sized generously around that (see `llm_news.py`'s
-`REQUEST_TIMEOUT_SECONDS`) since this is a background call at most twice a
-day, not a latency-sensitive one. It also does noticeably weaker risk judgment than a
-large hosted model — treat it as a plausible advisory signal, not an
-authority.
+`REQUEST_TIMEOUT_SECONDS`). Because decision-changing checks now finish before
+orders, enabling the LLM can add minutes to an iteration when the same-day
+cache is cold. It also does noticeably weaker risk judgment than a large
+hosted model, so validate its vetoes extensively in paper trading.
 
 #### Enabling it
 
@@ -894,18 +891,16 @@ authority.
 "LLM_NEWS_ENABLED": true,
 "LLM_NEWS_MODEL": "hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M",
 "LLM_NEWS_BASE_URL": "http://127.0.0.1:11434/v1",
-"LLM_NEWS_BLOCK_ON_HIGH_RISK": false,
+"LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE": true,
 "LLM_NEWS_BLOCK_SCORE": -6
 ```
 
-With `LLM_NEWS_BLOCK_ON_HIGH_RISK` set to `false` (the default), the
-assessment is **advisory only** and is queued until after orders, persistence,
-narrative generation, and email have finished. Its score and reasoning appear
-in the logs and still update the observational LLM-score learning model, but
-cannot delay or block a trade. The current email labels it `deferred` because
-the result intentionally does not exist yet. This is the recommended starting
-mode. Review several weeks of paper-trading logs and compare the model's
-assessments with what actually happened before setting it to `true`.
+`LLM_NEWS_ENABLED=true` has one meaning: the assessment runs before order
+decisions. A score at or below `LLM_NEWS_BLOCK_SCORE` vetoes new purchases and
+replacements. With `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE=true`, a timeout,
+unavailable model, or invalid response also vetoes opening trades rather than
+letting the bot trade without the requested opinion. Review this behavior in
+paper trading before considering live use.
 
 `LLM_NEWS_MODEL` can be swapped for any other Ollama-pulled model tag, and
 `LLM_NEWS_BASE_URL` can point at a different host running Ollama on the local
@@ -922,10 +917,9 @@ removed.
    conservatively and treating duplicate coverage as one event.
 3. The model must reply in a fixed JSON format containing the score, a risk
    level, and two or three sentences of reasoning that cite the headlines.
-4. The score, level, and reasoning are logged. In blocking mode they are also
-   included in that iteration's email, and a score at or below
-   `LLM_NEWS_BLOCK_SCORE` vetoes the trade. Advisory mode runs afterward and
-   therefore labels the current email as deferred.
+4. The score, level, and reasoning are logged and included in that iteration's
+   email. A score at or below `LLM_NEWS_BLOCK_SCORE` vetoes the trade before
+   any opening order is submitted.
 
 The log line looks like:
 
@@ -936,8 +930,7 @@ LLM news assessment: risk=elevated, score=-3. Several articles describe ...
 #### Other uses of the local model
 
 Once the model is running locally for free with no rate limit, four more
-places reuse it. All four are purely descriptive or, in the discovery
-case, advisory by default — none can create a trade, and none run unless
+places reuse it. None can create a buy signal, and none run unless
 `LLM_NEWS_ENABLED` is `true`.
 
 - **Daily email summary.** After the iteration finishes, a short 2-3
@@ -955,21 +948,16 @@ case, advisory by default — none can create a trade, and none run unless
   surfaced (never a held or statically-configured symbol), negative dedicated
   coverage can be checked for a severe, company-specific risk (fraud,
   delisting, imminent bankruptcy, major legal action) that the price/volume
-  liquidity floor cannot see. By default this is advisory only and starts in
-  a daemon worker after orders, persistence, narrative generation, and email
-  have completed; it can log a warning and warm the article cache, but cannot
-  delay or change that iteration. Set
-  `PORTFOLIO_DISCOVERY_LLM_BLOCK_ENABLED` to `true` to check at most the
-  most-negative covered discovery symbol synchronously and exclude it if
-  flagged. The severity-prioritized one-symbol cap bounds worst-case
-  local-model latency; lower-priority symbols remain eligible for a later
-  discovery cycle. Symbols with no negative coverage make no model call.
+  liquidity floor cannot see. Every negatively-covered discovery candidate is
+  checked synchronously before orders. A severe red flag or bearish full-
+  article verdict excludes that symbol for the iteration. Symbols with no
+  negative coverage make no per-symbol model call.
 - **Nightly pre-evaluation.** `trading-agent-nightly-preeval.timer` (see
   above) runs the same per-symbol article-verdict check the discovery
   red-flag screening above uses, but at 03:00 ET over *every* managed or
   held symbol, not just discovery's negative-news ones, and regardless of
   sentiment. Each verdict lands in the same same-day cache
-  (`.article_verdicts.duckdb`) that the advisory article-context analysis
+  (`.article_verdicts.duckdb`) that the pre-trade article-context analysis
   reads from, so later checks mostly find a cache hit instead of paying an
   Ollama round-trip live. Purely a cache warm-up — it cannot itself flag,
   block, or otherwise change a trade; it only changes whether a later,
@@ -982,9 +970,8 @@ case, advisory by default — none can create a trade, and none run unless
 - A language model can misjudge significance in either direction; its
   reasoning is plausible-sounding even when wrong — a small local model more
   so than a large hosted one.
-- If `ollama.service` is down or the model fails to load, that day runs
-  without LLM protection (trading continues on price logic and the keyword
-  guard).
+- If `ollama.service` is down or the model fails to load, opening trades are
+  blocked when `LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE` is `true` (the default).
 - Scores are not comparable to the keyword score; the two guards use separate
   thresholds and either can veto independently once enabled.
 

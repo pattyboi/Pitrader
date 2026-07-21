@@ -1,9 +1,10 @@
 """Optional LLM-based assessment of daily market news.
 
 This layer reads the same Alpaca headlines the keyword scorer uses and asks
-a language model for one structured risk assessment per trading day. It is
-advisory by default, fails open like the rest of the news stack, and never
-creates a buy signal on its own.
+a language model for one structured risk assessment per trading iteration.
+When enabled, the strategy obtains this assessment before opening orders and
+uses its configured score/availability guards as vetoes. It never creates a
+buy signal on its own.
 
 The only supported backend is a local Ollama server (its OpenAI-compatible
 `/v1/chat/completions` endpoint) so this assessment never depends on an
