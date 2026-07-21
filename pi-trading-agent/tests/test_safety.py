@@ -29,6 +29,7 @@ from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_
 from news_context import NewsContext, WorldEventAnalyzer
 import rss_news
 import runtime_state
+import safe_http
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
 from symbol_reference import SymbolReference
@@ -1740,6 +1741,35 @@ def test_run_trader_until_stopped_stops_from_main_thread_event() -> None:
     assert trader.stop_calls == 1
 
 
+def test_run_trader_until_stopped_bounds_a_hung_cleanup() -> None:
+    never_returns = threading.Event()
+
+    class FakeExecutor:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    class FakeTrader:
+        def run_all(self, **kwargs):
+            return None
+
+        def stop_all(self):
+            never_returns.wait()
+
+    requested = threading.Event()
+    requested.set()
+
+    assert run_trader_until_stopped(
+        FakeTrader(),
+        SimpleNamespace(_executor=FakeExecutor()),
+        logging.getLogger("test-hung-stop"),
+        requested,
+        shutdown_timeout_seconds=0.01,
+    ) == 1
+
+
 def _signal_test_strategy(last_price: float, volume: list[float]) -> AssetRotationStrategy:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     strategy.parameters = {
@@ -2075,7 +2105,7 @@ def test_extract_financial_context_returns_none_for_a_low_density_article(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(article_filter, "DB_PATH", tmp_path / "verdicts.duckdb")
-    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "<html></html>")
+    monkeypatch.setattr(article_filter, "fetch_public_bytes", lambda *args, **kwargs: b"<html></html>")
     monkeypatch.setattr(
         article_filter.trafilatura,
         "extract",
@@ -2107,7 +2137,7 @@ def test_extract_financial_context_returns_cached_value_without_fetching(
     def _fail_fetch(url):
         raise AssertionError("a cache hit must never fetch the article")
 
-    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", _fail_fetch)
+    monkeypatch.setattr(article_filter, "fetch_public_bytes", _fail_fetch)
 
     result = article_filter.extract_financial_context("https://example.com/a", ["AAPL"])
 
@@ -2128,7 +2158,7 @@ def test_extract_financial_context_parses_a_valid_model_response(
         "Executives said the recession fears and inflation outlook remain a modest headwind. "
         "A weather report and a recipe roundup filled out the rest of the newsletter."
     )
-    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "<html></html>")
+    monkeypatch.setattr(article_filter, "fetch_public_bytes", lambda *args, **kwargs: b"<html></html>")
     monkeypatch.setattr(article_filter.trafilatura, "extract", lambda *args, **kwargs: article_text)
     expected = {
         "sentiment": "bullish",
@@ -2903,7 +2933,7 @@ def test_article_context_cache_is_scoped_to_the_watchlist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(article_filter, "DB_PATH", tmp_path / "verdicts.duckdb")
-    monkeypatch.setattr(article_filter.trafilatura, "fetch_url", lambda url: "raw")
+    monkeypatch.setattr(article_filter, "fetch_public_bytes", lambda *args, **kwargs: b"raw")
     monkeypatch.setattr(
         article_filter.trafilatura,
         "extract",
@@ -3005,6 +3035,104 @@ def test_parse_feed_returns_nothing_for_malformed_xml() -> None:
     assert rss_news._parse_feed("not xml at all <<<") == []
 
 
+def test_public_url_validation_rejects_local_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        safe_http.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (safe_http.socket.AF_INET, safe_http.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+        ],
+    )
+
+    with pytest.raises(safe_http.UnsafeURL, match="non-public"):
+        safe_http.validate_public_http_url("http://attacker.example/article")
+
+
+def test_public_fetch_revalidates_redirect_destinations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addresses = {"public.example": "93.184.216.34", "localhost": "127.0.0.1"}
+    monkeypatch.setattr(
+        safe_http.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (
+                safe_http.socket.AF_INET,
+                safe_http.socket.SOCK_STREAM,
+                6,
+                "",
+                (addresses[host], port),
+            )
+        ],
+    )
+
+    class RedirectResponse:
+        is_redirect = True
+        is_permanent_redirect = False
+        headers = {"Location": "http://localhost/private"}
+
+        def close(self):
+            return None
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, *args, **kwargs):
+            return RedirectResponse()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(safe_http.requests, "Session", FakeSession)
+
+    with pytest.raises(safe_http.UnsafeURL, match="non-public"):
+        safe_http.fetch_public_bytes(
+            "https://public.example/article", timeout=1, max_bytes=1024
+        )
+
+
+def test_public_fetch_enforces_streaming_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        safe_http.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [
+            (safe_http.socket.AF_INET, safe_http.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+        ],
+    )
+
+    class OversizeResponse:
+        is_redirect = False
+        is_permanent_redirect = False
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            return iter((b"1234", b"5678"))
+
+        def close(self):
+            return None
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, *args, **kwargs):
+            return OversizeResponse()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(safe_http.requests, "Session", FakeSession)
+
+    with pytest.raises(ValueError, match="size limit"):
+        safe_http.fetch_public_bytes("https://public.example/feed", timeout=1, max_bytes=5)
+
+
 def test_fetch_articles_filters_by_lookback_window(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime.now(timezone.utc)
     xml = _SAMPLE_RSS_FEED.format(
@@ -3017,7 +3145,7 @@ def test_fetch_articles_filters_by_lookback_window(monkeypatch: pytest.MonkeyPat
         def raise_for_status(self) -> None:
             return None
 
-    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(rss_news, "fetch_public_bytes", lambda *args, **kwargs: xml.encode())
 
     articles = rss_news.fetch_articles(["https://feed.example/rss"], lookback_hours=24, max_articles=10)
 
@@ -3036,7 +3164,7 @@ def test_fetch_articles_deduplicates_the_same_url_across_feeds(monkeypatch: pyte
         def raise_for_status(self) -> None:
             return None
 
-    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(rss_news, "fetch_public_bytes", lambda *args, **kwargs: xml.encode())
 
     articles = rss_news.fetch_articles(
         ["https://feed-a.example/rss", "https://feed-b.example/rss"], lookback_hours=24, max_articles=10
@@ -3060,9 +3188,9 @@ def test_fetch_articles_skips_a_failing_feed_and_keeps_the_rest(monkeypatch: pyt
     def fake_get(url: str, *args, **kwargs):
         if "broken" in url:
             raise ConnectionError("feed host unreachable")
-        return FakeResponse()
+        return xml.encode()
 
-    monkeypatch.setattr(rss_news.requests, "get", fake_get)
+    monkeypatch.setattr(rss_news, "fetch_public_bytes", fake_get)
 
     articles = rss_news.fetch_articles(
         ["https://broken.example/rss", "https://feed.example/rss"], lookback_hours=24, max_articles=10
@@ -3086,7 +3214,7 @@ def test_fetch_articles_caps_total_and_sorts_newest_first(monkeypatch: pytest.Mo
         def raise_for_status(self) -> None:
             return None
 
-    monkeypatch.setattr(rss_news.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(rss_news, "fetch_public_bytes", lambda *args, **kwargs: xml.encode())
 
     articles = rss_news.fetch_articles(["https://feed.example/rss"], lookback_hours=24, max_articles=1)
 
@@ -3109,9 +3237,9 @@ def test_fetch_articles_requests_feeds_concurrently(monkeypatch: pytest.MonkeyPa
 
     def fake_get(*args, **kwargs):
         barrier.wait()
-        return FakeResponse()
+        return xml.encode()
 
-    monkeypatch.setattr(rss_news.requests, "get", fake_get)
+    monkeypatch.setattr(rss_news, "fetch_public_bytes", fake_get)
 
     articles = rss_news.fetch_articles(
         ["https://feed-a.example/rss", "https://feed-b.example/rss"],
@@ -3169,7 +3297,9 @@ def test_world_event_analyzer_merges_rss_articles_after_alpaca(monkeypatch: pyte
             return None
 
     monkeypatch.setattr(
-        news_context_module.rss_news.requests, "get", lambda *args, **kwargs: FakeRssResponse()
+        news_context_module.rss_news,
+        "fetch_public_bytes",
+        lambda *args, **kwargs: xml.encode(),
     )
 
     analyzer = WorldEventAnalyzer(
@@ -3548,3 +3678,11 @@ def test_build_snapshot_entries_skips_a_malformed_entry_instead_of_raising() -> 
     )
 
     assert [entry["symbol"] for entry in entries] == ["AAAA"]
+
+
+def test_dashboard_defaults_to_loopback_and_avoids_html_injection_sinks() -> None:
+    from scripts import web_dashboard
+
+    assert web_dashboard.HOST == "127.0.0.1"
+    assert "innerHTML" not in web_dashboard.INDEX_HTML
+    assert "textContent = String(e.symbol" in web_dashboard.INDEX_HTML

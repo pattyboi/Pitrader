@@ -21,12 +21,13 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from xml.etree import ElementTree
 
-import requests
+from safe_http import fetch_public_bytes
 
 logger = logging.getLogger(__name__)
 
 RSS_REQUEST_TIMEOUT_SECONDS = 15
 RSS_FETCH_WORKERS = 4
+RSS_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
 # Some publishers reject requests with no User-Agent at all.
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; pi-trading-agent RSS reader)"}
 
@@ -54,7 +55,7 @@ def _parse_pub_date(raw: str | None) -> datetime | None:
     return parsed
 
 
-def _parse_feed(xml_text: str) -> list[dict[str, Any]]:
+def _parse_feed(xml_text: str | bytes) -> list[dict[str, Any]]:
     """Pure parse of one RSS 2.0 document into article dicts; never raises
     (an unparseable feed yields no articles, exactly like an empty one)."""
     try:
@@ -94,12 +95,16 @@ def fetch_articles(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, lookback_hours))
     def fetch_one(feed_url: str) -> list[dict[str, Any]]:
         try:
-            response = requests.get(feed_url, timeout=timeout, headers=_REQUEST_HEADERS)
-            response.raise_for_status()
+            xml_text = fetch_public_bytes(
+                feed_url,
+                timeout=timeout,
+                max_bytes=RSS_MAX_DOWNLOAD_BYTES,
+                headers=_REQUEST_HEADERS,
+            )
         except Exception as exc:
             logger.warning("RSS feed unavailable, skipping: %s (%s: %s)", feed_url, type(exc).__name__, exc)
             return []
-        return _parse_feed(response.text)
+        return _parse_feed(xml_text)
 
     if not feed_urls:
         return []

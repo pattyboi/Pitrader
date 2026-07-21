@@ -13,7 +13,7 @@ POLL_INTERVAL_MS in the page's inline JS), and there's no work to do between
 requests.
 
 Usage: python3 scripts/web_dashboard.py
-Env vars: DASHBOARD_HOST (default 0.0.0.0), DASHBOARD_PORT (default 8765)
+Env vars: DASHBOARD_HOST (default 127.0.0.1), DASHBOARD_PORT (default 8765)
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ CRYPTO_SNAPSHOT = BASE_DIR / ".crypto_signal_snapshot.json"
 PORTFOLIO_TRADE_COUNT = BASE_DIR / ".portfolio_trade_count.json"
 CRYPTO_TRADE_COUNT = BASE_DIR / ".crypto_trade_count.json"
 
-HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 
 
@@ -249,32 +249,75 @@ function fmtAge(iso) {
 }
 
 function renderTable(container, snapshot) {
+  container.replaceChildren();
   if (!snapshot) {
-    container.innerHTML = '<div class="empty">no data yet -- the agent hasn\'t completed an iteration since this was set up</div>';
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "no data yet -- the agent hasn't completed an iteration since this was set up";
+    container.appendChild(empty);
     return null;
   }
   const entries = snapshot.symbols || [];
   if (entries.length === 0) {
-    container.innerHTML = '<div class="empty">no symbols evaluated yet</div>';
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "no symbols evaluated yet";
+    container.appendChild(empty);
     return snapshot;
   }
-  let rows = "";
+
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  for (const [label, rightAligned] of [
+    ["symbol", false], ["", false], ["dip%", true], ["edge%", true], ["opinion", true]
+  ]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    if (rightAligned) th.style.textAlign = "right";
+    headerRow.appendChild(th);
+  }
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
   for (const e of entries) {
     const opClass = e.opinion === "+" ? "opinion-pos" : "opinion-neg";
-    const heldRow = e.held ? "held" : "";
-    const heldTag = e.held ? '<span class="held-tag">HELD</span>' : "";
-    rows += `<tr class="${heldRow}">
-      <td class="sym">${e.symbol}</td>
-      <td>${heldTag}</td>
-      <td class="num">${Number(e.dip_percent || 0).toFixed(2)}%</td>
-      <td class="num">${Number(e.edge_percent || 0).toFixed(2)}%</td>
-      <td class="num ${opClass}">${e.opinion === "+" ? "&#9650;" : "&#9660;"} ${e.opinion}</td>
-    </tr>`;
+    const row = document.createElement("tr");
+    if (e.held) row.className = "held";
+
+    const symbol = document.createElement("td");
+    symbol.className = "sym";
+    symbol.textContent = String(e.symbol || "");
+    row.appendChild(symbol);
+
+    const held = document.createElement("td");
+    if (e.held) {
+      const tag = document.createElement("span");
+      tag.className = "held-tag";
+      tag.textContent = "HELD";
+      held.appendChild(tag);
+    }
+    row.appendChild(held);
+
+    const dip = document.createElement("td");
+    dip.className = "num";
+    dip.textContent = `${Number(e.dip_percent || 0).toFixed(2)}%`;
+    row.appendChild(dip);
+
+    const edge = document.createElement("td");
+    edge.className = "num";
+    edge.textContent = `${Number(e.edge_percent || 0).toFixed(2)}%`;
+    row.appendChild(edge);
+
+    const opinion = document.createElement("td");
+    opinion.className = `num ${opClass}`;
+    opinion.textContent = `${e.opinion === "+" ? "▲" : "▼"} ${String(e.opinion || "")}`;
+    row.appendChild(opinion);
+    tbody.appendChild(row);
   }
-  container.innerHTML = `<table>
-    <thead><tr><th>symbol</th><th></th><th style="text-align:right">dip%</th><th style="text-align:right">edge%</th><th style="text-align:right">opinion</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`;
+  table.appendChild(tbody);
+  container.appendChild(table);
   return snapshot;
 }
 
@@ -330,10 +373,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         pass  # keep the journal quiet; this is a read-only, low-value view logged noise
 
+    def _send_security_headers(self) -> None:
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+            "img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        )
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def do_GET(self) -> None:
         if self.path in ("/", "/index.html"):
             body = INDEX_HTML.encode("utf-8")
             self.send_response(200)
+            self._send_security_headers()
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -352,6 +406,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
+            self._send_security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -359,6 +414,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_response(404)
+            self._send_security_headers()
             self.send_header("Content-Length", "0")
             self.end_headers()
 

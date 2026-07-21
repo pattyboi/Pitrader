@@ -22,6 +22,7 @@ import duckdb
 import requests
 import trafilatura
 
+from safe_http import fetch_public_bytes
 from token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,10 @@ OLLAMA_NUM_PREDICT = 250
 # comfortably inside this even at this Pi's measured worst case (~1.6x
 # token-estimate undercount, ~28 tokens/sec prompt-eval, ~4 tokens/sec
 # generation -- see llm_news.py's REQUEST_TIMEOUT_SECONDS for the same
-# measurement); generous margin is kept since this fetches an arbitrary
-# third-party page, whose extraction time is not bounded by any of that.
+# measurement); safe_http separately bounds the arbitrary third-party page's
+# destination, redirect chain, and downloaded byte count.
 REQUEST_TIMEOUT_SECONDS = 180
+MAX_ARTICLE_DOWNLOAD_BYTES = 5 * 1024 * 1024
 
 MIN_SENTENCE_WORDS = 8
 TOP_SENTENCES = 15
@@ -190,7 +192,11 @@ def extract_financial_context(url: str, watchlist: list[str]) -> dict | None:
         if cached is not None:
             return cached
 
-        downloaded = trafilatura.fetch_url(url)
+        downloaded = fetch_public_bytes(
+            url,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            max_bytes=MAX_ARTICLE_DOWNLOAD_BYTES,
+        )
         if not downloaded:
             return None
         text = trafilatura.extract(

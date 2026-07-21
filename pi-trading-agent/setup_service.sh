@@ -43,7 +43,8 @@ fi
 if [[ ! -f "${PROJECT_DIR}/main.py" || ! -f "${PROJECT_DIR}/strategy.py" || \
       ! -f "${PROJECT_DIR}/main_crypto.py" || ! -f "${PROJECT_DIR}/crypto_strategy.py" || \
       ! -f "${PROJECT_DIR}/adaptive_news_model.py" || \
-      ! -f "${PROJECT_DIR}/news_context.py" || ! -f "${PROJECT_DIR}/config.json" ]]; then
+      ! -f "${PROJECT_DIR}/news_context.py" || ! -f "${PROJECT_DIR}/config.json" || \
+      ! -f "${PROJECT_DIR}/requirements.lock" ]]; then
     echo "Required project files are missing from ${PROJECT_DIR}." >&2
     exit 1
 fi
@@ -54,8 +55,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 python3 -m venv "${VENV_DIR}"
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install --requirement "${PROJECT_DIR}/requirements.txt"
+"${VENV_DIR}/bin/python" -m pip install --requirement "${PROJECT_DIR}/requirements.lock"
 
 chown -R "${RUN_USER}:${RUN_GROUP}" "${PROJECT_DIR}"
 chmod 600 "${PROJECT_DIR}/config.json"
@@ -69,8 +69,9 @@ chmod 755 "${PROJECT_DIR}/scripts/web_dashboard.py"
 # The optional LLM news assessment (llm_news.py) only ever talks to a local
 # Ollama server -- never an outside API -- so Ollama is provisioned here too.
 if ! command -v ollama >/dev/null 2>&1; then
-    echo "Installing Ollama (local LLM server for the optional news assessment)..."
-    curl -fsSL https://ollama.com/install.sh | sh
+    echo "Ollama is required but was not found." >&2
+    echo "Install a verified Ollama package from https://ollama.com/download, then rerun this installer." >&2
+    exit 1
 fi
 
 # The official installer's own ollama.service has no loopback restriction and
@@ -183,11 +184,9 @@ ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/web_dashboard.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
-# LAN-accessible by design (0.0.0.0) so it can be reached from any device on
-# the home network without an SSH tunnel -- there is no login on this page,
-# so anyone on that network can view current positions and opinions. Set
-# DASHBOARD_HOST=127.0.0.1 below instead if that trade-off ever changes.
-Environment=DASHBOARD_HOST=0.0.0.0
+# The dashboard has no login and contains position/signal information. Keep it
+# loopback-only; use an SSH tunnel or authenticated reverse proxy for remote use.
+Environment=DASHBOARD_HOST=127.0.0.1
 Environment=DASHBOARD_PORT=8765
 NoNewPrivileges=true
 PrivateTmp=true
@@ -311,7 +310,7 @@ echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
 echo "${CRYPTO_SERVICE_NAME} is also installed and running, but idles until CRYPTO_ENABLED is true in config.json (and only trades while NYSE is closed)."
 echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
-echo "${DASHBOARD_SERVICE_NAME} is installed and running -- browse to http://<this Pi's LAN IP>:8765 to view the signal board. It has no login, so it's reachable by anyone on the same network."
+echo "${DASHBOARD_SERVICE_NAME} is installed on 127.0.0.1:8765. Use an SSH tunnel or authenticated reverse proxy for remote access."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
     echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/unsloth/granite-4.0-micro-GGUF:Q4_K_M"
 fi

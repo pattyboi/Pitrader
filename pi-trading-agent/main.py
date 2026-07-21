@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime, timedelta as datetime_timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -872,6 +873,7 @@ def run_trader_until_stopped(
     logger: logging.Logger,
     stop_event: threading.Event | None = None,
     process_name: str = "Trading agent",
+    shutdown_timeout_seconds: float = 10.0,
 ) -> int:
     """Keep signal delivery on the main thread while Lumibot runs asynchronously."""
     requested = stop_event or threading.Event()
@@ -893,10 +895,36 @@ def run_trader_until_stopped(
         while executor.is_alive() and not requested.wait(0.5):
             pass
         if requested.is_set() and executor.is_alive():
-            trader.stop_all()
-        executor.join(timeout=10.0)
+            shutdown_deadline = time.monotonic() + shutdown_timeout_seconds
+            stop_finished = threading.Event()
+
+            def stop_trader() -> None:
+                try:
+                    trader.stop_all()
+                except Exception:
+                    logger.exception("%s cleanup failed", process_name)
+                finally:
+                    stop_finished.set()
+
+            # Lumibot cleanup has blocked indefinitely in upstream code before.
+            # A daemon worker lets the main thread enforce the same ten-second
+            # deadline used for the executor instead of hanging before join().
+            threading.Thread(
+                target=stop_trader,
+                name="lumibot-stop",
+                daemon=True,
+            ).start()
+            stop_finished.wait(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            join_timeout = max(0.0, shutdown_deadline - time.monotonic())
+        else:
+            join_timeout = shutdown_timeout_seconds
+        executor.join(timeout=join_timeout)
         if executor.is_alive():
-            logger.error("%s did not stop within 10 seconds", process_name)
+            logger.error(
+                "%s did not stop within %.1f seconds",
+                process_name,
+                shutdown_timeout_seconds,
+            )
             return 1
         if requested.is_set():
             logger.info("%s stopped by operator", process_name)
