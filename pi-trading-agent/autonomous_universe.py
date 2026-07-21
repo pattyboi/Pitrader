@@ -85,6 +85,11 @@ class AutonomousUniverse:
                     if symbol
                 }
             )
+            # Keep rotating from the persisted position after a metadata
+            # refresh.  Resetting to zero here meant a large alphabetically
+            # sorted equity universe could never advance beyond its first
+            # few batches before the next periodic refresh reset it again.
+            cursor = int(cursor_value or 0) % len(symbols) if symbols else 0
             with self._open() as conn:
                 conn.execute("DELETE FROM universe_symbols")
                 if symbols:
@@ -92,10 +97,9 @@ class AutonomousUniverse:
                         "INSERT INTO universe_symbols (symbol, rank) VALUES (?, ?)",
                         [(symbol, rank) for rank, symbol in enumerate(symbols)],
                     )
-                self._set_state(conn, "cursor", "0")
+                self._set_state(conn, "cursor", str(cursor))
                 self._set_state(conn, "refreshed", today.isoformat())
                 conn.commit()
-            cursor = 0
         else:
             cursor = int(cursor_value or 0) % len(symbols)
         if not symbols:

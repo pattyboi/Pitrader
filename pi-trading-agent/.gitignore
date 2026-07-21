@@ -7,3 +7,4 @@
 .news_learning_state.duckdb.*
 .news_learning_state_llm.duckdb
 .news_learning_state_llm.duckdb.*
+.crypto_shutdown_diagnostic.log

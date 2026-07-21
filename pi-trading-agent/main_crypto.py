@@ -21,7 +21,15 @@ import sys
 from lumibot.traders import Trader
 
 from crypto_strategy import CryptoRotationStrategy
-from main import BASE_DIR, CONFIG_PATH, LOG_FORMAT, MarketOpenLoggingAlpaca, _tidy_logging, load_config
+from main import (
+    BASE_DIR,
+    CONFIG_PATH,
+    LOG_FORMAT,
+    MarketOpenLoggingAlpaca,
+    _tidy_logging,
+    load_config,
+    run_trader_until_stopped,
+)
 
 
 def build_crypto_strategy(
@@ -86,6 +94,7 @@ def build_crypto_strategy(
             "crypto_opportunistic_min_probability": config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"],
             "crypto_rotation_state_file": str(base_dir / ".crypto_rotation_state.json"),
             "crypto_opportunistic_swap_state_file": str(base_dir / ".crypto_opportunistic_swap_state.json"),
+            "shutdown_diagnostic_file": str(base_dir / ".crypto_shutdown_diagnostic.log"),
         },
     )
     return broker, strategy
@@ -117,8 +126,9 @@ def main() -> int:
             "enabled" if config["CRYPTO_ENABLED"] else "disabled -- idling until CRYPTO_ENABLED is true",
             ", ".join(config["CRYPTO_SYMBOLS"]) or "(none configured)",
         )
-        trader.run_all()
-        return 0
+        return run_trader_until_stopped(
+            trader, strategy, logger, process_name="Crypto trading agent"
+        )
     except KeyboardInterrupt:
         logger.info("Crypto trading agent stopped by operator")
         return 0

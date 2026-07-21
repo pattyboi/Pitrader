@@ -17,6 +17,7 @@ Lumibot's own scheduler never blocks waiting for a stock-market open/close
 that will never come for a 24/7 asset).
 """
 
+import faulthandler
 import json
 import math
 import os
@@ -157,6 +158,17 @@ class CryptoRotationStrategy(Strategy):
                 "reconciling next cycle.",
                 color="yellow",
             )
+
+    def on_abrupt_closing(self) -> None:
+        """Capture every thread before Lumibot begins blocking shutdown work."""
+        raw_path = self.parameters.get("shutdown_diagnostic_file")
+        if not raw_path:
+            return
+        try:
+            with open(str(raw_path), "w", encoding="utf-8") as handle:
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+        except OSError:
+            pass
 
     def _crypto_state_guard(self) -> threading.RLock:
         return self._crypto_state_lock
@@ -750,26 +762,25 @@ class CryptoRotationStrategy(Strategy):
             log_message = getattr(self, "log_message", None)
             if callable(log_message) and getattr(self, "logger", None) is not None:
                 log_message(
-                    "Crypto history batch unavailable; using per-symbol requests: "
+                    "Crypto history batch unavailable; skipping this cycle to avoid "
+                    "an unbounded per-symbol retry cascade: "
                     f"{type(exc).__name__}: {exc}",
                     color="yellow",
                 )
-            prefetched = None
+            return [None] * len(symbols)
         with ThreadPoolExecutor(
             max_workers=min(self._CRYPTO_HISTORY_WORKERS, len(symbols)), thread_name_prefix="crypto-history"
         ) as executor:
-            if prefetched is not None:
-                return list(
-                    executor.map(
-                        lambda symbol: self._crypto_signal(
-                            symbol, prefetched[symbol], bars_prefetched=True
-                        )
-                        if symbol in prefetched
-                        else self._crypto_signal(symbol),
-                        symbols,
+            return list(
+                executor.map(
+                    lambda symbol: self._crypto_signal(
+                        symbol, prefetched[symbol], bars_prefetched=True
                     )
+                    if symbol in prefetched
+                    else None,
+                    symbols,
                 )
-            return list(executor.map(self._crypto_signal, symbols))
+            )
 
     # -- Pooled cross-symbol memory (mirrors AssetRotationStrategy's
     # _portfolio_memory/_update_portfolio_memory/_backfill_portfolio_memory

@@ -4,7 +4,9 @@
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 from datetime import datetime, timedelta as datetime_timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -864,6 +866,46 @@ def build_strategy(
     return broker, strategy
 
 
+def run_trader_until_stopped(
+    trader: Trader,
+    strategy: Any,
+    logger: logging.Logger,
+    stop_event: threading.Event | None = None,
+    process_name: str = "Trading agent",
+) -> int:
+    """Keep signal delivery on the main thread while Lumibot runs asynchronously."""
+    requested = stop_event or threading.Event()
+    trader.run_all(async_=True)
+
+    previous_handlers: dict[int, object] = {}
+
+    def request_stop(signum, _frame) -> None:
+        if not requested.is_set():
+            logger.info("%s received signal %s; stopping", process_name, signum)
+        requested.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
+
+    executor = strategy._executor
+    try:
+        while executor.is_alive() and not requested.wait(0.5):
+            pass
+        if requested.is_set() and executor.is_alive():
+            trader.stop_all()
+        executor.join(timeout=10.0)
+        if executor.is_alive():
+            logger.error("%s did not stop within 10 seconds", process_name)
+            return 1
+        if requested.is_set():
+            logger.info("%s stopped by operator", process_name)
+        return 0
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+
+
 def main() -> int:
     """Configure Lumibot and run until the process receives a stop signal."""
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -892,8 +934,7 @@ def main() -> int:
             config["ASSET_A"],
             config["ASSET_B"],
         )
-        trader.run_all()
-        return 0
+        return run_trader_until_stopped(trader, strategy, logger)
     except KeyboardInterrupt:
         logger.info("Trading agent stopped by operator")
         return 0

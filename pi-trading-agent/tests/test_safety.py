@@ -41,6 +41,7 @@ from main import (
     _DropOptionalLumiwealthWarning,
     format_market_open_time,
     load_config,
+    run_trader_until_stopped,
 )
 
 
@@ -506,6 +507,24 @@ def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monke
 
     assert first == ["AAPL", "MSFT"]
     assert second == ["NVDA", "TSLA"]
+
+
+def test_autonomous_universe_refresh_preserves_rotation_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    universe = AutonomousUniverse(tmp_path / "universe.duckdb", refresh_days=0, batch_size=2)
+    payload = [
+        {"symbol": symbol, "tradable": True, "fractionable": True}
+        for symbol in ["AAPL", "MSFT", "NVDA", "TSLA"]
+    ]
+    monkeypatch.setattr(
+        autonomous_universe.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload),
+    )
+
+    assert universe.next_batch("key", "secret") == ["AAPL", "MSFT"]
+    assert universe.next_batch("key", "secret") == ["NVDA", "TSLA"]
 
 
 def test_autonomous_universe_excludes_unpriceable_symbols_from_future_batches(
@@ -1636,6 +1655,89 @@ def test_crypto_history_requests_use_the_multi_asset_path() -> None:
     assert [[pair[0].symbol for pair in calls[0]]] == [["BTC", "ETH"]]
     assert [result["bars"] for result in results] == [bars["BTC"], bars["ETH"]]
     assert all(result["prefetched"] for result in results)
+
+
+def test_crypto_history_batch_failure_skips_cycle_without_per_symbol_retries() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_analysis_days": 252}
+    strategy._quote_asset = SimpleNamespace(symbol="USD")
+    strategy._unpriceable_symbols_lock = threading.Lock()
+    strategy.get_historical_prices_for_assets = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("batch unavailable")
+    )
+    messages = []
+    strategy.logger = object()
+    strategy.log_message = lambda message, **kwargs: messages.append(message)
+    strategy._crypto_signal = lambda symbol: pytest.fail(f"unexpected retry for {symbol}")
+
+    assert strategy._crypto_signals(["BTC", "ETH"]) == [None, None]
+    assert "skipping this cycle" in messages[0]
+
+
+def test_crypto_partial_history_batch_does_not_retry_missing_symbols() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {"crypto_analysis_days": 252}
+    strategy._quote_asset = SimpleNamespace(symbol="USD")
+    strategy._unpriceable_symbols_lock = threading.Lock()
+    btc_bars = object()
+    strategy.get_historical_prices_for_assets = lambda pairs, *args, **kwargs: {
+        pairs[0][0]: btc_bars
+    }
+    strategy._crypto_signal = lambda symbol, bars=None, **kwargs: {
+        "symbol": symbol,
+        "bars": bars,
+        "prefetched": kwargs.get("bars_prefetched"),
+    }
+
+    assert strategy._crypto_signals(["BTC", "ETH"]) == [
+        {"symbol": "BTC", "bars": btc_bars, "prefetched": True},
+        None,
+    ]
+
+
+def test_crypto_on_abrupt_closing_dumps_every_thread_stack(tmp_path: Path) -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    diagnostic = tmp_path / "crypto-shutdown.log"
+    strategy.parameters = {"shutdown_diagnostic_file": str(diagnostic)}
+
+    strategy.on_abrupt_closing()
+
+    assert "Current thread" in diagnostic.read_text(encoding="utf-8")
+
+
+def test_run_trader_until_stopped_stops_from_main_thread_event() -> None:
+    class FakeExecutor:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            return None
+
+    executor = FakeExecutor()
+    strategy = SimpleNamespace(_executor=executor)
+
+    class FakeTrader:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def run_all(self, **kwargs):
+            assert kwargs == {"async_": True}
+
+        def stop_all(self):
+            self.stop_calls += 1
+            executor.alive = False
+
+    trader = FakeTrader()
+    requested = threading.Event()
+    requested.set()
+
+    assert run_trader_until_stopped(
+        trader, strategy, logging.getLogger("test-crypto-stop"), requested
+    ) == 0
+    assert trader.stop_calls == 1
 
 
 def _signal_test_strategy(last_price: float, volume: list[float]) -> AssetRotationStrategy:
