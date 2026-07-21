@@ -91,16 +91,14 @@ historical estimate and the out-of-sample result meet their configured minimums
 with enough observations. Cash is split evenly among the open slots a given
 iteration fills.
 
-`PORTFOLIO_MAX_POSITIONS` is a ceiling, not a target: each iteration also
-computes how many of today's qualifying candidates are actually worth
-spreading capital across, given total account capital, `PORTFOLIO_MIN_ORDER_DOLLARS`,
-and each candidate's net edge and historical return variance — an equal-weighted,
-Sharpe-like score that assumes zero correlation between candidates (an
-optimistic upper bound, since symbols sharing a market factor diversify less
-than this in practice). That computed count can only narrow the configured
-ceiling, never widen it, so a `PORTFOLIO_MAX_POSITIONS` of `1` always
-means one position regardless of this math — it only has room to act once
-the ceiling is raised.
+`PORTFOLIO_MAX_POSITIONS` is a hard ceiling, not a forced target. With
+`PORTFOLIO_FILL_QUALIFIED_SLOTS` enabled (the default), every candidate that
+passes the price, liquidity, historical, out-of-sample, learned-edge, and news
+guards can be bought in the same iteration until the ceiling, available cash,
+or minimum-order floor is reached. Disable it to restore the narrower
+Sharpe-like position-count heuristic. Symbol-specific news scores affect the
+ordering of already-qualified candidates while the aggregate LLM assessment
+continues to control overall exposure and veto severe market-wide risk.
 
 Every holding is checked against its own unrealized return each iteration,
 starting the day it's bought (using the broker's own cost basis, not a fixed
@@ -405,7 +403,8 @@ source owner-readable only; never place secrets in command-line arguments.
 | `DIP_THRESHOLD_PERCENT` | Required fall from the recent high | `5.0` |
 | `RECENT_HIGH_LOOKBACK_DAYS` | Number of daily bars used for the high | `20` |
 | `PORTFOLIO_SYMBOLS` | Explicit symbols that portfolio mode may analyze or trade | `["SPY", "QQQ", "IWM", "DIA"]` |
-| `PORTFOLIO_MAX_POSITIONS` | Ceiling on simultaneous portfolio holdings and on how many trades one iteration can act on; use `1` for a ~$50 account. The actual number used each iteration is this value or the capital/edge-optimal count, whichever is smaller — see "How the strategy trades" above. Validated against the length of `PORTFOLIO_SYMBOLS` unless `PORTFOLIO_AUTONOMOUS_DISCOVERY` is `true`, in which case discovery can supply the rest of the candidate pool | `1` |
+| `PORTFOLIO_MAX_POSITIONS` | Ceiling on simultaneous portfolio holdings and on how many trades one iteration can act on; validated against `PORTFOLIO_SYMBOLS` unless autonomous discovery can supply more candidates | `1` |
+| `PORTFOLIO_FILL_QUALIFIED_SLOTS` | Buy every fundable candidate that passes all entry guards, up to `PORTFOLIO_MAX_POSITIONS`; `false` uses the narrower variance-aware count heuristic | `true` |
 | `PORTFOLIO_ANALYSIS_DAYS` | Daily bars used to calculate comparable-dip returns | `252` |
 | `PORTFOLIO_MIN_SIGNAL_OBSERVATIONS` | Comparable historical dips needed for a symbol to qualify | `20` |
 | `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | Minimum cost-adjusted historical average next-session return; also the minimum replacement advantage | `1.0` |
@@ -1088,6 +1087,7 @@ All keys live in the same `config.json`, prefixed `CRYPTO_`:
 | `CRYPTO_ENABLED` | `false` | Master on/off switch. The service runs either way; this just decides whether it ever evaluates or trades. |
 | `CRYPTO_SYMBOLS` | `["BTC", "ETH"]` | Static watchlist, base symbols only (no `/USD` suffix). |
 | `CRYPTO_MAX_POSITIONS` | `1` | Ceiling on simultaneous crypto holdings. |
+| `CRYPTO_FILL_QUALIFIED_SLOTS` | `true` | Buy every fundable crypto candidate that passes all entry guards, up to `CRYPTO_MAX_POSITIONS`; `false` uses the narrower variance-aware count heuristic. |
 | `CRYPTO_DIP_THRESHOLD_PERCENT` | `5.0` | Dip size (from the recent high) required to consider buying. |
 | `CRYPTO_MIN_EXPECTED_PROFIT_PERCENT` | `1.0` | Minimum cost-adjusted historical average next-session return required to buy; the crypto equivalent of `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT`. A dip that clears `CRYPTO_DIP_THRESHOLD_PERCENT` but not this floor produces no trade — the most common reason crypto stays idle even while dips are showing in the logs. |
 | `CRYPTO_TAKE_PROFIT_PERCENT` / `CRYPTO_STOP_LOSS_PERCENT` | `1.5` / `1.0` | Exit thresholds, wider than the equity defaults since crypto moves more. |
@@ -1164,10 +1164,11 @@ while to appear even right after the service starts.
 
 Browse to `http://<this Pi's LAN IP>:8765` from any device on the same
 network — the service binds `0.0.0.0:8765` by default, so it has **no login
-and is reachable by anyone on that network**. If that's not acceptable for
-your setup, edit `/etc/systemd/system/trading-agent-dashboard.service` and
-change `Environment=DASHBOARD_HOST=0.0.0.0` to `127.0.0.1` (only reachable
-via SSH tunnel or on the Pi itself), then
+and is reachable by anyone allowed through the host firewall**. If that's not
+acceptable for your setup, edit
+`/etc/systemd/system/trading-agent-dashboard.service` and change
+`Environment=DASHBOARD_HOST=0.0.0.0` to `127.0.0.1` (only reachable via SSH
+tunnel or on the Pi itself), then
 `sudo systemctl daemon-reload && sudo systemctl restart trading-agent-dashboard.service`.
 Follow its logs with `sudo journalctl -u trading-agent-dashboard.service -f`;
 check status/stop/start it like any other service in this project.

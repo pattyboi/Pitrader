@@ -1,7 +1,6 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
 import faulthandler
-import json
 import math
 import os
 import smtplib
@@ -10,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable
@@ -22,7 +21,6 @@ import article_filter
 import decision_math
 import email_render
 import signal_snapshot
-import trade_counter
 from autonomous_universe import AutonomousUniverse
 from llm_news import (
     LLMNewsAnalyzer,
@@ -31,13 +29,13 @@ from llm_news import (
     purchase_veto_reason,
 )
 from news_context import NewsContext, WorldEventAnalyzer
-from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
-from runtime_state import DuckDBStateStore
+from portfolio_memory import PortfolioMemory
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
 from symbol_reference import SymbolReference
+from strategy_support import BrokerRuntimeSupport, IterationContext, update_memory_forecasts
 
 
-class AssetRotationStrategy(Strategy):
+class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
     """Run the default dip-signal portfolio with a learned A/B opportunity."""
 
     parameters = {
@@ -159,58 +157,6 @@ class AssetRotationStrategy(Strategy):
     def _portfolio_rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_rotation_state_file")
         return Path(str(raw)) if raw else None
-
-    def _runtime_state(self) -> DuckDBStateStore | None:
-        raw = self.parameters.get("runtime_state_database_file")
-        if not raw:
-            return None
-        path = Path(str(raw))
-        cached = getattr(self, "_runtime_state_store", None)
-        if cached is None or cached.database_path != path:
-            cached = DuckDBStateStore(path)
-            self._runtime_state_store = cached
-        return cached
-
-    def _load_runtime_value(
-        self, key: str, legacy_path: Path | None, *, plain_text: bool = False
-    ) -> tuple[bool, Any]:
-        store = self._runtime_state()
-        if store is not None:
-            found, value = store.get(key)
-            if found:
-                return True, value
-        if legacy_path is None or not legacy_path.exists():
-            return False, None
-        text = legacy_path.read_text(encoding="utf-8")
-        value = text.strip() if plain_text else json.loads(text)
-        if store is not None:
-            store.set(key, value)
-        return True, value
-
-    def _save_runtime_value(
-        self,
-        key: str,
-        value: Any,
-        legacy_path: Path | None,
-        *,
-        delete_empty: bool = False,
-        plain_text: bool = False,
-    ) -> None:
-        store = self._runtime_state()
-        if store is not None:
-            # Persist an explicit empty value as a tombstone. Deleting the key
-            # would make the next restart re-import a stale legacy file.
-            store.set(key, value)
-            return
-        if legacy_path is None:
-            return
-        if delete_empty and not value:
-            legacy_path.unlink(missing_ok=True)
-            return
-        temporary_path = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
-        serialized = str(value) if plain_text else json.dumps(value, sort_keys=True)
-        temporary_path.write_text(serialized + "\n", encoding="utf-8")
-        temporary_path.replace(legacy_path)
 
     def _portfolio_state_guard(self) -> threading.RLock:
         """Return the shared lock protecting callback/iteration state swaps."""
@@ -356,14 +302,6 @@ class AssetRotationStrategy(Strategy):
             }
         except Exception:
             return {}
-
-    @staticmethod
-    def _valid_iso_date(value: str) -> bool:
-        try:
-            date_type.fromisoformat(value)
-            return True
-        except ValueError:
-            return False
 
     def _set_portfolio_holding_dates(self, dates: dict[str, str]) -> None:
         with self._portfolio_state_guard():
@@ -511,78 +449,6 @@ class AssetRotationStrategy(Strategy):
             return today - date_type.fromisoformat(entry_date) >= timedelta(days=maximum_days)
         except ValueError:
             return False
-
-    def _cached_orders(self) -> list[Any]:
-        """Fetch open orders once per iteration; _has_active_order is called
-        from several loop sites per iteration and they all describe the same
-        broker-side order book, so refetching per call is a pure waste of a
-        network round-trip. Cleared by _invalidate_orders_cache()."""
-        cached = getattr(self, "_orders_cache", None)
-        if cached is None:
-            cached = self.get_orders() or []
-            self._orders_cache = cached
-        return cached
-
-    def _invalidate_orders_cache(self) -> None:
-        self._orders_cache = None
-
-    def _has_active_order(self, symbol: str, side: str) -> bool:
-        """Best-effort check for a working order; unknown states count as active."""
-        try:
-            orders = self._cached_orders()
-        except Exception as exc:
-            self.log_message(
-                f"Could not read orders ({type(exc).__name__}: {exc}); "
-                "assuming one may still be working.",
-                color="yellow",
-            )
-            return True
-        for order in orders:
-            order_symbol = getattr(getattr(order, "asset", None), "symbol", None)
-            order_side = str(getattr(order, "side", "")).lower()
-            if order_symbol != symbol or order_side != side.lower():
-                continue
-            status = str(getattr(order, "status", "")).lower()
-            if status not in self._TERMINAL_ORDER_STATUSES:
-                return True
-        return False
-
-    @staticmethod
-    def _order_status(order: Any) -> str:
-        """Normalize Lumibot enum/string statuses for submission checks."""
-        status = getattr(order, "status", "")
-        value = getattr(status, "value", status)
-        return str(value).strip().lower()
-
-    def _submit_order_checked(self, order: Any, description: str) -> bool:
-        """Submit and reject Lumibot's non-raising synchronous error result.
-
-        Alpaca's Lumibot broker catches API exceptions, sets ``order.status``
-        to ``error``, and returns the order. Callers therefore cannot use the
-        absence of an exception as proof that the broker accepted it.
-        """
-        submitted = self.submit_order(order)
-        if submitted is None:
-            self.log_message(
-                f"Broker did not accept {description}: submission returned no order.",
-                color="red",
-            )
-            return False
-        status = self._order_status(submitted)
-        if status in self._FAILED_ORDER_STATUSES:
-            error = str(getattr(submitted, "error_message", "") or "").strip()
-            suffix = f": {error}" if error else ""
-            self.log_message(
-                f"Broker rejected {description} (status={status}){suffix}.",
-                color="red",
-            )
-            return False
-        trade_counter.record_trade(
-            str(self.parameters.get("portfolio_trade_count_file", "")),
-            self.get_datetime().date().isoformat(),
-        )
-        self._invalidate_orders_cache()
-        return True
 
     def _submit_portfolio_rotation_sell(
         self,
@@ -1104,98 +970,17 @@ class AssetRotationStrategy(Strategy):
         llm_score: int | None,
     ) -> dict[str, RotationForecast]:
         """Record and forecast every evaluated symbol with one pooled fit."""
-        if not signals:
-            return {}
-        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
-            disabled = RotationForecast(
-                0, False, None, None, "Portfolio memory is disabled in config.json."
-            )
-            return {str(signal["symbol"]): disabled for signal in signals}
-        inputs = [
-            PortfolioMemoryInput(
-                symbol=str(signal["symbol"]),
-                price=float(signal["price"]),
-                dip_percent=float(signal["dip"]),
-                llm_score=llm_score,
-                signal_present=bool(signal.get("qualifies")),
-                live_spread_percent=signal.get("live_spread_percent"),
-                recent_avg_volume=signal.get("recent_avg_volume"),
-                historical_expected_profit=signal.get("expected_profit"),
-                historical_win_probability=signal.get("win_probability"),
-                historical_return_stdev=signal.get("return_stdev"),
-            )
-            for signal in signals
-        ]
-        try:
-            return self._portfolio_memory().update_many_and_forecast(
-                self.get_datetime().date().isoformat(), inputs
-            )
-        except Exception as exc:
-            self.log_message(
-                f"Portfolio memory batch update failed safely: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
-            failed = RotationForecast(
-                0, False, None, None, f"Portfolio memory failed: {type(exc).__name__}: {exc}"
-            )
-            return {item.symbol: failed for item in inputs}
-
-    def _backfill_portfolio_memory(
-        self,
-        symbol: str,
-        history: list[tuple[str, float, float]] | None = None,
-    ) -> None:
-        """Seed one symbol's pooled memory from settled daily bars, once ever.
-
-        Mirrors _backfill_decision_memory's price-only, once-per-symbol
-        approach, but tracked in a set (not a single bool) since autonomous
-        discovery can introduce new symbols throughout the process lifetime.
-        """
-        backfilled = self.vars.portfolio_memory_backfilled_symbols
-        if symbol in backfilled:
-            return
-        backfilled.add(symbol)
-        if not bool(self.parameters.get("portfolio_memory_enabled", True)):
-            return
-        try:
-            if history is None:
-                bars = self.get_historical_prices(
-                    symbol, int(self.parameters["portfolio_analysis_days"]), "day"
-                )
-                if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
-                    return
-                frame = bars.df[["high", "close"]].dropna()
-                values = frame.to_numpy(dtype=np.float64, copy=False)
-                valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
-                values = values[valid]
-                dates = frame.index[valid]
-                lookback = int(self.parameters["recent_high_lookback_days"])
-                threshold = float(self.parameters["dip_threshold_percent"])
-                dips, next_returns = decision_math.historical_dip_returns(
-                    values[:, 0], values[:, 1], lookback
-                )
-                selected = dips >= threshold
-                history = [
-                    (
-                        str(date.date() if hasattr(date, "date") else date),
-                        float(dip),
-                        float(next_return),
-                    )
-                    for date, dip, next_return in zip(
-                        dates[lookback:-1][selected], dips[selected], next_returns[selected]
-                    )
-                ]
-            inserted = self._portfolio_memory().backfill_history(symbol, history)
-            if inserted:
-                self.log_message(
-                    f"Portfolio-memory historical backfill added {inserted} settled observations for {symbol}.",
-                    color="blue",
-                )
-        except Exception as exc:
-            self.log_message(
-                f"Portfolio-memory historical backfill failed safely for {symbol}: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
+        return update_memory_forecasts(
+            signals=signals,
+            evaluation_date=self.get_datetime().date().isoformat(),
+            llm_score=llm_score,
+            enabled=bool(self.parameters.get("portfolio_memory_enabled", True)),
+            memory_factory=self._portfolio_memory,
+            disabled_explanation="Portfolio memory is disabled in config.json.",
+            failure_label="Portfolio memory",
+            log_message=self.log_message,
+            include_recent_volume=True,
+        )
 
     def _record_memory_decision(self, report: dict[str, Any]) -> None:
         """Persist the final decision label after an observation was recorded."""
@@ -1212,16 +997,6 @@ class AssetRotationStrategy(Strategy):
                 f"Could not label decision-memory entry: {type(exc).__name__}: {exc}",
                 color="red",
             )
-
-    @staticmethod
-    def _quantity(position: Any) -> Decimal:
-        """Return a safe, non-negative quantity for a Lumibot position."""
-        if position is None:
-            return Decimal("0")
-        try:
-            return max(Decimal(str(position.quantity)), Decimal("0"))
-        except (AttributeError, InvalidOperation, TypeError, ValueError):
-            return Decimal("0")
 
     def _managed_portfolio_symbols(self) -> set[str]:
         """Return symbols this strategy is permitted to count or sell.
@@ -2505,6 +2280,74 @@ class AssetRotationStrategy(Strategy):
         }
         return actions, claimed_symbols
 
+    def _prepare_portfolio_iteration_context(
+        self,
+        report: dict[str, Any],
+        managed_symbols: set[str],
+        held: dict[str, Decimal],
+        entry_prices: dict[str, float],
+    ) -> IterationContext:
+        """Collect every non-order input used by the portfolio decision."""
+        symbols = self._portfolio_symbols(report, held, managed_symbols)
+        self._refresh_symbol_reference(symbols)
+        news_context = self._get_news_context()
+        report.update(
+            news_risk_level=news_context.risk_level,
+            news_score=news_context.score if news_context.available else "unavailable",
+            news_article_count=(
+                news_context.article_count if news_context.available else "unavailable"
+            ),
+            news_explanation=news_context.explanation,
+            news_headlines=news_context.headlines,
+        )
+        symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
+        llm_assessment = self._get_llm_news_assessment(
+            news_context, symbols, set(held), symbol_news_scores
+        )
+        report.update(
+            llm_risk_level=llm_assessment.risk_level,
+            llm_score=(llm_assessment.score if llm_assessment.available else "unavailable"),
+            llm_reasoning=(
+                llm_assessment.reasoning
+                if llm_assessment.available
+                else llm_assessment.explanation
+            ),
+        )
+        nightly_learnings = self._load_nightly_preeval_learnings()
+        if nightly_learnings:
+            report["nightly_learned_summary"] = (
+                nightly_learnings.get("summary") or "no notable verdicts"
+            )
+            report["nightly_learned_symbol_count"] = nightly_learnings.get(
+                "symbol_count", 0
+            )
+
+        discovered_only = sorted(set(symbols) - managed_symbols - set(held))
+        excluded_symbols = self._run_pretrade_discovery_analysis(
+            discovered_only, news_context, symbol_news_scores, report
+        )
+        if excluded_symbols:
+            symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
+        veto_reason = purchase_veto_reason(
+            llm_assessment,
+            enabled=bool(self.parameters.get("llm_news_enabled", False)),
+            fail_closed_on_unavailable=bool(
+                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
+            ),
+            block_score=int(self.parameters.get("llm_news_block_score", -6)),
+        )
+        return IterationContext(
+            report=report,
+            managed_symbols=managed_symbols,
+            held=held,
+            entry_prices=entry_prices,
+            symbols=symbols,
+            news_context=news_context,
+            llm_assessment=llm_assessment,
+            symbol_news_scores=symbol_news_scores,
+            veto_reason=veto_reason,
+        )
+
     def _run_portfolio_iteration(self, report: dict[str, Any]) -> None:
         """Build or rotate a bounded portfolio from the explicit symbol list."""
         self._invalidate_orders_cache()
@@ -2528,62 +2371,15 @@ class AssetRotationStrategy(Strategy):
         report["portfolio_holdings"] = (
             ", ".join(f"{symbol}={quantity}" for symbol, quantity in sorted(held.items())) or "none"
         )
-        symbols = self._portfolio_symbols(report, held, managed_symbols)
-        self._refresh_symbol_reference(symbols)
-
-        news_context = self._get_news_context()
-        report.update(
-            news_risk_level=news_context.risk_level,
-            news_score=news_context.score if news_context.available else "unavailable",
-            news_article_count=(
-                news_context.article_count if news_context.available else "unavailable"
-            ),
-            news_explanation=news_context.explanation,
-            news_headlines=news_context.headlines,
+        context = self._prepare_portfolio_iteration_context(
+            report, managed_symbols, held, entry_prices
         )
-        # Deterministic scoring remains preprocessing only: it attributes and
-        # prioritizes articles for the LLM, but no longer casts a second vote
-        # in ranking, learned forecasts, or purchase vetoes.
-        symbol_news_scores = self._symbol_news_scores(news_context, set(symbols))
-        llm_assessment = self._get_llm_news_assessment(
-            news_context, symbols, set(held), symbol_news_scores
-        )
-        report.update(
-            llm_risk_level=llm_assessment.risk_level,
-            llm_score=llm_assessment.score if llm_assessment.available else "unavailable",
-            llm_reasoning=(
-                llm_assessment.reasoning
-                if llm_assessment.available
-                else llm_assessment.explanation
-            ),
-        )
-        nightly_learnings = self._load_nightly_preeval_learnings()
-        if nightly_learnings:
-            report["nightly_learned_summary"] = (
-                nightly_learnings.get("summary") or "no notable verdicts"
-            )
-            report["nightly_learned_symbol_count"] = nightly_learnings.get("symbol_count", 0)
-
-        # Screen only symbols discovery itself just surfaced -- never a held
-        # or statically-configured symbol -- for a severe, company-specific
-        # red flag the liquidity/price floor can't see. Advisory by default;
-        # see _check_discovery_red_flags.
-        discovered_only = sorted(set(symbols) - managed_symbols - set(held))
-        excluded_symbols = self._run_pretrade_discovery_analysis(
-            discovered_only, news_context, symbol_news_scores, report
-        )
-        if excluded_symbols:
-            symbols = [symbol for symbol in symbols if symbol not in excluded_symbols]
-
+        symbols = context.symbols
+        news_context = context.news_context
+        symbol_news_scores = context.symbol_news_scores
+        llm_assessment = context.llm_assessment
+        veto_reason = context.veto_reason
         proxy_price = self.get_last_price(str(self.parameters["asset_b"]).upper())
-        veto_reason = purchase_veto_reason(
-            llm_assessment,
-            enabled=bool(self.parameters.get("llm_news_enabled", False)),
-            fail_closed_on_unavailable=bool(
-                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
-            ),
-            block_score=int(self.parameters.get("llm_news_block_score", -6)),
-        )
         llm_exposure = decision_math.llm_exposure_multiplier(
             llm_assessment.score if llm_assessment.available else None
         )
@@ -2717,8 +2513,12 @@ class AssetRotationStrategy(Strategy):
                 if forecast.ready and forecast.predicted_edge_percent is not None
                 else None
             )
+            signal["symbol_news_score"] = int(symbol_news_scores.get(symbol, 0))
             signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
-                signal, risk_posture, llm_purchase_score
+                signal,
+                risk_posture,
+                llm_purchase_score,
+                signal["symbol_news_score"],
             )
         report["portfolio_risk_posture"] = risk_posture
         signal_snapshot.write_snapshot(
@@ -2830,11 +2630,24 @@ class AssetRotationStrategy(Strategy):
                 (float(signal["posture_adjusted_edge"]), float(signal.get("return_stdev") or 0.0))
                 for signal in remaining_candidates
             ]
-            effective_max_positions = self._optimal_position_count(
-                float(total_capital), min_order_dollars, candidate_edges, max_positions
-            )
+            build_candidates = [
+                signal
+                for signal in remaining_candidates
+                if str(signal["symbol"]) not in held_working
+            ]
+            if bool(self.parameters.get("portfolio_fill_qualified_slots", True)):
+                effective_max_positions = decision_math.qualified_position_count(
+                    float(total_capital),
+                    min_order_dollars,
+                    len(held_working) + len(build_candidates),
+                    max_positions,
+                )
+            else:
+                effective_max_positions = self._optimal_position_count(
+                    float(total_capital), min_order_dollars, candidate_edges, max_positions
+                )
             report["portfolio_effective_max_positions"] = effective_max_positions
-            desired = remaining_candidates[:effective_max_positions]
+            desired = build_candidates[:effective_max_positions]
 
             builds_submitted = self._submit_portfolio_builds(
                 desired,

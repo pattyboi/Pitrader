@@ -172,8 +172,7 @@ install -o root -g root -m 0644 /dev/null "${DASHBOARD_SERVICE_FILE}"
 tee "${DASHBOARD_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=Browser dashboard for the trading agent's per-symbol signal snapshot
-After=network.target awg-quick@awg0.service
-Requires=awg-quick@awg0.service
+After=network.target
 
 [Service]
 Type=simple
@@ -184,9 +183,8 @@ ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/web_dashboard.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
-# The dashboard has no login and contains position/signal information. Bind only
-# to AmneziaWG's server address so neither Ethernet nor Wi-Fi can reach it.
-Environment=DASHBOARD_HOST=10.29.70.1
+# The host firewall is the access boundary. Listen on LAN and VPN interfaces.
+Environment=DASHBOARD_HOST=0.0.0.0
 Environment=DASHBOARD_PORT=8765
 NoNewPrivileges=true
 PrivateTmp=true
@@ -310,7 +308,7 @@ echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
 echo "${CRYPTO_SERVICE_NAME} is also installed and running, but idles until CRYPTO_ENABLED is true in config.json (and only trades while NYSE is closed)."
 echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
-echo "${DASHBOARD_SERVICE_NAME} is installed on AmneziaWG at http://10.29.70.1:8765."
+echo "${DASHBOARD_SERVICE_NAME} is available on LAN and VPN interfaces at http://<this Pi's IP>:8765."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
     echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"
 fi

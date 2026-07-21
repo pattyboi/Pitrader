@@ -17,9 +17,17 @@ files (see crypto_strategy.py).
 import logging
 import os
 import sys
+from pathlib import Path
 
 from lumibot.traders import Trader
 
+from config_support import (
+    EMAIL_CONFIG_KEYS,
+    LLM_CONFIG_KEYS,
+    NEWS_CONFIG_KEYS,
+    resolve_state_paths,
+    select_parameters,
+)
 from crypto_strategy import CryptoRotationStrategy
 from main import (
     BASE_DIR,
@@ -32,8 +40,68 @@ from main import (
 )
 
 
+_CRYPTO_PARAMETER_KEYS = (
+    "CRYPTO_ENABLED",
+    "CRYPTO_SYMBOLS",
+    "CRYPTO_MAX_POSITIONS",
+    "CRYPTO_FILL_QUALIFIED_SLOTS",
+    "CRYPTO_ANALYSIS_DAYS",
+    "CRYPTO_RECENT_HIGH_LOOKBACK_DAYS",
+    "CRYPTO_MIN_SIGNAL_OBSERVATIONS",
+    "CRYPTO_DIP_THRESHOLD_PERCENT",
+    "CRYPTO_MIN_EXPECTED_PROFIT_PERCENT",
+    "CRYPTO_OOS_MIN_OBSERVATIONS",
+    "CRYPTO_OOS_MIN_NET_PROFIT_PERCENT",
+    "CRYPTO_ROUND_TRIP_COST_PERCENT",
+    "CRYPTO_TAKE_PROFIT_PERCENT",
+    "CRYPTO_STOP_LOSS_PERCENT",
+    "CRYPTO_HOLDING_HORIZON_MAX_DAYS",
+    "CRYPTO_MIN_ORDER_DOLLARS",
+    "CRYPTO_ITERATION_INTERVAL_MINUTES",
+    "CRYPTO_NEWS_REFRESH_MINUTES",
+    "CRYPTO_RISK_POSTURE",
+    "CRYPTO_MEMORY_ENABLED",
+    "CRYPTO_MEMORY_MIN_OBSERVATIONS",
+    "CRYPTO_MEMORY_MAX_OBSERVATIONS",
+    "CRYPTO_MEMORY_MIN_CORRELATION",
+    "CRYPTO_EMAIL_REPORT_ENABLED",
+    "CRYPTO_AUTONOMOUS_DISCOVERY",
+    "CRYPTO_DISCOVERY_BATCH_SIZE",
+    "CRYPTO_DISCOVERY_REFRESH_DAYS",
+    "CRYPTO_ASSET_A",
+    "CRYPTO_ASSET_B",
+    "CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY",
+)
+
+_CRYPTO_STATE_FILES = {
+    "crypto_holding_state_file": ".crypto_holding_state.json",
+    "crypto_runtime_state_database_file": ".crypto_runtime_state.duckdb",
+    "crypto_signal_snapshot_file": ".crypto_signal_snapshot.json",
+    "crypto_trade_count_file": ".crypto_trade_count.json",
+    "crypto_memory_database_file": ".crypto_portfolio_memory.duckdb",
+    "crypto_trade_memory_database_file": ".crypto_trade_memory.duckdb",
+    "crypto_email_state_file": ".crypto_last_email_report",
+    "crypto_universe_database_file": ".crypto_universe.duckdb",
+    "crypto_rotation_state_file": ".crypto_rotation_state.json",
+    "crypto_opportunistic_swap_state_file": ".crypto_opportunistic_swap_state.json",
+    "shutdown_diagnostic_file": ".crypto_shutdown_diagnostic.log",
+}
+
+
+def _crypto_strategy_parameters(config: dict, base_dir: Path) -> dict:
+    parameters = select_parameters(
+        config,
+        _CRYPTO_PARAMETER_KEYS,
+        EMAIL_CONFIG_KEYS,
+        NEWS_CONFIG_KEYS,
+        LLM_CONFIG_KEYS,
+    )
+    parameters.update(resolve_state_paths(base_dir, _CRYPTO_STATE_FILES))
+    return parameters
+
+
 def build_crypto_strategy(
-    config: dict, base_dir
+    config: dict, base_dir: Path
 ) -> tuple[MarketOpenLoggingAlpaca, CryptoRotationStrategy]:
     """Construct the broker and crypto strategy from validated config.
 
@@ -50,66 +118,7 @@ def build_crypto_strategy(
     )
     strategy = CryptoRotationStrategy(
         broker=broker,
-        parameters={
-            "crypto_enabled": config["CRYPTO_ENABLED"],
-            "crypto_symbols": config["CRYPTO_SYMBOLS"],
-            "crypto_max_positions": config["CRYPTO_MAX_POSITIONS"],
-            "crypto_analysis_days": config["CRYPTO_ANALYSIS_DAYS"],
-            "crypto_recent_high_lookback_days": config["CRYPTO_RECENT_HIGH_LOOKBACK_DAYS"],
-            "crypto_min_signal_observations": config["CRYPTO_MIN_SIGNAL_OBSERVATIONS"],
-            "crypto_dip_threshold_percent": config["CRYPTO_DIP_THRESHOLD_PERCENT"],
-            "crypto_min_expected_profit_percent": config["CRYPTO_MIN_EXPECTED_PROFIT_PERCENT"],
-            "crypto_oos_min_observations": config["CRYPTO_OOS_MIN_OBSERVATIONS"],
-            "crypto_oos_min_net_profit_percent": config["CRYPTO_OOS_MIN_NET_PROFIT_PERCENT"],
-            "crypto_round_trip_cost_percent": config["CRYPTO_ROUND_TRIP_COST_PERCENT"],
-            "crypto_take_profit_percent": config["CRYPTO_TAKE_PROFIT_PERCENT"],
-            "crypto_stop_loss_percent": config["CRYPTO_STOP_LOSS_PERCENT"],
-            "crypto_holding_horizon_max_days": config["CRYPTO_HOLDING_HORIZON_MAX_DAYS"],
-            "crypto_min_order_dollars": config["CRYPTO_MIN_ORDER_DOLLARS"],
-            "crypto_iteration_interval_minutes": config["CRYPTO_ITERATION_INTERVAL_MINUTES"],
-            "crypto_news_refresh_minutes": config["CRYPTO_NEWS_REFRESH_MINUTES"],
-            "crypto_risk_posture": config["CRYPTO_RISK_POSTURE"],
-            "crypto_holding_state_file": str(base_dir / ".crypto_holding_state.json"),
-            "crypto_runtime_state_database_file": str(base_dir / ".crypto_runtime_state.duckdb"),
-            "crypto_signal_snapshot_file": str(base_dir / ".crypto_signal_snapshot.json"),
-            "crypto_trade_count_file": str(base_dir / ".crypto_trade_count.json"),
-            "crypto_memory_enabled": config["CRYPTO_MEMORY_ENABLED"],
-            "crypto_memory_min_observations": config["CRYPTO_MEMORY_MIN_OBSERVATIONS"],
-            "crypto_memory_max_observations": config["CRYPTO_MEMORY_MAX_OBSERVATIONS"],
-            "crypto_memory_min_correlation": config["CRYPTO_MEMORY_MIN_CORRELATION"],
-            "crypto_memory_database_file": str(base_dir / ".crypto_portfolio_memory.duckdb"),
-            "crypto_trade_memory_database_file": str(base_dir / ".crypto_trade_memory.duckdb"),
-            "crypto_email_report_enabled": config["CRYPTO_EMAIL_REPORT_ENABLED"],
-            "email_smtp_host": config["EMAIL_SMTP_HOST"],
-            "email_smtp_port": config["EMAIL_SMTP_PORT"],
-            "email_smtp_username": config["EMAIL_SMTP_USERNAME"],
-            "email_from_address": config["EMAIL_FROM_ADDRESS"],
-            "email_to_address": config["EMAIL_TO_ADDRESS"],
-            "email_use_tls": config["EMAIL_USE_TLS"],
-            "crypto_email_state_file": str(base_dir / ".crypto_last_email_report"),
-            "crypto_autonomous_discovery": config["CRYPTO_AUTONOMOUS_DISCOVERY"],
-            "crypto_discovery_batch_size": config["CRYPTO_DISCOVERY_BATCH_SIZE"],
-            "crypto_discovery_refresh_days": config["CRYPTO_DISCOVERY_REFRESH_DAYS"],
-            "crypto_universe_database_file": str(base_dir / ".crypto_universe.duckdb"),
-            "crypto_asset_a": config["CRYPTO_ASSET_A"],
-            "crypto_asset_b": config["CRYPTO_ASSET_B"],
-            "crypto_opportunistic_min_probability": config["CRYPTO_OPPORTUNISTIC_MIN_PROBABILITY"],
-            "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
-            "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
-            "news_max_articles": config["NEWS_MAX_ARTICLES"],
-            "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
-            "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
-            "llm_news_enabled": config["LLM_NEWS_ENABLED"],
-            "llm_news_model": config["LLM_NEWS_MODEL"],
-            "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
-            "llm_news_fail_closed_on_unavailable": config[
-                "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
-            ],
-            "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
-            "crypto_rotation_state_file": str(base_dir / ".crypto_rotation_state.json"),
-            "crypto_opportunistic_swap_state_file": str(base_dir / ".crypto_opportunistic_swap_state.json"),
-            "shutdown_diagnostic_file": str(base_dir / ".crypto_shutdown_diagnostic.log"),
-        },
+        parameters=_crypto_strategy_parameters(config, base_dir),
     )
     return broker, strategy
 

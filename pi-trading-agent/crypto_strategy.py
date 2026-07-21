@@ -18,7 +18,6 @@ that will never come for a 24/7 asset).
 """
 
 import faulthandler
-import json
 import math
 import os
 import re
@@ -28,7 +27,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable
@@ -40,14 +39,13 @@ import numpy as np
 import decision_math
 import email_render
 import signal_snapshot
-import trade_counter
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, purchase_veto_reason
 from news_context import NewsContext, WorldEventAnalyzer
-from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
-from runtime_state import DuckDBStateStore
+from portfolio_memory import PortfolioMemory
 from trade_memory import OpportunityProbability, RotationForecast, TradeMemory
+from strategy_support import BrokerRuntimeSupport, IterationContext, update_memory_forecasts
 
 _CRYPTO_BASE_SYMBOL = re.compile(r"^[A-Z0-9]{1,10}$")
 
@@ -73,8 +71,12 @@ def _crypto_asset_symbol_filter(item: dict[str, Any]) -> str | None:
     return base
 
 
-class CryptoRotationStrategy(Strategy):
+class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
     """Run a dip-signal crypto rotation only while NYSE regular hours are closed."""
+
+    _RUNTIME_STATE_DATABASE_PARAMETER = "crypto_runtime_state_database_file"
+    _TRADE_COUNT_PARAMETER = "crypto_trade_count_file"
+    _DELETE_EMPTY_ONLY_WHEN_NONE = True
 
     parameters = {
         "crypto_enabled": False,
@@ -188,58 +190,6 @@ class CryptoRotationStrategy(Strategy):
     def _crypto_state_guard(self) -> threading.RLock:
         return self._crypto_state_lock
 
-    def _runtime_state(self) -> DuckDBStateStore | None:
-        raw = self.parameters.get("crypto_runtime_state_database_file")
-        if not raw:
-            return None
-        path = Path(str(raw))
-        cached = getattr(self, "_runtime_state_store", None)
-        if cached is None or cached.database_path != path:
-            cached = DuckDBStateStore(path)
-            self._runtime_state_store = cached
-        return cached
-
-    def _load_runtime_value(
-        self, key: str, legacy_path: Path | None, *, plain_text: bool = False
-    ) -> tuple[bool, Any]:
-        store = self._runtime_state()
-        if store is not None:
-            found, value = store.get(key)
-            if found:
-                return True, value
-        if legacy_path is None or not legacy_path.exists():
-            return False, None
-        text = legacy_path.read_text(encoding="utf-8")
-        value = text.strip() if plain_text else json.loads(text)
-        if store is not None:
-            store.set(key, value)
-        return True, value
-
-    def _save_runtime_value(
-        self,
-        key: str,
-        value: Any,
-        legacy_path: Path | None,
-        *,
-        delete_empty: bool = False,
-        plain_text: bool = False,
-    ) -> None:
-        store = self._runtime_state()
-        if store is not None:
-            # Persist an explicit null tombstone so a stale legacy rotation
-            # file cannot be imported again after the rotation completes.
-            store.set(key, value)
-            return
-        if legacy_path is None:
-            return
-        if delete_empty and value is None:
-            legacy_path.unlink(missing_ok=True)
-            return
-        temporary_path = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
-        serialized = str(value) if plain_text else json.dumps(value, sort_keys=True)
-        temporary_path.write_text(serialized + "\n", encoding="utf-8")
-        temporary_path.replace(legacy_path)
-
     # -- Holding-date state (restart-safe, mirrors AssetRotationStrategy's
     # portfolio_holding_dates in strategy.py) --------------------------------
 
@@ -263,14 +213,6 @@ class CryptoRotationStrategy(Strategy):
             }
         except Exception:
             return {}
-
-    @staticmethod
-    def _valid_iso_date(value: str) -> bool:
-        try:
-            date_type.fromisoformat(value)
-            return True
-        except ValueError:
-            return False
 
     def _set_crypto_holding_dates(self, dates: dict[str, str]) -> None:
         with self._crypto_state_guard():
@@ -389,64 +331,6 @@ class CryptoRotationStrategy(Strategy):
         except Exception as exc:
             self.log_message(f"Could not persist crypto opportunistic-swap state: {exc}", color="red")
 
-    # -- Order helpers (broker-generic; mirrors AssetRotationStrategy's
-    # methods of the same name in strategy.py) -------------------------------
-
-    def _cached_orders(self) -> list[Any]:
-        """Fetch open orders once per iteration; see strategy.py's identical
-        helper for why this is shared across every _has_active_order call site."""
-        cached = getattr(self, "_orders_cache", None)
-        if cached is None:
-            cached = self.get_orders() or []
-            self._orders_cache = cached
-        return cached
-
-    def _invalidate_orders_cache(self) -> None:
-        self._orders_cache = None
-
-    def _has_active_order(self, symbol: str, side: str) -> bool:
-        try:
-            orders = self._cached_orders()
-        except Exception as exc:
-            self.log_message(
-                f"Could not read orders ({type(exc).__name__}: {exc}); assuming one may still be working.",
-                color="yellow",
-            )
-            return True
-        for order in orders:
-            order_symbol = getattr(getattr(order, "asset", None), "symbol", None)
-            order_side = str(getattr(order, "side", "")).lower()
-            if order_symbol != symbol or order_side != side.lower():
-                continue
-            status = str(getattr(order, "status", "")).lower()
-            if status not in self._TERMINAL_ORDER_STATUSES:
-                return True
-        return False
-
-    @staticmethod
-    def _order_status(order: Any) -> str:
-        status = getattr(order, "status", "")
-        value = getattr(status, "value", status)
-        return str(value).strip().lower()
-
-    def _submit_order_checked(self, order: Any, description: str) -> bool:
-        submitted = self.submit_order(order)
-        if submitted is None:
-            self.log_message(f"Broker did not accept {description}: submission returned no order.", color="red")
-            return False
-        status = self._order_status(submitted)
-        if status in self._FAILED_ORDER_STATUSES:
-            error = str(getattr(submitted, "error_message", "") or "").strip()
-            suffix = f": {error}" if error else ""
-            self.log_message(f"Broker rejected {description}{suffix}.", color="red")
-            return False
-        trade_counter.record_trade(
-            str(self.parameters.get("crypto_trade_count_file", "")),
-            self.get_datetime().date().isoformat(),
-        )
-        self._invalidate_orders_cache()
-        return True
-
     # -- Pricing helpers (Asset-wrapped so the quote resolves for crypto,
     # unlike the bare-string calls the equity pipeline uses) -----------------
 
@@ -538,15 +422,6 @@ class CryptoRotationStrategy(Strategy):
         return value if math.isfinite(value) and value > 0 else None
 
     # -- Positions -------------------------------------------------------
-
-    @staticmethod
-    def _quantity(position: Any) -> Decimal:
-        if position is None:
-            return Decimal("0")
-        try:
-            return max(Decimal(str(position.quantity)), Decimal("0"))
-        except (AttributeError, InvalidOperation, TypeError, ValueError):
-            return Decimal("0")
 
     def _crypto_held_positions(
         self, managed_symbols: set[str]
@@ -930,99 +805,22 @@ class CryptoRotationStrategy(Strategy):
             self._crypto_memory_key = key
         return cached
 
-    def _backfill_crypto_memory(
-        self,
-        symbol: str,
-        history: list[tuple[str, float, float]] | None = None,
-    ) -> None:
-        """Seed one symbol's pooled memory from settled daily bars, once ever."""
-        backfilled = self.vars.crypto_memory_backfilled_symbols
-        if symbol in backfilled:
-            return
-        backfilled.add(symbol)
-        if not bool(self.parameters.get("crypto_memory_enabled", True)):
-            return
-        try:
-            if history is None:
-                bars = self.get_historical_prices(
-                    self._crypto_asset(symbol),
-                    int(self.parameters["crypto_analysis_days"]),
-                    "day",
-                    quote=self.quote_asset,
-                )
-                if bars is None or bars.df is None or bars.df.empty or not {"high", "close"}.issubset(bars.df.columns):
-                    return
-                frame = bars.df[["high", "close"]].dropna()
-                values = frame.to_numpy(dtype=np.float64, copy=False)
-                valid = np.isfinite(values).all(axis=1) & (values > 0).all(axis=1)
-                values = values[valid]
-                dates = frame.index[valid]
-                lookback = int(self.parameters["crypto_recent_high_lookback_days"])
-                threshold = float(self.parameters["crypto_dip_threshold_percent"])
-                dips, next_returns = decision_math.historical_dip_returns(
-                    values[:, 0], values[:, 1], lookback
-                )
-                selected = dips >= threshold
-                history = [
-                    (
-                        str(date.date() if hasattr(date, "date") else date),
-                        float(dip),
-                        float(next_return),
-                    )
-                    for date, dip, next_return in zip(
-                        dates[lookback:-1][selected], dips[selected], next_returns[selected]
-                    )
-                ]
-            inserted = self._crypto_memory().backfill_history(symbol, history)
-            if inserted:
-                self.log_message(
-                    f"Crypto-memory historical backfill added {inserted} settled observations for {symbol}.",
-                    color="blue",
-                )
-        except Exception as exc:
-            self.log_message(
-                f"Crypto-memory historical backfill failed safely for {symbol}: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
-
     def _update_crypto_memories(
         self,
         signals: list[dict[str, Any]],
         evaluation_date: str,
         llm_score: int | None,
     ) -> dict[str, RotationForecast]:
-        if not signals:
-            return {}
-        if not bool(self.parameters.get("crypto_memory_enabled", True)):
-            disabled = RotationForecast(
-                0, False, None, None, "Crypto memory is disabled in config.json."
-            )
-            return {str(signal["symbol"]): disabled for signal in signals}
-        inputs = [
-            PortfolioMemoryInput(
-                symbol=str(signal["symbol"]),
-                price=float(signal["price"]),
-                dip_percent=float(signal["dip"]),
-                llm_score=llm_score,
-                signal_present=bool(signal.get("qualifies")),
-                live_spread_percent=signal.get("live_spread_percent"),
-                historical_expected_profit=signal.get("expected_profit"),
-                historical_win_probability=signal.get("win_probability"),
-                historical_return_stdev=signal.get("return_stdev"),
-            )
-            for signal in signals
-        ]
-        try:
-            return self._crypto_memory().update_many_and_forecast(evaluation_date, inputs)
-        except Exception as exc:
-            self.log_message(
-                f"Crypto memory batch update failed safely: {type(exc).__name__}: {exc}",
-                color="yellow",
-            )
-            failed = RotationForecast(
-                0, False, None, None, f"Crypto memory failed: {type(exc).__name__}: {exc}"
-            )
-            return {item.symbol: failed for item in inputs}
+        return update_memory_forecasts(
+            signals=signals,
+            evaluation_date=evaluation_date,
+            llm_score=llm_score,
+            enabled=bool(self.parameters.get("crypto_memory_enabled", True)),
+            memory_factory=self._crypto_memory,
+            disabled_explanation="Crypto memory is disabled in config.json.",
+            failure_label="Crypto memory",
+            log_message=self.log_message,
+        )
 
     # -- Autonomous discovery (mirrors AssetRotationStrategy's
     # _autonomous_universe/_portfolio_symbols/_managed_portfolio_symbols and
@@ -1422,6 +1220,64 @@ class CryptoRotationStrategy(Strategy):
 
     # -- Iteration -------------------------------------------------------
 
+    def _prepare_crypto_iteration_context(
+        self,
+        report: dict[str, Any],
+        managed_symbols: set[str],
+        held: dict[str, Decimal],
+        entry_prices: dict[str, float],
+    ) -> IterationContext:
+        """Collect news and signal inputs before crypto order decisions."""
+        symbols = self._crypto_symbols(report, held, managed_symbols)
+        news_context, llm_assessment, symbol_news_scores = self._crypto_news_signals(
+            symbols, set(held)
+        )
+        veto_reason = purchase_veto_reason(
+            llm_assessment,
+            enabled=bool(self.parameters.get("llm_news_enabled", False)),
+            fail_closed_on_unavailable=bool(
+                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
+            ),
+            block_score=int(self.parameters.get("llm_news_block_score", -6)),
+            label="Crypto purchase",
+        )
+        report.update(
+            crypto_news_risk=news_context.risk_level,
+            crypto_news_score=(
+                f"{news_context.score:+d}" if news_context.available else "unavailable"
+            ),
+            crypto_news_articles=news_context.article_count,
+            crypto_llm_risk=llm_assessment.risk_level,
+            crypto_llm_score=(
+                f"{llm_assessment.score:+d}"
+                if llm_assessment.available
+                else "unavailable"
+            ),
+            crypto_llm_reasoning=(llm_assessment.reasoning or llm_assessment.explanation),
+            crypto_purchase_guard=veto_reason or "clear",
+        )
+        raw_signals = self._crypto_signals(symbols)
+        discovery_only = set(symbols) - managed_symbols - set(held)
+        unpriceable_discovered = sorted(
+            self._unpriceable_symbols_this_iteration & discovery_only
+        )
+        if unpriceable_discovered:
+            self._exclude_unpriceable_discovered_crypto_symbols(unpriceable_discovered)
+        signals = [signal for signal in raw_signals if signal is not None]
+        self._remember_discovered_crypto_symbols(sorted(held))
+        return IterationContext(
+            report=report,
+            managed_symbols=managed_symbols,
+            held=held,
+            entry_prices=entry_prices,
+            symbols=symbols,
+            news_context=news_context,
+            llm_assessment=llm_assessment,
+            symbol_news_scores=symbol_news_scores,
+            veto_reason=veto_reason,
+            signals=signals,
+        )
+
     def _run_crypto_iteration(self, report: dict[str, Any]) -> None:
         self._invalidate_orders_cache()
         self._quote_cache = {}
@@ -1480,50 +1336,17 @@ class CryptoRotationStrategy(Strategy):
                 held_working.pop(source, None)
                 exited_this_pass.add(source)
 
-        symbols = self._crypto_symbols(report, held, managed)
-        news_context, llm_assessment, symbol_news_scores = self._crypto_news_signals(
-            symbols, set(held)
+        context = self._prepare_crypto_iteration_context(
+            report, managed, held, entry_prices
         )
-        veto_reason = purchase_veto_reason(
-            llm_assessment,
-            enabled=bool(self.parameters.get("llm_news_enabled", False)),
-            fail_closed_on_unavailable=bool(
-                self.parameters.get("llm_news_fail_closed_on_unavailable", True)
-            ),
-            block_score=int(self.parameters.get("llm_news_block_score", -6)),
-            label="Crypto purchase",
-        )
-        report.update(
-            crypto_news_risk=news_context.risk_level,
-            crypto_news_score=(
-                f"{news_context.score:+d}" if news_context.available else "unavailable"
-            ),
-            crypto_news_articles=news_context.article_count,
-            crypto_llm_risk=llm_assessment.risk_level,
-            crypto_llm_score=(
-                f"{llm_assessment.score:+d}" if llm_assessment.available else "unavailable"
-            ),
-            crypto_llm_reasoning=(
-                llm_assessment.reasoning or llm_assessment.explanation
-            ),
-            crypto_purchase_guard=veto_reason or "clear",
-        )
-        signals = self._crypto_signals(symbols)
-        # Only a discovery-sourced candidate is safe to permanently exclude --
-        # a config-listed CRYPTO_SYMBOLS entry hitting a transient data outage
-        # must stay eligible for re-evaluation, not be blacklisted. Mirrors
-        # AssetRotationStrategy's discovery_only_symbols/unpriceable_discovered
-        # handling in _run_portfolio_iteration (strategy.py).
-        discovery_only_symbols = set(symbols) - managed - set(held)
-        unpriceable_discovered = sorted(self._unpriceable_symbols_this_iteration & discovery_only_symbols)
-        if unpriceable_discovered:
-            self._exclude_unpriceable_discovered_crypto_symbols(unpriceable_discovered)
-        signals_by_symbol = {str(signal["symbol"]): signal for signal in signals if signal is not None}
-        # Persist only positions the strategy actually owns -- merely
-        # qualifying a discovered pair must not grant permission to manage a
-        # manual account position in that symbol. New buys are remembered on
-        # fill (_remember_confirmed_crypto_symbol).
-        self._remember_discovered_crypto_symbols(sorted(held))
+        symbols = context.symbols
+        news_context = context.news_context
+        llm_assessment = context.llm_assessment
+        symbol_news_scores = context.symbol_news_scores
+        veto_reason = context.veto_reason
+        signals_by_symbol = {
+            str(signal["symbol"]): signal for signal in context.signals
+        }
 
         posture = str(self.parameters.get("crypto_risk_posture", "conservative"))
         report["crypto_risk_posture"] = posture
@@ -1581,8 +1404,12 @@ class CryptoRotationStrategy(Strategy):
                 if forecast.ready and forecast.predicted_edge_percent is not None
                 else None
             )
+            signal["symbol_news_score"] = int(symbol_news_scores.get(symbol, 0))
             signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(
-                signal, posture, llm_purchase_score
+                signal,
+                posture,
+                llm_purchase_score,
+                signal["symbol_news_score"],
             )
             if not decision_math.learned_edge_allows_purchase(signal):
                 continue
@@ -1658,9 +1485,17 @@ class CryptoRotationStrategy(Strategy):
         crypto_allocation = self._account_half_value_dollars()
         report["crypto_cash_allocation_dollars"] = crypto_allocation
         min_order_dollars = float(self.parameters.get("crypto_min_order_dollars", 5.0))
-        effective_max_positions = decision_math.optimal_position_count(
-            crypto_allocation, min_order_dollars, candidate_edges, configured_max_positions
-        )
+        if bool(self.parameters.get("crypto_fill_qualified_slots", True)):
+            effective_max_positions = decision_math.qualified_position_count(
+                crypto_allocation,
+                min_order_dollars,
+                len(held_working) + len(eligible),
+                configured_max_positions,
+            )
+        else:
+            effective_max_positions = decision_math.optimal_position_count(
+                crypto_allocation, min_order_dollars, candidate_edges, configured_max_positions
+            )
         report["crypto_effective_max_positions"] = effective_max_positions
 
         deployed = self._crypto_deployed_dollars(held_working, signals_by_symbol)

@@ -32,6 +32,7 @@ POSTURE_LLM_SCORE_WEIGHT = {"conservative": 0.10, "risky": 0.15}
 # never-changes-eligibility invariant as the other posture weights above.
 POSTURE_LEARNED_EDGE_WEIGHT = {"conservative": 0.25, "risky": 0.6}
 POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
+SYMBOL_NEWS_SCORE_WEIGHT = 0.05
 
 
 def llm_exposure_multiplier(llm_score: float | int | None) -> float:
@@ -132,6 +133,7 @@ def posture_adjusted_edge(
     signal: dict[str, float | int | str | None],
     posture: str,
     llm_score: float | int | None = None,
+    symbol_news_score: float | int | None = None,
 ) -> float:
     """Reshape a symbol's historical edge through a risky or conservative lens.
 
@@ -150,12 +152,33 @@ def posture_adjusted_edge(
     if llm_score is not None:
         capped_llm_score = max(-10.0, min(10.0, float(llm_score)))
         adjustment += capped_llm_score * POSTURE_LLM_SCORE_WEIGHT[posture]
+    if symbol_news_score is not None:
+        # Company/pair-specific context stays distinct from the aggregate LLM
+        # opinion. It is bounded and ranking-only: headlines cannot make an
+        # otherwise ineligible price signal tradable.
+        capped_symbol_score = max(-10.0, min(10.0, float(symbol_news_score)))
+        adjustment += capped_symbol_score * SYMBOL_NEWS_SCORE_WEIGHT
     if signal.get("learned_edge_ready") and signal.get("learned_edge") is not None:
         learned_edge = float(signal["learned_edge"])
         adjustment += (learned_edge - expected_profit) * POSTURE_LEARNED_EDGE_WEIGHT[posture]
     max_adjustment = POSTURE_MAX_ADJUSTMENT_PERCENT
     adjustment = max(-max_adjustment, min(max_adjustment, adjustment))
     return expected_profit + adjustment
+
+
+def qualified_position_count(
+    total_capital: float,
+    min_order_dollars: float,
+    available_symbol_count: int,
+    configured_max_positions: int,
+) -> int:
+    """Return every fundable qualified slot up to the configured ceiling."""
+    if configured_max_positions < 1:
+        return 1
+    if available_symbol_count < 1 or total_capital <= 0 or min_order_dollars <= 0:
+        return 1
+    feasible_cap = max(1, int(total_capital // min_order_dollars))
+    return max(1, min(configured_max_positions, feasible_cap, available_symbol_count))
 
 
 def optimal_position_count(

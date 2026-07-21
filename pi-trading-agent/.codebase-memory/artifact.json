@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "aa7a6bd8cc0c9fb941cac831fc7c1650b3c8496a",
-    "indexed_at": "2026-07-21T17:04:09Z",
+    "commit": "e7d45a03e8f48507bfe978a5fa7c82f24187b326",
+    "indexed_at": "2026-07-21T23:44:55Z",
     "project": "mnt-dietpi_userdata-staging-pi-trading-pi-trading-agent",
-    "nodes": 1043,
-    "edges": 4579,
-    "original_size": 7405568,
-    "compressed_size": 1170450,
+    "nodes": 1113,
+    "edges": 4873,
+    "original_size": 7667712,
+    "compressed_size": 1222745,
     "compression_level": 3
 }

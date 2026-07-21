@@ -1172,6 +1172,16 @@ def test_llm_assessment_is_a_signed_bounded_purchase_signal() -> None:
     assert positive <= 2.0 + AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
 
 
+def test_symbol_specific_news_context_changes_candidate_ranking() -> None:
+    signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
+
+    bearish = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, -6)
+    neutral = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, 0)
+    constructive = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, 6)
+
+    assert bearish < neutral == 2.0 < constructive
+
+
 def test_learned_edge_only_shifts_ranking_when_ready() -> None:
     ready = {
         "expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5,
@@ -1316,6 +1326,15 @@ def test_optimal_position_count_fails_open_to_one_on_bad_inputs() -> None:
     assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [], 3) == 1
     assert AssetRotationStrategy._optimal_position_count(0.0, 5.0, [(2.0, 1.0)], 3) == 1
     assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [(2.0, 1.0)], 0) == 1
+
+
+def test_qualified_position_count_uses_every_fundable_good_candidate() -> None:
+    # Candidates reaching this function already passed the signal, OOS,
+    # learned-edge, and news guards. Do not collapse a strong discovery batch
+    # back to one or two positions.
+    assert decision_math.qualified_position_count(100.0, 5.0, 12, 15) == 12
+    assert decision_math.qualified_position_count(24.0, 5.0, 12, 15) == 4
+    assert decision_math.qualified_position_count(100.0, 5.0, 12, 3) == 3
 
 
 def test_score_articles_attributes_score_to_only_the_tagged_symbol() -> None:
@@ -3863,9 +3882,9 @@ def test_dashboard_defaults_to_loopback_and_avoids_html_injection_sinks() -> Non
     assert "textContent = String(e.symbol" in web_dashboard.INDEX_HTML
 
 
-def test_dashboard_service_binds_only_to_amneziawg() -> None:
+def test_dashboard_service_binds_to_lan_and_does_not_require_amneziawg() -> None:
     installer = Path("setup_service.sh").read_text(encoding="utf-8")
 
-    assert "Requires=awg-quick@awg0.service" in installer
-    assert "Environment=DASHBOARD_HOST=10.29.70.1" in installer
-    assert "Environment=DASHBOARD_HOST=0.0.0.0" not in installer
+    assert "Requires=awg-quick@awg0.service" not in installer
+    assert "After=network.target awg-quick@awg0.service" not in installer
+    assert "Environment=DASHBOARD_HOST=0.0.0.0" in installer

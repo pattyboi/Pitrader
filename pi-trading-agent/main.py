@@ -17,6 +17,13 @@ from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 
 from strategy import AssetRotationStrategy
+from config_support import (
+    EMAIL_CONFIG_KEYS,
+    LLM_CONFIG_KEYS,
+    NEWS_CONFIG_KEYS,
+    resolve_state_paths,
+    select_parameters,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -252,6 +259,7 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_defaults = {
         "PORTFOLIO_SYMBOLS": [asset_a, asset_b],
         "PORTFOLIO_MAX_POSITIONS": 1,
+        "PORTFOLIO_FILL_QUALIFIED_SLOTS": True,
         "PORTFOLIO_ANALYSIS_DAYS": 252,
         "PORTFOLIO_MIN_SIGNAL_OBSERVATIONS": 20,
         "PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT": 1.0,
@@ -294,7 +302,9 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_take_profit_percent = float(config["PORTFOLIO_TAKE_PROFIT_PERCENT"])
     portfolio_stop_loss_percent = float(config["PORTFOLIO_STOP_LOSS_PERCENT"])
     portfolio_holding_horizon_max_days = int(config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"])
-    _require_booleans(config, "PORTFOLIO_AUTONOMOUS_DISCOVERY")
+    _require_booleans(
+        config, "PORTFOLIO_AUTONOMOUS_DISCOVERY", "PORTFOLIO_FILL_QUALIFIED_SLOTS"
+    )
     discovery_batch_size = int(config["PORTFOLIO_DISCOVERY_BATCH_SIZE"])
     discovery_refresh_days = int(config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"])
     discovery_min_price = float(config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"])
@@ -377,6 +387,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "CRYPTO_ENABLED": False,
         "CRYPTO_SYMBOLS": ["BTC", "ETH"],
         "CRYPTO_MAX_POSITIONS": 1,
+        "CRYPTO_FILL_QUALIFIED_SLOTS": True,
         "CRYPTO_ANALYSIS_DAYS": 252,
         "CRYPTO_RECENT_HIGH_LOOKBACK_DAYS": 20,
         "CRYPTO_MIN_SIGNAL_OBSERVATIONS": 20,
@@ -410,7 +421,12 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in crypto_defaults.items():
         config.setdefault(key, default)
-    _require_booleans(config, "CRYPTO_ENABLED", "CRYPTO_AUTONOMOUS_DISCOVERY")
+    _require_booleans(
+        config,
+        "CRYPTO_ENABLED",
+        "CRYPTO_AUTONOMOUS_DISCOVERY",
+        "CRYPTO_FILL_QUALIFIED_SLOTS",
+    )
     raw_crypto_symbols = config["CRYPTO_SYMBOLS"]
     if not isinstance(raw_crypto_symbols, list):
         raise TypeError("CRYPTO_SYMBOLS must be a JSON array of base symbols (e.g. \"BTC\")")
@@ -715,6 +731,86 @@ def _tidy_logging() -> None:
     )
 
 
+_PORTFOLIO_PARAMETER_KEYS = (
+    "ASSET_A",
+    "ASSET_B",
+    "CRYPTO_ENABLED",
+    "DIP_THRESHOLD_PERCENT",
+    "RECENT_HIGH_LOOKBACK_DAYS",
+    "EMAIL_REPORT_ENABLED",
+    "PORTFOLIO_SYMBOLS",
+    "PORTFOLIO_MAX_POSITIONS",
+    "PORTFOLIO_FILL_QUALIFIED_SLOTS",
+    "PORTFOLIO_ANALYSIS_DAYS",
+    "PORTFOLIO_MIN_SIGNAL_OBSERVATIONS",
+    "PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT",
+    "PORTFOLIO_OOS_MIN_OBSERVATIONS",
+    "PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT",
+    "PORTFOLIO_ROUND_TRIP_COST_PERCENT",
+    "PORTFOLIO_TAKE_PROFIT_PERCENT",
+    "PORTFOLIO_STOP_LOSS_PERCENT",
+    "PORTFOLIO_HOLDING_HORIZON_MAX_DAYS",
+    "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES",
+    "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED",
+    "PORTFOLIO_AUTONOMOUS_DISCOVERY",
+    "PORTFOLIO_DISCOVERY_BATCH_SIZE",
+    "PORTFOLIO_DISCOVERY_REFRESH_DAYS",
+    "PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS",
+    "PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME",
+    "PORTFOLIO_FRACTIONAL_SHARES",
+    "PORTFOLIO_CASH_RESERVE_DOLLARS",
+    "PORTFOLIO_MIN_ORDER_DOLLARS",
+    "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY",
+    "PORTFOLIO_RISK_POSTURE",
+    "NEWS_RSS_ENABLED",
+    "NEWS_RSS_FEED_URLS",
+    "SYMBOL_REFERENCE_ENABLED",
+    "SYMBOL_REFERENCE_REFRESH_DAYS",
+    "DECISION_MEMORY_ENABLED",
+    "DECISION_MEMORY_BLOCK_ENABLED",
+    "DECISION_MEMORY_MIN_OBSERVATIONS",
+    "DECISION_MEMORY_MAX_OBSERVATIONS",
+    "DECISION_MEMORY_MIN_CORRELATION",
+    "DECISION_MEMORY_EDGE_BLOCK_PERCENT",
+    "DECISION_MEMORY_BACKFILL_DAYS",
+    "PORTFOLIO_MEMORY_ENABLED",
+    "PORTFOLIO_MEMORY_MIN_OBSERVATIONS",
+    "PORTFOLIO_MEMORY_MAX_OBSERVATIONS",
+    "PORTFOLIO_MEMORY_MIN_CORRELATION",
+)
+
+_PORTFOLIO_STATE_FILES = {
+    "email_state_file": ".last_email_report",
+    "shutdown_diagnostic_file": ".shutdown_diagnostic.log",
+    "portfolio_holding_state_file": ".portfolio_holding_state.json",
+    "portfolio_rotation_state_file": ".portfolio_rotation_state.json",
+    "runtime_state_database_file": ".runtime_state.duckdb",
+    "portfolio_signal_snapshot_file": ".portfolio_signal_snapshot.json",
+    "portfolio_trade_count_file": ".portfolio_trade_count.json",
+    "portfolio_iteration_state_file": ".portfolio_iteration_state.json",
+    "nightly_preeval_state_file": ".nightly_preeval_state.json",
+    "portfolio_universe_database_file": ".autonomous_universe.duckdb",
+    "symbol_reference_database_file": ".symbol_reference.duckdb",
+    "decision_memory_database_file": ".trade_memory.duckdb",
+    "portfolio_memory_database_file": ".portfolio_memory.duckdb",
+}
+
+
+def _portfolio_strategy_parameters(
+    config: dict[str, Any], base_dir: Path
+) -> dict[str, Any]:
+    parameters = select_parameters(
+        config,
+        _PORTFOLIO_PARAMETER_KEYS,
+        EMAIL_CONFIG_KEYS,
+        NEWS_CONFIG_KEYS,
+        LLM_CONFIG_KEYS,
+        aliases={"PORTFOLIO_FRACTIONAL_SHARES": "fractional_shares"},
+    )
+    parameters.update(resolve_state_paths(base_dir, _PORTFOLIO_STATE_FILES))
+    return parameters
+
+
 def build_strategy(
     config: dict[str, Any], base_dir: Path
 ) -> tuple["MarketOpenLoggingAlpaca", AssetRotationStrategy]:
@@ -733,90 +829,7 @@ def build_strategy(
     )
     strategy = AssetRotationStrategy(
         broker=broker,
-        parameters={
-            "asset_a": config["ASSET_A"],
-            "asset_b": config["ASSET_B"],
-            # So _crypto_reserve_dollars (strategy.py) knows whether there is
-            # another pipeline actually competing for this shared account's
-            # cash -- a crypto-disabled deployment (the shipped default)
-            # should not have its capital halved for a pipeline that never
-            # trades.
-            "crypto_enabled": config["CRYPTO_ENABLED"],
-            "dip_threshold_percent": config["DIP_THRESHOLD_PERCENT"],
-            "recent_high_lookback_days": config["RECENT_HIGH_LOOKBACK_DAYS"],
-            "email_report_enabled": config["EMAIL_REPORT_ENABLED"],
-            "email_smtp_host": config["EMAIL_SMTP_HOST"],
-            "email_smtp_port": config["EMAIL_SMTP_PORT"],
-            "email_smtp_username": config["EMAIL_SMTP_USERNAME"],
-            "email_from_address": config["EMAIL_FROM_ADDRESS"],
-            "email_to_address": config["EMAIL_TO_ADDRESS"],
-            "email_use_tls": config["EMAIL_USE_TLS"],
-            "email_state_file": str(base_dir / ".last_email_report"),
-            "shutdown_diagnostic_file": str(base_dir / ".shutdown_diagnostic.log"),
-            "portfolio_symbols": config["PORTFOLIO_SYMBOLS"],
-            "portfolio_max_positions": config["PORTFOLIO_MAX_POSITIONS"],
-            "portfolio_analysis_days": config["PORTFOLIO_ANALYSIS_DAYS"],
-            "portfolio_min_signal_observations": config["PORTFOLIO_MIN_SIGNAL_OBSERVATIONS"],
-            "portfolio_min_expected_profit_percent": config["PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT"],
-            "portfolio_oos_min_observations": config["PORTFOLIO_OOS_MIN_OBSERVATIONS"],
-            "portfolio_oos_min_net_profit_percent": config["PORTFOLIO_OOS_MIN_NET_PROFIT_PERCENT"],
-            "portfolio_round_trip_cost_percent": config["PORTFOLIO_ROUND_TRIP_COST_PERCENT"],
-            "portfolio_take_profit_percent": config["PORTFOLIO_TAKE_PROFIT_PERCENT"],
-            "portfolio_stop_loss_percent": config["PORTFOLIO_STOP_LOSS_PERCENT"],
-            "portfolio_holding_horizon_max_days": config["PORTFOLIO_HOLDING_HORIZON_MAX_DAYS"],
-            "portfolio_holding_state_file": str(base_dir / ".portfolio_holding_state.json"),
-            "portfolio_rotation_state_file": str(base_dir / ".portfolio_rotation_state.json"),
-            "runtime_state_database_file": str(base_dir / ".runtime_state.duckdb"),
-            "portfolio_signal_snapshot_file": str(base_dir / ".portfolio_signal_snapshot.json"),
-            "portfolio_trade_count_file": str(base_dir / ".portfolio_trade_count.json"),
-            "portfolio_iteration_state_file": str(base_dir / ".portfolio_iteration_state.json"),
-            "portfolio_second_iteration_offset_minutes": config[
-                "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"
-            ],
-            "portfolio_nightly_preeval_enabled": config["PORTFOLIO_NIGHTLY_PREEVAL_ENABLED"],
-            "nightly_preeval_state_file": str(base_dir / ".nightly_preeval_state.json"),
-            "portfolio_autonomous_discovery": config["PORTFOLIO_AUTONOMOUS_DISCOVERY"],
-            "portfolio_discovery_batch_size": config["PORTFOLIO_DISCOVERY_BATCH_SIZE"],
-            "portfolio_discovery_refresh_days": config["PORTFOLIO_DISCOVERY_REFRESH_DAYS"],
-            "portfolio_discovery_min_price_dollars": config["PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS"],
-            "portfolio_discovery_min_avg_volume": config["PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME"],
-            "portfolio_universe_database_file": str(base_dir / ".autonomous_universe.duckdb"),
-            "fractional_shares": config["PORTFOLIO_FRACTIONAL_SHARES"],
-            "portfolio_cash_reserve_dollars": config["PORTFOLIO_CASH_RESERVE_DOLLARS"],
-            "portfolio_min_order_dollars": config["PORTFOLIO_MIN_ORDER_DOLLARS"],
-            "portfolio_opportunistic_min_probability": config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"],
-            "portfolio_risk_posture": config["PORTFOLIO_RISK_POSTURE"],
-            "news_context_enabled": config["NEWS_CONTEXT_ENABLED"],
-            "news_lookback_hours": config["NEWS_LOOKBACK_HOURS"],
-            "news_max_articles": config["NEWS_MAX_ARTICLES"],
-            "news_high_risk_score": config["NEWS_HIGH_RISK_SCORE"],
-            "news_score_refinement_enabled": config["NEWS_SCORE_REFINEMENT_ENABLED"],
-            "news_rss_enabled": config["NEWS_RSS_ENABLED"],
-            "news_rss_feed_urls": config["NEWS_RSS_FEED_URLS"],
-            "symbol_reference_enabled": config["SYMBOL_REFERENCE_ENABLED"],
-            "symbol_reference_refresh_days": config["SYMBOL_REFERENCE_REFRESH_DAYS"],
-            "symbol_reference_database_file": str(base_dir / ".symbol_reference.duckdb"),
-            "decision_memory_enabled": config["DECISION_MEMORY_ENABLED"],
-            "decision_memory_block_enabled": config["DECISION_MEMORY_BLOCK_ENABLED"],
-            "decision_memory_min_observations": config["DECISION_MEMORY_MIN_OBSERVATIONS"],
-            "decision_memory_max_observations": config["DECISION_MEMORY_MAX_OBSERVATIONS"],
-            "decision_memory_min_correlation": config["DECISION_MEMORY_MIN_CORRELATION"],
-            "decision_memory_edge_block_percent": config["DECISION_MEMORY_EDGE_BLOCK_PERCENT"],
-            "decision_memory_backfill_days": config["DECISION_MEMORY_BACKFILL_DAYS"],
-            "decision_memory_database_file": str(base_dir / ".trade_memory.duckdb"),
-            "portfolio_memory_enabled": config["PORTFOLIO_MEMORY_ENABLED"],
-            "portfolio_memory_min_observations": config["PORTFOLIO_MEMORY_MIN_OBSERVATIONS"],
-            "portfolio_memory_max_observations": config["PORTFOLIO_MEMORY_MAX_OBSERVATIONS"],
-            "portfolio_memory_min_correlation": config["PORTFOLIO_MEMORY_MIN_CORRELATION"],
-            "portfolio_memory_database_file": str(base_dir / ".portfolio_memory.duckdb"),
-            "llm_news_enabled": config["LLM_NEWS_ENABLED"],
-            "llm_news_model": config["LLM_NEWS_MODEL"],
-            "llm_news_base_url": config["LLM_NEWS_BASE_URL"],
-            "llm_news_fail_closed_on_unavailable": config[
-                "LLM_NEWS_FAIL_CLOSED_ON_UNAVAILABLE"
-            ],
-            "llm_news_block_score": config["LLM_NEWS_BLOCK_SCORE"],
-        },
+        parameters=_portfolio_strategy_parameters(config, base_dir),
     )
     return broker, strategy
 
