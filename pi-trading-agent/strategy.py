@@ -100,6 +100,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         # broker has supplied current market data.
         self.vars.decision_memory_backfill_attempted = False
         self.vars.portfolio_memory_backfilled_symbols = set()
+        self.vars.portfolio_memory_backfill_status_loaded = False
         self.vars.portfolio_pending_rotation = self._load_portfolio_rotation()
         self.vars.portfolio_holding_dates = self._load_portfolio_holding_dates()
         self.vars.portfolio_iteration_state = self._load_portfolio_iteration_state()
@@ -842,11 +843,22 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         }
 
     def _backfill_decision_memory(self, asset_a: str, asset_b: str) -> None:
-        """Seed decision memory from settled daily bars once per process start."""
+        """Seed decision memory once for each durable backfill configuration."""
         if self.vars.decision_memory_backfill_attempted:
             return
         days = int(self.parameters.get("decision_memory_backfill_days", 0))
         if not bool(self.parameters.get("decision_memory_enabled", True)) or days < 2:
+            self.vars.decision_memory_backfill_attempted = True
+            return
+        memory = self._decision_memory(
+            1, int(self.parameters["decision_memory_max_observations"])
+        )
+        completion_key = (
+            f"equity:{asset_a.upper()}:{asset_b.upper()}:days={days}:"
+            f"lookback={int(self.parameters['recent_high_lookback_days'])}:"
+            f"threshold={float(self.parameters['dip_threshold_percent']):.8g}"
+        )
+        if memory.backfill_completed(completion_key):
             self.vars.decision_memory_backfill_attempted = True
             return
         try:
@@ -893,9 +905,9 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 history.append(
                     (date, close_a, close_b, float(dip), float(dip) >= threshold)
                 )
-            inserted = self._decision_memory(
-                1, int(self.parameters["decision_memory_max_observations"])
-            ).backfill_history(history)
+            inserted = memory.backfill_history(
+                history, completion_key=completion_key
+            )
             self.log_message(
                 f"Decision-memory historical backfill added {inserted} settled daily observations.",
                 color="blue",
@@ -2471,13 +2483,43 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         # tie-breaking below; the eligibility floor two lines down still
         # gates on the raw historical expected_profit, unaffected by posture.
         llm_purchase_score = llm_assessment.score if llm_assessment.available else None
-        pending_backfill = {
+        memory_histories = {
             str(signal["symbol"]): signal.get("_memory_history", [])
             for signal in signals
-            if str(signal["symbol"]) not in self.vars.portfolio_memory_backfilled_symbols
         }
-        if pending_backfill and bool(self.parameters.get("portfolio_memory_enabled", True)):
-            self.vars.portfolio_memory_backfilled_symbols.update(pending_backfill)
+        memory_enabled = bool(self.parameters.get("portfolio_memory_enabled", True))
+        if (
+            memory_histories
+            and memory_enabled
+            and not getattr(self.vars, "portfolio_memory_backfill_status_loaded", False)
+        ):
+            try:
+                backfilled_symbols = getattr(
+                    self.vars, "portfolio_memory_backfilled_symbols", set()
+                )
+                backfilled_symbols.update(
+                    self._portfolio_memory().backfilled_symbols()
+                )
+                self.vars.portfolio_memory_backfilled_symbols = backfilled_symbols
+                self.vars.portfolio_memory_backfill_status_loaded = True
+            except Exception as exc:
+                self.log_message(
+                    f"Could not load portfolio-memory backfill status: "
+                    f"{type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+        pending_backfill = {
+            symbol: history
+            for symbol, history in memory_histories.items()
+            if symbol
+            not in getattr(self.vars, "portfolio_memory_backfilled_symbols", set())
+        }
+        if pending_backfill and memory_enabled:
+            tracked_backfills = getattr(
+                self.vars, "portfolio_memory_backfilled_symbols", set()
+            )
+            tracked_backfills.update(pending_backfill)
+            self.vars.portfolio_memory_backfilled_symbols = tracked_backfills
             try:
                 inserted = self._portfolio_memory().backfill_many(pending_backfill)
                 if inserted:

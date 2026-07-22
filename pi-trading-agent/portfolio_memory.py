@@ -107,10 +107,6 @@ class PortfolioMemory:
         if not observations:
             return {}
         with self._open() as conn:
-            for item in observations:
-                self._settle_prior_observations_with_predicate(
-                    conn, item.symbol, evaluation_date, item.price
-                )
             frame = pd.DataFrame(
                 [
                     {
@@ -131,6 +127,7 @@ class PortfolioMemory:
             )
             conn.register("portfolio_memory_inputs", frame)
             try:
+                self._settle_prior_observations_bulk(conn, evaluation_date)
                 conn.execute(
                     """
                     INSERT INTO observations
@@ -169,6 +166,8 @@ class PortfolioMemory:
 
     def backfill_many(self, histories: dict[str, list[tuple[str, float, float]]]) -> int:
         """Bulk import settled histories for multiple symbols."""
+        if not histories:
+            return 0
         records = [
             {
                 "evaluation_date": date,
@@ -180,31 +179,80 @@ class PortfolioMemory:
             for date, dip, next_return in rows
             if math.isfinite(dip) and math.isfinite(next_return)
         ]
-        if not records:
-            return 0
-        frame = pd.DataFrame.from_records(records)
+        frame = pd.DataFrame.from_records(
+            records,
+            columns=(
+                "evaluation_date",
+                "symbol",
+                "dip_percent",
+                "next_session_return_percent",
+            ),
+        )
+        status_frame = pd.DataFrame.from_records(
+            [
+                {
+                    "symbol": symbol,
+                    "through_date": max((row[0] for row in rows), default=""),
+                }
+                for symbol, rows in histories.items()
+            ]
+        )
         with self._open() as conn:
-            before = self._observation_count(conn)
-            conn.register("portfolio_memory_backfill", frame)
+            inserted = 0
+            if not frame.empty:
+                conn.register("portfolio_memory_backfill", frame)
+            try:
+                if not frame.empty:
+                    inserted = len(
+                        conn.execute(
+                            """
+                            INSERT INTO observations
+                                (evaluation_date, symbol, price, dip_percent, llm_score,
+                                 next_session_return_percent)
+                            SELECT evaluation_date, symbol, NULL, dip_percent, NULL,
+                                   next_session_return_percent
+                            FROM portfolio_memory_backfill
+                            ON CONFLICT(evaluation_date, symbol) DO NOTHING
+                            RETURNING symbol
+                            """
+                        ).fetchall()
+                    )
+            finally:
+                if not frame.empty:
+                    conn.unregister("portfolio_memory_backfill")
+            conn.register("portfolio_memory_backfill_status", status_frame)
             try:
                 conn.execute(
                     """
-                    INSERT INTO observations
-                        (evaluation_date, symbol, price, dip_percent, llm_score, next_session_return_percent)
-                    SELECT evaluation_date, symbol, NULL, dip_percent, NULL,
-                           next_session_return_percent
-                    FROM portfolio_memory_backfill
-                    ON CONFLICT(evaluation_date, symbol) DO NOTHING
+                    INSERT INTO backfill_status (symbol, through_date)
+                    SELECT symbol, through_date FROM portfolio_memory_backfill_status
+                    ON CONFLICT(symbol) DO UPDATE SET through_date = excluded.through_date
                     """
                 )
             finally:
-                conn.unregister("portfolio_memory_backfill")
-            inserted = self._observation_count(conn) - before
+                conn.unregister("portfolio_memory_backfill_status")
             conn.commit()
         return inserted
 
+    def backfilled_symbols(self) -> set[str]:
+        """Return symbols whose historical import completed in an earlier process."""
+        with self._open() as conn:
+            return {
+                str(row[0])
+                for row in conn.execute("SELECT symbol FROM backfill_status").fetchall()
+            }
+
     @staticmethod
     def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
+        backfill_status_exists = bool(
+            conn.execute(
+                """
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'backfill_status'
+                LIMIT 1
+                """
+            ).fetchone()
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS observations (
@@ -221,6 +269,14 @@ class PortfolioMemory:
                 historical_win_probability REAL,
                 historical_return_stdev REAL,
                 PRIMARY KEY (evaluation_date, symbol)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backfill_status (
+                symbol TEXT PRIMARY KEY,
+                through_date TEXT NOT NULL
             )
             """
         )
@@ -252,33 +308,79 @@ class PortfolioMemory:
         if "signal_present" not in existing_columns:
             conn.execute("UPDATE observations SET signal_present = 1 WHERE signal_present IS NULL")
             conn.execute("ALTER TABLE observations ALTER COLUMN signal_present SET DEFAULT 1")
+        # Existing installations predate explicit completion metadata. A NULL
+        # price uniquely identifies historical-import rows, so migrate those
+        # symbols once and avoid re-fetching their histories after deployment.
+        if not backfill_status_exists:
+            conn.execute(
+                """
+                INSERT INTO backfill_status (symbol, through_date)
+                SELECT symbol, COALESCE(MAX(evaluation_date), '')
+                FROM observations
+                WHERE price IS NULL
+                GROUP BY symbol
+                ON CONFLICT(symbol) DO NOTHING
+                """
+            )
 
-    def _settle_prior_observations_with_predicate(
-        self, conn: duckdb.DuckDBPyConnection, symbol: str, date: str, price: float
+    def _settle_prior_observations_bulk(
+        self, conn: duckdb.DuckDBPyConnection, date: str
     ) -> None:
+        """Settle the latest eligible row per input symbol with two SQL calls."""
         rows = conn.execute(
             """
-            SELECT evaluation_date, price FROM observations
-            WHERE symbol = ? AND evaluation_date < ?
-              AND next_session_return_percent IS NULL AND price IS NOT NULL
-            ORDER BY evaluation_date DESC LIMIT 1
+            SELECT evaluation_date, symbol, prior_price, current_price
+            FROM (
+                SELECT o.evaluation_date, o.symbol, o.price AS prior_price,
+                       i.price AS current_price,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY o.symbol ORDER BY o.evaluation_date DESC
+                       ) AS recency
+                FROM observations AS o
+                JOIN portfolio_memory_inputs AS i ON i.symbol = o.symbol
+                WHERE o.evaluation_date < ?
+                  AND o.next_session_return_percent IS NULL
+                  AND o.price IS NOT NULL
+            )
+            WHERE recency = 1
             """,
-            (symbol, date),
+            (date,),
         ).fetchall()
-        for prior_date, prior_price in rows:
+        settlements = []
+        for prior_date, symbol, prior_price, current_price in rows:
             if not self._next_session_predicate(str(prior_date), date):
                 continue
             if prior_price is None or prior_price <= 0:
                 continue
-            next_return = ((price - prior_price) / prior_price) * 100.0
+            next_return = ((current_price - prior_price) / prior_price) * 100.0
             # Check finiteness before clamping: min/max silently turn NaN
             # into the clamp bound, which would record a fabricated return.
             if math.isfinite(next_return):
-                conn.execute(
-                    "UPDATE observations SET next_session_return_percent = ? "
-                    "WHERE evaluation_date = ? AND symbol = ?",
-                    (max(-25.0, min(25.0, next_return)), prior_date, symbol),
+                settlements.append(
+                    {
+                        "evaluation_date": prior_date,
+                        "symbol": symbol,
+                        "next_session_return_percent": max(
+                            -25.0, min(25.0, next_return)
+                        ),
+                    }
                 )
+        if not settlements:
+            return
+        frame = pd.DataFrame.from_records(settlements)
+        conn.register("portfolio_memory_settlements", frame)
+        try:
+            conn.execute(
+                """
+                UPDATE observations AS target
+                SET next_session_return_percent = source.next_session_return_percent
+                FROM portfolio_memory_settlements AS source
+                WHERE target.evaluation_date = source.evaluation_date
+                  AND target.symbol = source.symbol
+                """
+            )
+        finally:
+            conn.unregister("portfolio_memory_settlements")
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self.database_path))
@@ -293,10 +395,6 @@ class PortfolioMemory:
                 self._create_schema(conn)
                 self._schema_initialized = True
             yield conn
-
-    @staticmethod
-    def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
-        return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
 
     def _fit_many(
         self,

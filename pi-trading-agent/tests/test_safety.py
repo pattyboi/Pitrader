@@ -21,6 +21,7 @@ import crypto_strategy
 import decision_math
 import llm_news
 import scripts.nightly_preeval as nightly_preeval
+import scripts.crypto_session_guard as crypto_session_guard
 import token_estimate
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, purchase_veto_reason
@@ -206,6 +207,106 @@ def test_cpu_watchdog_treats_system_logger_failure_as_best_effort(tmp_path: Path
     assert (project_dir / ".cpu_watchdog.log").exists()
 
 
+def test_cpu_watchdog_records_all_services_memory_and_temperature(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    scripts_dir = project_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    script_source = Path(__file__).resolve().parent.parent / "scripts" / "cpu_watchdog.sh"
+    script_path = scripts_dir / "cpu_watchdog.sh"
+    script_path.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+    cgroup_root = tmp_path / "cgroup"
+    for service, usage in {
+        "trading-agent.service": 1_000_000,
+        "trading-agent-crypto.service": 2_000_000,
+        "ollama.service": 3_000_000,
+    }.items():
+        directory = cgroup_root / "system.slice" / service
+        directory.mkdir(parents=True)
+        (directory / "cpu.stat").write_text(f"usage_usec {usage}\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/usr/bin/env bash\necho \"/system.slice/${@: -1}\"\n", encoding="utf-8"
+    )
+    fake_systemctl.chmod(fake_systemctl.stat().st_mode | stat.S_IEXEC)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemAvailable:       131072 kB\n", encoding="utf-8")
+    thermal = tmp_path / "temp"
+    thermal.write_text("55000\n", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{fake_bin}:{env['PATH']}",
+        CGROUP_ROOT=str(cgroup_root),
+        MEMINFO_FILE=str(meminfo),
+        THERMAL_FILE=str(thermal),
+    )
+
+    subprocess.run([str(script_path)], check=True, env=env, cwd=str(project_dir))
+    for service in (
+        "trading-agent.service",
+        "trading-agent-crypto.service",
+        "ollama.service",
+    ):
+        stat_file = cgroup_root / "system.slice" / service / "cpu.stat"
+        current = int(stat_file.read_text(encoding="utf-8").split()[1])
+        stat_file.write_text(f"usage_usec {current + 1000}\n", encoding="utf-8")
+    subprocess.run([str(script_path)], check=True, env=env, cwd=str(project_dir))
+
+    sample = (project_dir / ".cpu_watchdog.log").read_text(encoding="utf-8")
+    assert "equity_cpu_pct=" in sample
+    assert "crypto_cpu_pct=" in sample
+    assert "ollama_cpu_pct=" in sample
+    assert "available_memory_mib=128" in sample
+    assert "temperature_c=55.0" in sample
+
+
+def test_crypto_session_guard_stops_during_nyse_hours_and_starts_after_close(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"CRYPTO_ENABLED": true}', encoding="utf-8")
+    commands: list[list[str]] = []
+    active = True
+
+    def fake_run(command, check=False):
+        nonlocal active
+        commands.append(list(command))
+        if command[1] == "is-active":
+            return SimpleNamespace(returncode=0 if active else 3)
+        active = command[1] == "start"
+        return SimpleNamespace(returncode=0)
+
+    assert crypto_session_guard.reconcile_crypto_service(
+        config_path,
+        now_utc=datetime(2026, 7, 14, 15, 0, tzinfo=timezone.utc),
+        run=fake_run,
+    ) == "stopped"
+    assert active is False
+    assert crypto_session_guard.reconcile_crypto_service(
+        config_path,
+        now_utc=datetime(2026, 7, 14, 21, 0, tzinfo=timezone.utc),
+        run=fake_run,
+    ) == "started"
+    assert active is True
+
+
+def test_crypto_session_guard_leaves_crypto_running_on_nyse_holiday(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"CRYPTO_ENABLED": true}', encoding="utf-8")
+
+    def fake_run(command, check=False):
+        return SimpleNamespace(returncode=0)
+
+    assert crypto_session_guard.reconcile_crypto_service(
+        config_path,
+        now_utc=datetime(2026, 7, 3, 15, 0, tzinfo=timezone.utc),
+        run=fake_run,
+    ) == "unchanged"
+
+
 def test_opportunistic_probability_uses_settled_a_to_b_outcomes(tmp_path: Path) -> None:
     memory = TradeMemory(tmp_path / "memory.duckdb", 1, 10)
     memory.backfill_history(
@@ -364,6 +465,53 @@ def test_portfolio_memory_batches_updates_and_forecasts(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT COUNT(*) FROM observations WHERE evaluation_date = '2026-01-05'"
         ).fetchone()[0] == 2
+
+
+def test_portfolio_memory_bulk_settles_each_symbol_and_persists_backfill_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "portfolio_memory.duckdb"
+    memory = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+    memory.backfill_many({"HIST": [("2026-01-02", 5.0, 1.0)]})
+    memory.update_many_and_forecast(
+        "2026-01-02",
+        [
+            PortfolioMemoryInput("SPY", 100.0, 5.0, 0),
+            PortfolioMemoryInput("QQQ", 200.0, 5.0, 0),
+        ],
+    )
+    memory.update_many_and_forecast(
+        "2026-01-05",
+        [
+            PortfolioMemoryInput("SPY", 101.0, 5.0, 0),
+            PortfolioMemoryInput("QQQ", 204.0, 5.0, 0),
+        ],
+    )
+
+    restarted = PortfolioMemory(db_path, minimum_observations=1, maximum_observations=50)
+    assert restarted.backfilled_symbols() == {"HIST"}
+    with duckdb.connect(str(db_path)) as conn:
+        returns = dict(
+            conn.execute(
+                "SELECT symbol, next_session_return_percent FROM observations "
+                "WHERE evaluation_date = '2026-01-02' AND symbol IN ('SPY', 'QQQ')"
+            ).fetchall()
+        )
+    assert returns == pytest.approx({"SPY": 1.0, "QQQ": 2.0})
+
+
+def test_trade_memory_backfill_completion_survives_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "trade_memory.duckdb"
+    memory = TradeMemory(db_path, 1, 50)
+    rows = [
+        ("2026-01-02", 100.0, 100.0, 5.0, True),
+        ("2026-01-05", 101.0, 102.0, 5.0, True),
+    ]
+    assert memory.backfill_history(rows, completion_key="equity:SPY:QQQ:v1") == 1
+
+    restarted = TradeMemory(db_path, 1, 50)
+    assert restarted.backfill_completed("equity:SPY:QQQ:v1") is True
+    assert restarted.backfill_completed("equity:SPY:QQQ:v2") is False
 
 
 def test_historical_dip_returns_excludes_event_day_high_and_final_bar() -> None:
@@ -3611,6 +3759,68 @@ def test_crypto_news_is_assessed_once_per_refresh_and_maps_pair_tags(
     assert first[1].score == second[1].score == 5
 
 
+def test_crypto_news_refresh_skips_llm_when_assessment_inputs_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"news": 0, "llm": 0}
+    context = NewsContext(
+        available=True,
+        score=1,
+        article_count=1,
+        risk_level="constructive",
+        per_article=[
+            {
+                "headline": "Bitcoin adoption expands",
+                "summary": "Same article body",
+                "symbols": ["BTCUSD"],
+                "score": 1,
+            }
+        ],
+    )
+
+    class FakeWorldEventAnalyzer:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def analyze(self) -> NewsContext:
+            calls["news"] += 1
+            return context
+
+    class FakeLLMNewsAnalyzer:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def assess(self, articles, **kwargs):
+            calls["llm"] += 1
+            return llm_news.LLMNewsAssessment(
+                available=True, score=3, risk_level="constructive", reasoning="Stable."
+            )
+
+    moments = iter((0.0, 3601.0, 3602.0))
+    monkeypatch.setattr(crypto_strategy, "WorldEventAnalyzer", FakeWorldEventAnalyzer)
+    monkeypatch.setattr(crypto_strategy, "LLMNewsAnalyzer", FakeLLMNewsAnalyzer)
+    monkeypatch.setattr(crypto_strategy.time, "monotonic", lambda: next(moments))
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.parameters = {
+        "news_context_enabled": True,
+        "news_lookback_hours": 24,
+        "news_max_articles": 50,
+        "news_high_risk_score": -6,
+        "llm_news_enabled": True,
+        "llm_news_model": "test-model",
+        "llm_news_base_url": "http://localhost",
+        "llm_news_block_score": -6,
+        "crypto_news_refresh_minutes": 60,
+    }
+    strategy.log_message = lambda *args, **kwargs: None
+
+    strategy._crypto_news_signals(["BTC"], set())
+    strategy._crypto_news_signals(["BTC"], set())
+    strategy._crypto_news_signals(["BTC"], {"BTC"})
+
+    assert calls == {"news": 2, "llm": 2}
+
+
 # -- Per-iteration call-count regressions: _has_active_order and the quote
 # helpers fan out to several loop sites per iteration; a normal correctness
 # test can't tell "correct and fetched once" apart from "correct and fetched
@@ -3696,6 +3906,49 @@ def test_decision_memory_reuses_one_instance_per_key(tmp_path: Path) -> None:
 
     assert same_a is same_b
     assert different is not same_a
+
+
+def test_equity_decision_backfill_skips_market_data_after_persistent_completion() -> None:
+    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
+    strategy.vars = SimpleNamespace(decision_memory_backfill_attempted=False)
+    strategy.parameters = {
+        "decision_memory_enabled": True,
+        "decision_memory_backfill_days": 1000,
+        "decision_memory_max_observations": 500,
+        "recent_high_lookback_days": 20,
+        "dip_threshold_percent": 2.5,
+    }
+    strategy._decision_memory = lambda *args: SimpleNamespace(
+        backfill_completed=lambda key: True
+    )
+    strategy.get_historical_prices = lambda *args, **kwargs: pytest.fail(
+        "completed backfill should not fetch market data"
+    )
+
+    strategy._backfill_decision_memory("SPY", "QQQ")
+
+    assert strategy.vars.decision_memory_backfill_attempted is True
+
+
+def test_crypto_decision_backfill_skips_market_data_after_persistent_completion() -> None:
+    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
+    strategy.vars = SimpleNamespace(crypto_decision_memory_backfill_attempted=False)
+    strategy.parameters = {
+        "crypto_analysis_days": 252,
+        "crypto_memory_max_observations": 500,
+        "crypto_recent_high_lookback_days": 20,
+        "crypto_dip_threshold_percent": 2.5,
+    }
+    strategy._crypto_decision_memory = lambda *args: SimpleNamespace(
+        backfill_completed=lambda key: True
+    )
+    strategy.get_historical_prices = lambda *args, **kwargs: pytest.fail(
+        "completed backfill should not fetch market data"
+    )
+
+    strategy._backfill_crypto_decision_memory("BTC", "ETH")
+
+    assert strategy.vars.crypto_decision_memory_backfill_attempted is True
 
 
 # -- Bugfix regressions found in the follow-up correctness audit of the
@@ -3837,3 +4090,12 @@ def test_installer_removes_the_retired_dashboard_service() -> None:
 
     assert "ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/web_dashboard.py" not in installer
     assert "systemctl disable --now trading-agent-dashboard.service" in installer
+
+
+def test_installer_assigns_crypto_residency_to_the_session_guard() -> None:
+    installer = Path("setup_service.sh").read_text(encoding="utf-8")
+
+    assert "trading-agent-crypto-session-guard.timer" in installer
+    assert 'systemctl disable --now "${CRYPTO_SERVICE_NAME}"' in installer
+    assert 'systemctl enable --now "${CRYPTO_GUARD_TIMER_NAME}"' in installer
+    assert "OnCalendar=Mon..Fri 13:01:00" in installer

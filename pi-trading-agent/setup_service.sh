@@ -3,6 +3,8 @@ set -euo pipefail
 
 SERVICE_NAME="trading-agent.service"
 CRYPTO_SERVICE_NAME="trading-agent-crypto.service"
+CRYPTO_GUARD_SERVICE_NAME="trading-agent-crypto-session-guard.service"
+CRYPTO_GUARD_TIMER_NAME="trading-agent-crypto-session-guard.timer"
 WATCHDOG_SERVICE_NAME="trading-agent-cpu-watchdog.service"
 WATCHDOG_TIMER_NAME="trading-agent-cpu-watchdog.timer"
 OLLAMA_SERVICE_NAME="ollama.service"
@@ -14,6 +16,8 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 CRYPTO_SERVICE_FILE="/etc/systemd/system/${CRYPTO_SERVICE_NAME}"
+CRYPTO_GUARD_SERVICE_FILE="/etc/systemd/system/${CRYPTO_GUARD_SERVICE_NAME}"
+CRYPTO_GUARD_TIMER_FILE="/etc/systemd/system/${CRYPTO_GUARD_TIMER_NAME}"
 WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_SERVICE_NAME}"
 WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_TIMER_NAME}"
 OLLAMA_SERVICE_FILE="/etc/systemd/system/${OLLAMA_SERVICE_NAME}"
@@ -58,6 +62,7 @@ chown -R "${RUN_USER}:${RUN_GROUP}" "${PROJECT_DIR}"
 chmod 600 "${PROJECT_DIR}/config.json"
 chmod 755 "${PROJECT_DIR}/main.py"
 chmod 755 "${PROJECT_DIR}/main_crypto.py"
+chmod 755 "${PROJECT_DIR}/scripts/crypto_session_guard.py"
 chmod 755 "${PROJECT_DIR}/scripts/cpu_watchdog.sh"
 chmod 755 "${PROJECT_DIR}/scripts/ollama_warmup.sh"
 chmod 755 "${PROJECT_DIR}/scripts/nightly_preeval.py"
@@ -100,6 +105,38 @@ Environment=OLLAMA_MAX_LOADED_MODELS=1
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+install -o root -g root -m 0644 /dev/null "${CRYPTO_GUARD_SERVICE_FILE}"
+tee "${CRYPTO_GUARD_SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Start or stop the crypto agent according to the NYSE session calendar
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/crypto_session_guard.py ${PROJECT_DIR}/config.json
+EOF
+
+install -o root -g root -m 0644 /dev/null "${CRYPTO_GUARD_TIMER_FILE}"
+tee "${CRYPTO_GUARD_TIMER_FILE}" >/dev/null <<EOF
+[Unit]
+Description=Reconcile crypto-agent residency at NYSE session boundaries
+
+[Timer]
+# OnBoot covers weekends, holidays, and boots between boundaries. The 13:01
+# check handles NYSE early-close days; each invocation consults the real NYSE
+# calendar before changing service state.
+OnBootSec=1min
+OnCalendar=Mon..Fri 09:30:00
+OnCalendar=Mon..Fri 13:01:00
+OnCalendar=Mon..Fri 16:01:00
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
 EOF
 
 install -o root -g root -m 0644 /dev/null "${OLLAMA_WARMUP_SERVICE_FILE}"
@@ -231,15 +268,12 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=${PROJECT_DIR}
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
 install -o root -g root -m 0644 /dev/null "${WATCHDOG_SERVICE_FILE}"
 tee "${WATCHDOG_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
-Description=Sample trading-agent.service CPU usage for the watchdog log
+Description=Sample trading services, Ollama, memory, and temperature
 
 [Service]
 Type=oneshot
@@ -251,7 +285,7 @@ EOF
 install -o root -g root -m 0644 /dev/null "${WATCHDOG_TIMER_FILE}"
 tee "${WATCHDOG_TIMER_FILE}" >/dev/null <<EOF
 [Unit]
-Description=Periodically sample trading-agent.service CPU usage
+Description=Periodically sample trading-system resource usage
 
 [Timer]
 OnBootSec=2min
@@ -275,7 +309,11 @@ rm -f "${PROJECT_DIR}/.crypto_shutdown_diagnostic.log"
 
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
-systemctl enable --now "${CRYPTO_SERVICE_NAME}"
+# The guard owns crypto service residency. Remove any legacy boot enablement,
+# then reconcile immediately instead of waiting for the first timer event.
+systemctl disable --now "${CRYPTO_SERVICE_NAME}" 2>/dev/null || true
+systemctl enable --now "${CRYPTO_GUARD_TIMER_NAME}"
+systemctl start "${CRYPTO_GUARD_SERVICE_NAME}"
 systemctl enable --now "${WATCHDOG_TIMER_NAME}"
 systemctl enable --now "${OLLAMA_SERVICE_NAME}"
 systemctl enable --now "${OLLAMA_WARMUP_TIMER_NAME}"
@@ -284,9 +322,9 @@ systemctl enable --now "${NIGHTLY_PREEVAL_TIMER_NAME}"
 echo "${SERVICE_NAME} is installed and running."
 echo "View status with: sudo systemctl status ${SERVICE_NAME}"
 echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
-echo "${CRYPTO_SERVICE_NAME} is also installed and running, but idles until CRYPTO_ENABLED is true in config.json (and only trades while NYSE is closed)."
+echo "${CRYPTO_SERVICE_NAME} is managed by ${CRYPTO_GUARD_TIMER_NAME} and remains resident only while NYSE is closed."
 echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
-echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
+echo "CPU, memory, and temperature are sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
     echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"
 fi

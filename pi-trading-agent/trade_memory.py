@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 from market_sessions import is_next_trading_session
 from ridge_regression import fit_two_feature_ridge
@@ -95,6 +96,8 @@ class TradeMemory:
     def backfill_history(
         self,
         rows: list[tuple[str, float, float, float, bool]],
+        *,
+        completion_key: str | None = None,
     ) -> int:
         """Import completed daily observations without changing existing records.
 
@@ -104,11 +107,8 @@ class TradeMemory:
         deliberately price-only: inventing historic LLM scores would make the
         learned relationship look more certain than it is.
         """
-        if len(rows) < 2:
-            return 0
-        inserted = 0
-        with self._open() as conn:
-            before = self._observation_count(conn)
+        records = []
+        if len(rows) >= 2:
             for (date, price_a, price_b, dip, signal), (next_date, next_a, next_b, _, _) in zip(
                 rows, rows[1:]
             ):
@@ -124,26 +124,60 @@ class TradeMemory:
                 edge = ((next_b - price_b) / price_b - (next_a - price_a) / price_a) * 100.0
                 if not math.isfinite(edge):
                     continue
+                records.append(
+                    {
+                        "evaluation_date": date,
+                        "price_a": price_a,
+                        "price_b": price_b,
+                        "dip_percent": dip,
+                        "signal_present": int(signal),
+                        "relative_return_percent": max(-25.0, min(25.0, edge)),
+                    }
+                )
+        with self._open() as conn:
+            inserted = 0
+            if records:
+                frame = pd.DataFrame.from_records(records)
+                conn.register("trade_memory_backfill", frame)
+                try:
+                    inserted = len(
+                        conn.execute(
+                            """
+                            INSERT INTO observations
+                                (evaluation_date, price_a, price_b, dip_percent, llm_score,
+                                 signal_present, relative_return_percent)
+                            SELECT evaluation_date, price_a, price_b, dip_percent, NULL,
+                                   signal_present, relative_return_percent
+                            FROM trade_memory_backfill
+                            ON CONFLICT(evaluation_date) DO NOTHING
+                            RETURNING evaluation_date
+                            """
+                        ).fetchall()
+                    )
+                finally:
+                    conn.unregister("trade_memory_backfill")
+            if completion_key is not None:
                 conn.execute(
                     """
-                    INSERT INTO observations
-                        (evaluation_date, price_a, price_b, dip_percent, llm_score,
-                         signal_present, relative_return_percent)
-                    VALUES (?, ?, ?, ?, NULL, ?, ?)
-                    ON CONFLICT(evaluation_date) DO NOTHING
+                    INSERT INTO backfill_status (completion_key, completed_through)
+                    VALUES (?, ?)
+                    ON CONFLICT(completion_key) DO UPDATE
+                    SET completed_through = excluded.completed_through
                     """,
-                    (
-                        date,
-                        price_a,
-                        price_b,
-                        dip,
-                        int(signal),
-                        max(-25.0, min(25.0, edge)),
-                    ),
+                    (completion_key, str(rows[-1][0]) if rows else ""),
                 )
-            inserted = self._observation_count(conn) - before
             conn.commit()
         return inserted
+
+    def backfill_completed(self, completion_key: str) -> bool:
+        """Return whether this exact historical import completed previously."""
+        with self._open() as conn:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM backfill_status WHERE completion_key = ? LIMIT 1",
+                    (completion_key,),
+                ).fetchone()
+            )
 
     def record_decision(self, evaluation_date: str, decision: str, reason: str) -> None:
         """Attach the final decision to today's already-recorded snapshot."""
@@ -213,6 +247,14 @@ class TradeMemory:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS backfill_status (
+                completion_key TEXT PRIMARY KEY,
+                completed_through TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS executions (
                 id BIGINT PRIMARY KEY,
                 evaluation_date TEXT NOT NULL,
@@ -277,10 +319,6 @@ class TradeMemory:
                 self._create_schema(conn)
                 self._schema_initialized = True
             yield conn
-
-    @staticmethod
-    def _observation_count(conn: duckdb.DuckDBPyConnection) -> int:
-        return int(conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0])
 
     def _fit(self, rows: list[tuple[float, int | None, float]], dip: float, score: int | None) -> RotationForecast:
         count = len(rows)

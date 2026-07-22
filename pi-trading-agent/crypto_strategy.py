@@ -17,6 +17,8 @@ Lumibot's own scheduler never blocks waiting for a stock-market open/close
 that will never come for a 24/7 asset).
 """
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -161,10 +163,12 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
         self._unpriceable_symbols_this_iteration: set[str] = set()
         self.vars.crypto_holding_dates = self._load_crypto_holding_dates()
         self.vars.crypto_memory_backfilled_symbols = set()
+        self.vars.crypto_memory_backfill_status_loaded = False
         self.vars.crypto_pending_rotation = self._load_crypto_rotation()
         self.vars.crypto_opportunistic_swap_date = self._load_crypto_opportunistic_swap_date()
         self.vars.crypto_decision_memory_backfill_attempted = False
-        self._crypto_news_cache: tuple[float, tuple[str, ...], NewsContext, LLMNewsAssessment] | None = None
+        self._crypto_news_cache: tuple[float, tuple[str, ...], NewsContext] | None = None
+        self._crypto_llm_assessment_cache: tuple[str, LLMNewsAssessment] | None = None
         if self.vars.crypto_pending_rotation is not None:
             entry = self.vars.crypto_pending_rotation
             self.log_message(
@@ -701,29 +705,29 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
         cached = getattr(self, "_crypto_news_cache", None)
         now = time.monotonic()
         if cached is not None and cached[1] == cache_key and now - cached[0] < refresh_seconds:
-            context, assessment = cached[2], cached[3]
-            return context, assessment, self._crypto_symbol_news_scores(context, symbols)
-
-        try:
-            analyzer = WorldEventAnalyzer(
-                lookback_hours=int(self.parameters.get("news_lookback_hours", 24)),
-                max_articles=int(self.parameters.get("news_max_articles", 50)),
-                block_score=int(self.parameters.get("news_high_risk_score", -6)),
-                refine_scoring=bool(
-                    self.parameters.get("news_score_refinement_enabled", False)
-                ),
-                # The shared RSS feeds are broad equity/market feeds. Alpaca's
-                # symbol-filtered endpoint is the crypto-specific source here.
-                rss_enabled=False,
-                symbols=[f"{symbol}USD" for symbol in cache_key],
-            )
-            context = analyzer.analyze()
-        except Exception as exc:
-            context = NewsContext(
-                available=False,
-                risk_level="unavailable",
-                explanation=f"Crypto news retrieval failed: {type(exc).__name__}: {exc}",
-            )
+            context = cached[2]
+        else:
+            try:
+                analyzer = WorldEventAnalyzer(
+                    lookback_hours=int(self.parameters.get("news_lookback_hours", 24)),
+                    max_articles=int(self.parameters.get("news_max_articles", 50)),
+                    block_score=int(self.parameters.get("news_high_risk_score", -6)),
+                    refine_scoring=bool(
+                        self.parameters.get("news_score_refinement_enabled", False)
+                    ),
+                    # The shared RSS feeds are broad equity/market feeds. Alpaca's
+                    # symbol-filtered endpoint is the crypto-specific source here.
+                    rss_enabled=False,
+                    symbols=[f"{symbol}USD" for symbol in cache_key],
+                )
+                context = analyzer.analyze()
+            except Exception as exc:
+                context = NewsContext(
+                    available=False,
+                    risk_level="unavailable",
+                    explanation=f"Crypto news retrieval failed: {type(exc).__name__}: {exc}",
+                )
+            self._crypto_news_cache = (now, cache_key, context)
         symbol_scores = self._crypto_symbol_news_scores(context, symbols)
 
         if not bool(self.parameters.get("llm_news_enabled", False)):
@@ -739,25 +743,37 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
                 explanation="No crypto news articles were available for the LLM assessment.",
             )
         else:
-            try:
-                assessment = LLMNewsAnalyzer(
-                    model=str(self.parameters.get("llm_news_model", "")),
-                    base_url=str(self.parameters.get("llm_news_base_url", "")),
-                    block_score=int(self.parameters.get("llm_news_block_score", -6)),
-                ).assess(
-                    context.per_article,
-                    symbols=list(cache_key),
-                    held_symbols=held_symbols,
-                    symbol_scores=symbol_scores,
+            fingerprint = self._crypto_llm_assessment_fingerprint(
+                context, cache_key, held_symbols, symbol_scores
+            )
+            cached_assessment = getattr(self, "_crypto_llm_assessment_cache", None)
+            if cached_assessment is not None and cached_assessment[0] == fingerprint:
+                assessment = cached_assessment[1]
+                self.log_message(
+                    "Crypto LLM assessment reused because its news and position inputs are unchanged.",
+                    color="blue",
                 )
-            except Exception as exc:
-                assessment = LLMNewsAssessment(
-                    available=False,
-                    risk_level="unavailable",
-                    explanation=f"Crypto LLM assessment failed: {type(exc).__name__}: {exc}",
-                )
+            else:
+                try:
+                    assessment = LLMNewsAnalyzer(
+                        model=str(self.parameters.get("llm_news_model", "")),
+                        base_url=str(self.parameters.get("llm_news_base_url", "")),
+                        block_score=int(self.parameters.get("llm_news_block_score", -6)),
+                    ).assess(
+                        context.per_article,
+                        symbols=list(cache_key),
+                        held_symbols=held_symbols,
+                        symbol_scores=symbol_scores,
+                    )
+                    if assessment.available:
+                        self._crypto_llm_assessment_cache = (fingerprint, assessment)
+                except Exception as exc:
+                    assessment = LLMNewsAssessment(
+                        available=False,
+                        risk_level="unavailable",
+                        explanation=f"Crypto LLM assessment failed: {type(exc).__name__}: {exc}",
+                    )
 
-        self._crypto_news_cache = (now, cache_key, context, assessment)
         self.log_message(
             f"Crypto news: risk={context.risk_level}, score={context.score:+d}, "
             f"articles={context.article_count}; LLM={assessment.risk_level}, "
@@ -765,6 +781,28 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
             color="yellow" if context.score < 0 or assessment.score < 0 else "blue",
         )
         return context, assessment, symbol_scores
+
+    def _crypto_llm_assessment_fingerprint(
+        self,
+        context: NewsContext,
+        symbols: tuple[str, ...],
+        held_symbols: set[str],
+        symbol_scores: dict[str, int],
+    ) -> str:
+        """Hash every input that can change the aggregate LLM assessment."""
+        payload = {
+            "articles": context.per_article,
+            "symbols": symbols,
+            "held_symbols": sorted(str(symbol).upper() for symbol in held_symbols),
+            "symbol_scores": sorted(symbol_scores.items()),
+            "model": str(self.parameters.get("llm_news_model", "")),
+            "base_url": str(self.parameters.get("llm_news_base_url", "")),
+            "block_score": int(self.parameters.get("llm_news_block_score", -6)),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     # -- Pooled cross-symbol memory (mirrors AssetRotationStrategy's
     # _portfolio_memory/_update_portfolio_memories/_backfill_portfolio_memory
@@ -948,10 +986,21 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
         return cached
 
     def _backfill_crypto_decision_memory(self, asset_a: str, asset_b: str) -> None:
-        """Seed crypto decision memory from settled daily bars, once per process start."""
+        """Seed crypto decision memory once for each durable configuration."""
         if self.vars.crypto_decision_memory_backfill_attempted:
             return
-        self.vars.crypto_decision_memory_backfill_attempted = True
+        memory = self._crypto_decision_memory(
+            int(self.parameters.get("crypto_memory_max_observations", 500))
+        )
+        completion_key = (
+            f"crypto:{asset_a.upper()}:{asset_b.upper()}:"
+            f"days={int(self.parameters['crypto_analysis_days'])}:"
+            f"lookback={int(self.parameters['crypto_recent_high_lookback_days'])}:"
+            f"threshold={float(self.parameters['crypto_dip_threshold_percent']):.8g}"
+        )
+        if memory.backfill_completed(completion_key):
+            self.vars.crypto_decision_memory_backfill_attempted = True
+            return
         try:
             bars_a = self.get_historical_prices(
                 self._crypto_asset(asset_a), int(self.parameters["crypto_analysis_days"]), "day", quote=self.quote_asset
@@ -993,13 +1042,14 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
                 history.append(
                     (date, close_a, close_b, float(dip), float(dip) >= threshold)
                 )
-            inserted = self._crypto_decision_memory(
-                int(self.parameters.get("crypto_memory_max_observations", 500))
-            ).backfill_history(history)
+            inserted = memory.backfill_history(
+                history, completion_key=completion_key
+            )
             self.log_message(
                 f"Crypto decision-memory historical backfill added {inserted} settled daily observations.",
                 color="blue",
             )
+            self.vars.crypto_decision_memory_backfill_attempted = True
         except Exception as exc:
             self.log_message(
                 f"Crypto decision-memory historical backfill failed safely: {type(exc).__name__}: {exc}",
@@ -1342,13 +1392,43 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
         oos_min_profit = float(self.parameters.get("crypto_oos_min_net_profit_percent", 0.0))
         eligible: list[dict[str, Any]] = []
         signals = list(signals_by_symbol.values())
-        pending_backfill = {
+        memory_histories = {
             str(signal["symbol"]): signal.get("_memory_history", [])
             for signal in signals
-            if str(signal["symbol"]) not in self.vars.crypto_memory_backfilled_symbols
         }
-        if pending_backfill and bool(self.parameters.get("crypto_memory_enabled", True)):
-            self.vars.crypto_memory_backfilled_symbols.update(pending_backfill)
+        memory_enabled = bool(self.parameters.get("crypto_memory_enabled", True))
+        if (
+            memory_histories
+            and memory_enabled
+            and not getattr(self.vars, "crypto_memory_backfill_status_loaded", False)
+        ):
+            try:
+                backfilled_symbols = getattr(
+                    self.vars, "crypto_memory_backfilled_symbols", set()
+                )
+                backfilled_symbols.update(
+                    self._crypto_memory().backfilled_symbols()
+                )
+                self.vars.crypto_memory_backfilled_symbols = backfilled_symbols
+                self.vars.crypto_memory_backfill_status_loaded = True
+            except Exception as exc:
+                self.log_message(
+                    f"Could not load crypto-memory backfill status: "
+                    f"{type(exc).__name__}: {exc}",
+                    color="yellow",
+                )
+        pending_backfill = {
+            symbol: history
+            for symbol, history in memory_histories.items()
+            if symbol
+            not in getattr(self.vars, "crypto_memory_backfilled_symbols", set())
+        }
+        if pending_backfill and memory_enabled:
+            tracked_backfills = getattr(
+                self.vars, "crypto_memory_backfilled_symbols", set()
+            )
+            tracked_backfills.update(pending_backfill)
+            self.vars.crypto_memory_backfilled_symbols = tracked_backfills
             try:
                 inserted = self._crypto_memory().backfill_many(pending_backfill)
                 if inserted:
