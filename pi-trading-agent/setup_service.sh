@@ -10,7 +10,6 @@ OLLAMA_WARMUP_SERVICE_NAME="ollama-warmup.service"
 OLLAMA_WARMUP_TIMER_NAME="ollama-warmup.timer"
 NIGHTLY_PREEVAL_SERVICE_NAME="trading-agent-nightly-preeval.service"
 NIGHTLY_PREEVAL_TIMER_NAME="trading-agent-nightly-preeval.timer"
-DASHBOARD_SERVICE_NAME="trading-agent-dashboard.service"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -22,7 +21,6 @@ OLLAMA_WARMUP_SERVICE_FILE="/etc/systemd/system/${OLLAMA_WARMUP_SERVICE_NAME}"
 OLLAMA_WARMUP_TIMER_FILE="/etc/systemd/system/${OLLAMA_WARMUP_TIMER_NAME}"
 NIGHTLY_PREEVAL_SERVICE_FILE="/etc/systemd/system/${NIGHTLY_PREEVAL_SERVICE_NAME}"
 NIGHTLY_PREEVAL_TIMER_FILE="/etc/systemd/system/${NIGHTLY_PREEVAL_TIMER_NAME}"
-DASHBOARD_SERVICE_FILE="/etc/systemd/system/${DASHBOARD_SERVICE_NAME}"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP="$(id -gn "${RUN_USER}")"
 
@@ -63,7 +61,6 @@ chmod 755 "${PROJECT_DIR}/main_crypto.py"
 chmod 755 "${PROJECT_DIR}/scripts/cpu_watchdog.sh"
 chmod 755 "${PROJECT_DIR}/scripts/ollama_warmup.sh"
 chmod 755 "${PROJECT_DIR}/scripts/nightly_preeval.py"
-chmod 755 "${PROJECT_DIR}/scripts/web_dashboard.py"
 
 # The optional LLM news assessment (llm_news.py) only ever talks to a local
 # Ollama server -- never an outside API -- so Ollama is provisioned here too.
@@ -168,34 +165,6 @@ Persistent=false
 WantedBy=timers.target
 EOF
 
-install -o root -g root -m 0644 /dev/null "${DASHBOARD_SERVICE_FILE}"
-tee "${DASHBOARD_SERVICE_FILE}" >/dev/null <<EOF
-[Unit]
-Description=Browser dashboard for the trading agent's per-symbol signal snapshot
-After=network.target
-
-[Service]
-Type=simple
-User=${RUN_USER}
-Group=${RUN_GROUP}
-WorkingDirectory=${PROJECT_DIR}
-ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/web_dashboard.py
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-# The host firewall is the access boundary. Listen on LAN and VPN interfaces.
-Environment=DASHBOARD_HOST=0.0.0.0
-Environment=DASHBOARD_PORT=8765
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=read-only
-# Read-only view of the two snapshot JSON files -- no ReadWritePaths needed.
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 install -o root -g root -m 0644 /dev/null "${SERVICE_FILE}"
 tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
@@ -293,6 +262,17 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# Remove retired observational artifacts from hosts that installed an older
+# release. These files are no longer produced or consumed.
+systemctl disable --now trading-agent-dashboard.service 2>/dev/null || true
+rm -f /etc/systemd/system/trading-agent-dashboard.service
+rm -f "${PROJECT_DIR}/.portfolio_signal_snapshot.json"
+rm -f "${PROJECT_DIR}/.crypto_signal_snapshot.json"
+rm -f "${PROJECT_DIR}/.portfolio_trade_count.json"
+rm -f "${PROJECT_DIR}/.crypto_trade_count.json"
+rm -f "${PROJECT_DIR}/.shutdown_diagnostic.log"
+rm -f "${PROJECT_DIR}/.crypto_shutdown_diagnostic.log"
+
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 systemctl enable --now "${CRYPTO_SERVICE_NAME}"
@@ -300,7 +280,6 @@ systemctl enable --now "${WATCHDOG_TIMER_NAME}"
 systemctl enable --now "${OLLAMA_SERVICE_NAME}"
 systemctl enable --now "${OLLAMA_WARMUP_TIMER_NAME}"
 systemctl enable --now "${NIGHTLY_PREEVAL_TIMER_NAME}"
-systemctl enable --now "${DASHBOARD_SERVICE_NAME}"
 
 echo "${SERVICE_NAME} is installed and running."
 echo "View status with: sudo systemctl status ${SERVICE_NAME}"
@@ -308,7 +287,6 @@ echo "Follow logs with: sudo journalctl -u ${SERVICE_NAME} -f"
 echo "${CRYPTO_SERVICE_NAME} is also installed and running, but idles until CRYPTO_ENABLED is true in config.json (and only trades while NYSE is closed)."
 echo "Follow crypto logs with: sudo journalctl -u ${CRYPTO_SERVICE_NAME} -f"
 echo "CPU usage is sampled every 5 minutes into .cpu_watchdog.log (warnings also go to the journal, tag trading-agent-cpu-watchdog)."
-echo "${DASHBOARD_SERVICE_NAME} is available on LAN and VPN interfaces at http://<this Pi's IP>:8765."
 if [[ ! $(ollama list 2>/dev/null | grep -c .) -gt 1 ]]; then
     echo "Ollama is running but has no model yet. If LLM_NEWS_ENABLED is true, pull the model named in LLM_NEWS_MODEL, e.g.: ollama pull hf.co/ibm-granite/granite-4.1-3b-GGUF:Q4_K_M"
 fi

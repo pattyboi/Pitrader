@@ -233,8 +233,6 @@ pi-trading-agent/
 ├── token_estimate.py   Shared, dependency-free prompt token-count estimate
 ├── market_sessions.py  Shared NYSE/calendar-day session-succession helpers (equity and crypto)
 ├── ridge_regression.py Shared two-feature ridge fit used by decision/portfolio memory
-├── signal_snapshot.py  Writes the per-symbol opinion snapshot the browser dashboard reads
-├── trade_counter.py    Writes the same-day trade count the browser dashboard reads
 ├── strategy.py         Daily dip and rotation logic
 ├── strategy_support.py Shared broker/runtime, iteration-context, and memory helpers
 ├── decision_math.py     Shared position-sizing/ranking math (equity and crypto)
@@ -245,7 +243,6 @@ pi-trading-agent/
 │   ├── architecture.md      Technical module/process boundaries
 │   └── decision-pipeline.md Exact equity/crypto decision phase ordering
 ├── scripts/
-│   ├── web_dashboard.py     Read-only browser dashboard (own systemd service, see below)
 │   ├── nightly_preeval.py   03:00 ET cache warm-up for the LLM article-verdict check
 │   ├── ollama_warmup.sh     Pre-loads the local LLM ahead of market open
 │   └── cpu_watchdog.sh      Samples service CPU into .cpu_watchdog.log
@@ -1138,10 +1135,7 @@ defaults.
 The crypto service writes only its own databases, entirely separate from the
 equity service: `.crypto_runtime_state.duckdb`,
 `.crypto_portfolio_memory.duckdb`, `.crypto_trade_memory.duckdb`, and
-`.crypto_universe.duckdb` (autonomous discovery). It also writes
-`.crypto_signal_snapshot.json`
-(equity's counterpart is `.portfolio_signal_snapshot.json`) — see "Viewing
-the agent's current per-symbol opinions" below.
+`.crypto_universe.duckdb` (autonomous discovery).
 
 ### Enabling it
 
@@ -1162,43 +1156,6 @@ Confirm `IS_PAPER_TRADING` is `true` before enabling crypto for the first
 time, exactly as you would for the equity strategy.
 
 ## Operating the service
-
-### Viewing the agent's current per-symbol opinions
-
-Every iteration, both the equity and crypto strategies write a small snapshot
-of what they currently think about each symbol they evaluated — not just the
-ones they decided to trade. `setup_service.sh` installs and starts
-`trading-agent-dashboard.service`, a small always-on browser dashboard for
-it, showing the per-symbol opinions plus a running count of trades placed
-today. It's read-only, stdlib-only Python (`scripts/web_dashboard.py`, no new
-pip dependency) — no broker calls, no network access beyond serving the page
-itself, just the same two small JSON files the live strategies already write
-(`.portfolio_signal_snapshot.json`/`.crypto_signal_snapshot.json`).
-
-Each row shows whether the symbol is currently held, today's dip percentage,
-the edge percentage behind the opinion (today's posture-adjusted edge if the
-symbol is dipping right now, otherwise its raw historical expected profit),
-and a green `+` (non-negative edge) or red `-` (negative edge). If a section
-says "no data yet," that strategy hasn't completed an iteration since the
-snapshot file was last written — equity only evaluates twice a trading day
-(see `PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES` above), so it can take a
-while to appear even right after the service starts.
-
-Browse to `http://<this Pi's LAN IP>:8765` from any device on the same
-network — the service binds `0.0.0.0:8765` by default, so it has **no login
-and is reachable by anyone allowed through the host firewall**. If that's not
-acceptable for your setup, edit
-`/etc/systemd/system/trading-agent-dashboard.service` and change
-`Environment=DASHBOARD_HOST=0.0.0.0` to `127.0.0.1` (only reachable via SSH
-tunnel or on the Pi itself), then
-`sudo systemctl daemon-reload && sudo systemctl restart trading-agent-dashboard.service`.
-Follow its logs with `sudo journalctl -u trading-agent-dashboard.service -f`;
-check status/stop/start it like any other service in this project.
-
-The "trades today" figure comes from `trade_counter.py`, a side channel each
-strategy calls from its own order-submission code (never the reverse) —
-`.portfolio_trade_count.json`/`.crypto_trade_count.json` — and resets when the
-strategy's clock rolls to a new calendar day.
 
 ### Understanding common log messages
 
@@ -1558,11 +1515,9 @@ files in place:
 ```bash
 sudo systemctl disable --now trading-agent.service
 sudo systemctl disable --now trading-agent-cpu-watchdog.timer
-sudo systemctl disable --now trading-agent-dashboard.service
 sudo rm /etc/systemd/system/trading-agent.service
 sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.service
 sudo rm /etc/systemd/system/trading-agent-cpu-watchdog.timer
-sudo rm /etc/systemd/system/trading-agent-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 ```

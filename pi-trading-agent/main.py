@@ -781,12 +781,9 @@ _PORTFOLIO_PARAMETER_KEYS = (
 
 _PORTFOLIO_STATE_FILES = {
     "email_state_file": ".last_email_report",
-    "shutdown_diagnostic_file": ".shutdown_diagnostic.log",
     "portfolio_holding_state_file": ".portfolio_holding_state.json",
     "portfolio_rotation_state_file": ".portfolio_rotation_state.json",
     "runtime_state_database_file": ".runtime_state.duckdb",
-    "portfolio_signal_snapshot_file": ".portfolio_signal_snapshot.json",
-    "portfolio_trade_count_file": ".portfolio_trade_count.json",
     "portfolio_iteration_state_file": ".portfolio_iteration_state.json",
     "nightly_preeval_state_file": ".nightly_preeval_state.json",
     "portfolio_universe_database_file": ".autonomous_universe.duckdb",

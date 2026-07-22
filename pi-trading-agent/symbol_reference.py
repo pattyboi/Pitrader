@@ -264,17 +264,6 @@ class SymbolReference:
                 aliases[ticker] = names
         return aliases
 
-    def scan_text_for_symbols(self, text: str, candidates: list[str] | set[str]) -> set[str]:
-        """Find company-name mentions of `candidates` in `text`.
-
-        Bounded to the given candidates (the day's watchlist), never the
-        whole market, to keep this cheap. Catches a mention Alpaca's own
-        `symbols` tagging missed.
-        """
-        if not text.strip() or not candidates:
-            return set()
-        return self.scan_text_for_aliases(text, self.aliases_for_symbols(candidates))
-
     def scan_text_for_aliases(
         self, text: str, aliases: dict[str, tuple[str, ...]]
     ) -> set[str]:

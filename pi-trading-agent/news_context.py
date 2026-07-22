@@ -74,7 +74,7 @@ class NewsContext:
     # Per-article breakdown (headline, summary, Alpaca's own symbol tags,
     # and that article's individual score) so a caller can re-attribute a
     # symbol mentioned by company name but missed by Alpaca's tagging --
-    # see symbol_reference.py's scan_text_for_symbols.
+    # see symbol_reference.py's scan_text_for_aliases.
     per_article: list[dict] = field(default_factory=list)
     explanation: str = "News context was not evaluated."
 

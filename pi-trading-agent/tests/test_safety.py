@@ -20,10 +20,8 @@ import autonomous_universe
 import crypto_strategy
 import decision_math
 import llm_news
-import signal_snapshot
 import scripts.nightly_preeval as nightly_preeval
 import token_estimate
-import trade_counter
 from autonomous_universe import AutonomousUniverse
 from llm_news import LLMNewsAnalyzer, purchase_veto_reason
 from market_sessions import is_next_calendar_day, is_next_trading_session, nyse_is_open
@@ -999,27 +997,10 @@ def test_realizable_sale_price_is_none_when_nothing_is_available() -> None:
     assert strategy._realizable_sale_price("DARK") is None
 
 
-def test_on_abrupt_closing_dumps_every_thread_stack_to_the_diagnostic_file(tmp_path: Path) -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    diagnostic_path = tmp_path / "shutdown.log"
-    strategy.parameters = {"shutdown_diagnostic_file": str(diagnostic_path)}
-
-    strategy.on_abrupt_closing()
-
-    assert "Current thread" in diagnostic_path.read_text(encoding="utf-8")
-
-
-def test_on_abrupt_closing_is_a_no_op_without_a_configured_path() -> None:
-    strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
-    strategy.parameters = {}
-
-    strategy.on_abrupt_closing()  # must not raise
-
-
 def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:
     # The first five results establish a 2% gross edge. The sixth return is
     # then an out-of-sample trade selected from those five prior results.
-    outcomes = AssetRotationStrategy._walk_forward_net_returns(
+    outcomes = decision_math.walk_forward_net_returns(
         [2.0, 2.0, 2.0, 2.0, 2.0, -1.0],
         round_trip_cost_percent=0.2,
         minimum_observations=5,
@@ -1030,7 +1011,7 @@ def test_walk_forward_validation_never_uses_a_trade_to_select_itself() -> None:
 
 
 def test_walk_forward_validation_accounts_for_costs_before_selection() -> None:
-    outcomes = AssetRotationStrategy._walk_forward_net_returns(
+    outcomes = decision_math.walk_forward_net_returns(
         [1.1, 1.1, 1.1, 1.1, 1.1, 3.0],
         round_trip_cost_percent=0.2,
         minimum_observations=5,
@@ -1148,15 +1129,15 @@ def test_posture_adjusted_edge_keeps_the_expected_profit_floor_unchanged() -> No
     # or subtracted around it.
     signal = {"expected_profit": 1.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None) == 1.0
-    assert AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None) == 1.0
+    assert decision_math.posture_adjusted_edge(signal, "conservative", None) == 1.0
+    assert decision_math.posture_adjusted_edge(signal, "risky", None) == 1.0
 
 
 def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
     volatile = {"expected_profit": 3.0, "return_stdev": 4.0, "win_probability": 0.5}
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(volatile, "conservative", None)
-    risky = AssetRotationStrategy._posture_adjusted_edge(volatile, "risky", None)
+    conservative = decision_math.posture_adjusted_edge(volatile, "conservative", None)
+    risky = decision_math.posture_adjusted_edge(volatile, "risky", None)
 
     assert conservative < risky < 3.0
 
@@ -1164,20 +1145,20 @@ def test_conservative_posture_penalizes_variance_harder_than_risky() -> None:
 def test_llm_assessment_is_a_signed_bounded_purchase_signal() -> None:
     signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    negative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", -5)
-    neutral = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", 0)
-    positive = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", 5)
+    negative = decision_math.posture_adjusted_edge(signal, "conservative", -5)
+    neutral = decision_math.posture_adjusted_edge(signal, "conservative", 0)
+    positive = decision_math.posture_adjusted_edge(signal, "conservative", 5)
 
     assert negative < neutral == 2.0 < positive
-    assert positive <= 2.0 + AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
+    assert positive <= 2.0 + decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
 
 
 def test_symbol_specific_news_context_changes_candidate_ranking() -> None:
     signal = {"expected_profit": 2.0, "return_stdev": 0.0, "win_probability": 0.5}
 
-    bearish = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, -6)
-    neutral = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, 0)
-    constructive = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", 0, 6)
+    bearish = decision_math.posture_adjusted_edge(signal, "risky", 0, -6)
+    neutral = decision_math.posture_adjusted_edge(signal, "risky", 0, 0)
+    constructive = decision_math.posture_adjusted_edge(signal, "risky", 0, 6)
 
     assert bearish < neutral == 2.0 < constructive
 
@@ -1189,8 +1170,8 @@ def test_learned_edge_only_shifts_ranking_when_ready() -> None:
     }
     not_ready = {**ready, "learned_edge_ready": False}
 
-    adjusted = AssetRotationStrategy._posture_adjusted_edge(ready, "risky", None)
-    unadjusted = AssetRotationStrategy._posture_adjusted_edge(not_ready, "risky", None)
+    adjusted = decision_math.posture_adjusted_edge(ready, "risky", None)
+    unadjusted = decision_math.posture_adjusted_edge(not_ready, "risky", None)
 
     assert unadjusted == 1.0
     assert adjusted > unadjusted
@@ -1202,8 +1183,8 @@ def test_risky_posture_leans_into_the_learned_edge_more_than_conservative() -> N
         "learned_edge_ready": True, "learned_edge": 4.0,
     }
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(signal, "conservative", None)
-    risky = AssetRotationStrategy._posture_adjusted_edge(signal, "risky", None)
+    conservative = decision_math.posture_adjusted_edge(signal, "conservative", None)
+    risky = decision_math.posture_adjusted_edge(signal, "risky", None)
 
     assert 1.0 < conservative < risky
 
@@ -1211,9 +1192,9 @@ def test_risky_posture_leans_into_the_learned_edge_more_than_conservative() -> N
 def test_posture_adjusted_edge_never_exceeds_the_configured_clamp() -> None:
     extreme = {"expected_profit": 5.0, "return_stdev": 1000.0, "win_probability": 1.0}
 
-    conservative = AssetRotationStrategy._posture_adjusted_edge(extreme, "conservative", 10)
+    conservative = decision_math.posture_adjusted_edge(extreme, "conservative", 10)
 
-    assert conservative >= 5.0 - AssetRotationStrategy._POSTURE_MAX_ADJUSTMENT_PERCENT
+    assert conservative >= 5.0 - decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
 
 
 def _exit_test_strategy(bid_by_symbol: dict[str, float | None]) -> AssetRotationStrategy:
@@ -1293,7 +1274,7 @@ def test_portfolio_exit_reasons_never_sell_a_fresh_holding_without_cost_basis() 
 def test_optimal_position_count_never_exceeds_the_configured_ceiling() -> None:
     identical_candidates = [(2.0, 1.0)] * 5
 
-    assert AssetRotationStrategy._optimal_position_count(1000.0, 5.0, identical_candidates, 1) == 1
+    assert decision_math.optimal_position_count(1000.0, 5.0, identical_candidates, 1) == 1
 
 
 def test_optimal_position_count_is_capped_by_the_minimum_order_floor() -> None:
@@ -1301,7 +1282,7 @@ def test_optimal_position_count_is_capped_by_the_minimum_order_floor() -> None:
     # regardless of how generous the configured ceiling or candidate pool is.
     identical_candidates = [(2.0, 1.0)] * 5
 
-    assert AssetRotationStrategy._optimal_position_count(12.0, 5.0, identical_candidates, 5) <= 2
+    assert decision_math.optimal_position_count(12.0, 5.0, identical_candidates, 5) <= 2
 
 
 def test_optimal_position_count_diversifies_across_equally_good_candidates() -> None:
@@ -1310,7 +1291,7 @@ def test_optimal_position_count_diversifies_across_equally_good_candidates() -> 
     # so spreading across all three should beat concentrating in one.
     identical_candidates = [(2.0, 1.0), (2.0, 1.0), (2.0, 1.0)]
 
-    assert AssetRotationStrategy._optimal_position_count(300.0, 5.0, identical_candidates, 3) == 3
+    assert decision_math.optimal_position_count(300.0, 5.0, identical_candidates, 3) == 3
 
 
 def test_optimal_position_count_excludes_a_much_weaker_third_candidate() -> None:
@@ -1319,13 +1300,13 @@ def test_optimal_position_count_excludes_a_much_weaker_third_candidate() -> None
     # enough that including it is not worth it.
     candidates = [(3.0, 1.0), (3.0, 1.0), (0.1, 5.0)]
 
-    assert AssetRotationStrategy._optimal_position_count(300.0, 5.0, candidates, 3) == 2
+    assert decision_math.optimal_position_count(300.0, 5.0, candidates, 3) == 2
 
 
 def test_optimal_position_count_fails_open_to_one_on_bad_inputs() -> None:
-    assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [], 3) == 1
-    assert AssetRotationStrategy._optimal_position_count(0.0, 5.0, [(2.0, 1.0)], 3) == 1
-    assert AssetRotationStrategy._optimal_position_count(100.0, 5.0, [(2.0, 1.0)], 0) == 1
+    assert decision_math.optimal_position_count(100.0, 5.0, [], 3) == 1
+    assert decision_math.optimal_position_count(0.0, 5.0, [(2.0, 1.0)], 3) == 1
+    assert decision_math.optimal_position_count(100.0, 5.0, [(2.0, 1.0)], 0) == 1
 
 
 def test_qualified_position_count_uses_every_fundable_good_candidate() -> None:
@@ -1690,16 +1671,6 @@ def test_crypto_partial_history_batch_does_not_retry_missing_symbols() -> None:
     ]
 
 
-def test_crypto_on_abrupt_closing_dumps_every_thread_stack(tmp_path: Path) -> None:
-    strategy = CryptoRotationStrategy.__new__(CryptoRotationStrategy)
-    diagnostic = tmp_path / "crypto-shutdown.log"
-    strategy.parameters = {"shutdown_diagnostic_file": str(diagnostic)}
-
-    strategy.on_abrupt_closing()
-
-    assert "Current thread" in diagnostic.read_text(encoding="utf-8")
-
-
 def test_run_trader_until_stopped_stops_from_main_thread_event() -> None:
     class FakeExecutor:
         def __init__(self):
@@ -1918,7 +1889,7 @@ def test_portfolio_signal_still_context_only_without_any_historical_dip() -> Non
     assert result["observations"] == 0
 
 
-def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Path) -> None:
+def test_symbol_reference_alias_scan_finds_untagged_company_mentions(tmp_path: Path) -> None:
     reference = SymbolReference(
         tmp_path / "symbols.duckdb",
         refresh_days=7,
@@ -1927,10 +1898,13 @@ def test_symbol_reference_scan_text_finds_untagged_company_mentions(tmp_path: Pa
     )
     reference.refresh(["AAPL"], "key", "secret")
 
-    found = reference.scan_text_for_symbols("Apple reported record quarterly earnings", {"AAPL"})
+    aliases = reference.aliases_for_symbols({"AAPL"})
+    found = reference.scan_text_for_aliases(
+        "Apple reported record quarterly earnings", aliases
+    )
 
     assert found == {"AAPL"}
-    assert reference.scan_text_for_symbols("Nothing relevant here", {"AAPL"}) == set()
+    assert reference.scan_text_for_aliases("Nothing relevant here", aliases) == set()
 
 
 def test_symbol_news_scores_filters_unverified_tags_and_falls_back_when_empty() -> None:
@@ -3544,85 +3518,6 @@ def test_crypto_news_is_assessed_once_per_refresh_and_maps_pair_tags(
     assert first[1].score == second[1].score == 5
 
 
-def test_build_snapshot_entries_uses_posture_adjusted_edge_when_qualifying() -> None:
-    signals = [
-        {"symbol": "SPY", "qualifies": True, "dip": 2.5, "expected_profit": -1.0, "posture_adjusted_edge": 0.75},
-    ]
-    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
-    assert entries == [
-        {
-            "symbol": "SPY",
-            "held": False,
-            "qualifies": True,
-            "dip_percent": 2.5,
-            "edge_percent": 0.75,
-            "opinion": "+",
-        }
-    ]
-
-
-def test_build_snapshot_entries_falls_back_to_expected_profit_when_idle() -> None:
-    # Not qualifying today (no dip signal) -- posture_adjusted_edge is absent
-    # entirely, mirroring both strategies' actual signal shape, so the
-    # opinion falls back to the raw historical expected_profit.
-    signals = [{"symbol": "QQQ", "qualifies": False, "dip": 0.0, "expected_profit": -0.4}]
-    entries = signal_snapshot.build_snapshot_entries(signals, held={"QQQ"})
-    assert entries == [
-        {
-            "symbol": "QQQ",
-            "held": True,
-            "qualifies": False,
-            "dip_percent": 0.0,
-            "edge_percent": -0.4,
-            "opinion": "-",
-        }
-    ]
-
-
-def test_build_snapshot_entries_sorts_alphabetically_by_symbol() -> None:
-    signals = [
-        {"symbol": "QQQ", "qualifies": False, "dip": 0.0, "expected_profit": 0.1},
-        {"symbol": "DIA", "qualifies": False, "dip": 0.0, "expected_profit": 0.1},
-    ]
-    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
-    assert [entry["symbol"] for entry in entries] == ["DIA", "QQQ"]
-
-
-def test_build_snapshot_entries_zero_edge_is_a_positive_opinion() -> None:
-    signals = [{"symbol": "IWM", "qualifies": False, "dip": 0.0, "expected_profit": 0.0}]
-    entries = signal_snapshot.build_snapshot_entries(signals, held=set())
-    assert entries[0]["opinion"] == "+"
-
-
-def test_write_snapshot_round_trips_through_json(tmp_path: Path) -> None:
-    path = tmp_path / "snapshot.json"
-    entries = signal_snapshot.build_snapshot_entries(
-        [{"symbol": "BTC", "qualifies": True, "dip": 3.0, "expected_profit": 1.0, "posture_adjusted_edge": 1.2}],
-        held={"BTC"},
-    )
-    signal_snapshot.write_snapshot(str(path), "2026-07-19T09:00:00+00:00", "risky", entries)
-
-    saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["risk_posture"] == "risky"
-    assert saved["symbols"][0]["symbol"] == "BTC"
-    assert saved["symbols"][0]["opinion"] == "+"
-
-
-def test_write_snapshot_is_a_no_op_with_an_empty_path(tmp_path: Path) -> None:
-    # An empty path means the feature isn't wired up for this caller -- must
-    # not raise, matching this codebase's fail-open convention for
-    # observational side channels.
-    signal_snapshot.write_snapshot("", "2026-07-19T09:00:00+00:00", "risky", [])
-
-
-def test_write_snapshot_swallows_a_write_failure(tmp_path: Path) -> None:
-    # A directory that doesn't exist can't be written to -- must fail open,
-    # not raise, since this is a purely observational side channel.
-    bad_path = tmp_path / "missing-dir" / "snapshot.json"
-    signal_snapshot.write_snapshot(str(bad_path), "2026-07-19T09:00:00+00:00", "risky", [])
-    assert not bad_path.exists()
-
-
 # -- Per-iteration call-count regressions: _has_active_order and the quote
 # helpers fan out to several loop sites per iteration; a normal correctness
 # test can't tell "correct and fetched once" apart from "correct and fetched
@@ -3772,24 +3667,6 @@ def test_on_canceled_order_invalidates_orders_cache() -> None:
     assert strategy.vars.portfolio_pending_rotation == {}
 
 
-def test_trade_counter_serializes_concurrent_updates(tmp_path: Path) -> None:
-    path = tmp_path / "trade-count.json"
-    threads = [
-        threading.Thread(target=trade_counter.record_trade, args=(str(path), "2026-07-20"))
-        for _ in range(50)
-    ]
-
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert json.loads(path.read_text(encoding="utf-8")) == {
-        "date": "2026-07-20",
-        "count": 50,
-    }
-
-
 def test_get_quote_price_and_bid_ask_does_not_cache_a_failed_lookup() -> None:
     strategy = AssetRotationStrategy.__new__(AssetRotationStrategy)
     calls = {"count": 0}
@@ -3862,29 +3739,8 @@ def test_symbol_reference_refresh_failure_does_not_erase_verified_data(tmp_path:
     assert row == ("Apple Inc.", True)
 
 
-def test_build_snapshot_entries_skips_a_malformed_entry_instead_of_raising() -> None:
-    entries = signal_snapshot.build_snapshot_entries(
-        [
-            {"symbol": "AAAA", "posture_adjusted_edge": 1.5, "dip": 3.0, "qualifies": True},
-            {"posture_adjusted_edge": "not-a-number"},  # missing "symbol" entirely
-        ],
-        held=set(),
-    )
-
-    assert [entry["symbol"] for entry in entries] == ["AAAA"]
-
-
-def test_dashboard_defaults_to_loopback_and_avoids_html_injection_sinks() -> None:
-    from scripts import web_dashboard
-
-    assert web_dashboard.HOST == "127.0.0.1"
-    assert "innerHTML" not in web_dashboard.INDEX_HTML
-    assert "textContent = String(e.symbol" in web_dashboard.INDEX_HTML
-
-
-def test_dashboard_service_binds_to_lan_and_does_not_require_amneziawg() -> None:
+def test_installer_removes_the_retired_dashboard_service() -> None:
     installer = Path("setup_service.sh").read_text(encoding="utf-8")
 
-    assert "Requires=awg-quick@awg0.service" not in installer
-    assert "After=network.target awg-quick@awg0.service" not in installer
-    assert "Environment=DASHBOARD_HOST=0.0.0.0" in installer
+    assert "ExecStart=${VENV_DIR}/bin/python ${PROJECT_DIR}/scripts/web_dashboard.py" not in installer
+    assert "systemctl disable --now trading-agent-dashboard.service" in installer

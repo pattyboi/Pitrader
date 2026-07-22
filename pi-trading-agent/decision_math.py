@@ -3,8 +3,7 @@
 Extracted from AssetRotationStrategy (strategy.py) so CryptoRotationStrategy
 can reuse the same walk-forward validation, posture-adjusted ranking, and
 position-count math without duplicating it or depending on the equity
-strategy class. AssetRotationStrategy keeps its existing method names as thin
-aliases onto these functions so its own call sites and tests are unaffected.
+strategy class. Both strategies call these functions directly.
 """
 
 import math

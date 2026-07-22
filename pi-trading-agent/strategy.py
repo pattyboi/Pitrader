@@ -1,6 +1,5 @@
 """Daily dip-buying and asset-rotation strategy for Lumibot."""
 
-import faulthandler
 import math
 import os
 import smtplib
@@ -20,7 +19,6 @@ import numpy as np
 import article_filter
 import decision_math
 import email_render
-import signal_snapshot
 from autonomous_universe import AutonomousUniverse
 from llm_news import (
     LLMNewsAnalyzer,
@@ -61,16 +59,6 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
     # Fraction of cash withheld from the Asset B buy so the market order is not
     # rejected (or filled into a deficit) if the price moves before execution.
     CASH_BUFFER_FRACTION = 0.01
-
-    # These constants and the three methods aliased below live in
-    # decision_math.py -- pure, asset-class-agnostic math shared with
-    # CryptoRotationStrategy. Kept as class attributes here so existing call
-    # sites (self._posture_adjusted_edge(...), etc.) and tests are unaffected.
-    _POSTURE_VARIANCE_PENALTY = decision_math.POSTURE_VARIANCE_PENALTY
-    _POSTURE_CONSISTENCY_WEIGHT = decision_math.POSTURE_CONSISTENCY_WEIGHT
-    _POSTURE_LLM_SCORE_WEIGHT = decision_math.POSTURE_LLM_SCORE_WEIGHT
-    _POSTURE_LEARNED_EDGE_WEIGHT = decision_math.POSTURE_LEARNED_EDGE_WEIGHT
-    _POSTURE_MAX_ADJUSTMENT_PERCENT = decision_math.POSTURE_MAX_ADJUSTMENT_PERCENT
 
     # Order statuses that mean an order can no longer fill. Anything else is
     # treated as still working so the agent never submits a duplicate.
@@ -131,28 +119,6 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         self._refresh_symbol_reference(
             [str(symbol).strip().upper() for symbol in self.parameters.get("portfolio_symbols", [])]
         )
-
-    def on_abrupt_closing(self) -> None:
-        """Snapshot every thread's stack the instant a stop signal arrives.
-
-        Lumibot's StrategyExecutor.stop() sets stop_event and calls this hook
-        synchronously in the main thread before any join or systemd
-        TimeoutStopSec countdown. main.py's MarketOpenLoggingAlpaca already
-        makes the market-open/market-close waits interruptible on that same
-        stop_event, so a stop should exit within a second either way -- but
-        some mid-day stops still needed systemd's SIGKILL, and nothing so far
-        has captured what every thread was actually doing at that moment.
-        Overwritten (not appended) each time, so it stays a single snapshot
-        rather than a growing log.
-        """
-        raw_path = self.parameters.get("shutdown_diagnostic_file")
-        if not raw_path:
-            return
-        try:
-            with open(str(raw_path), "w", encoding="utf-8") as handle:
-                faulthandler.dump_traceback(file=handle, all_threads=True)
-        except OSError:
-            pass
 
     def _portfolio_rotation_state_path(self) -> Path | None:
         raw = self.parameters.get("portfolio_rotation_state_file")
@@ -1152,8 +1118,6 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             )
             return "submitted"
 
-    _walk_forward_net_returns = staticmethod(decision_math.walk_forward_net_returns)
-
     def _uses_alpaca_market_data(self) -> bool:
         source = getattr(getattr(getattr(self, "broker", None), "data_source", None), "SOURCE", "")
         return str(source).upper() == "ALPACA"
@@ -1409,7 +1373,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         win_probability: float | None = None
         if returns:
             net_returns = np.asarray(returns, dtype=np.float64) - round_trip_cost
-            walk_forward_returns = self._walk_forward_net_returns(
+            walk_forward_returns = decision_math.walk_forward_net_returns(
                 returns,
                 round_trip_cost,
                 int(self.parameters.get("portfolio_oos_min_observations", 10)),
@@ -1442,7 +1406,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             "oos_expected_profit": oos_expected_profit,
             "oos_observations": oos_observations,
             # Feed the risky/conservative reasoning pattern in
-            # _posture_adjusted_edge: how spread out this symbol's past
+            # posture_adjusted_edge: how spread out this symbol's past
             # dip-signal outcomes were, and a Laplace-smoothed win rate
             # (matches TradeMemory.opportunity_probability's convention).
             "return_stdev": return_stdev,
@@ -1515,7 +1479,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         Starts from NewsContext.per_symbol_scores (built from Alpaca's own
         article symbol tags), drops any tag the local reference has never
         seen from either source (catching a spurious tag), then extends
-        coverage using scan_text_for_symbols for a company mentioned by name
+        coverage using preloaded company-name aliases for a company mentioned by name
         but missed by Alpaca's tagging -- bounded to today's evaluated
         `candidates`, never the whole market. A symbol with neither an
         Alpaca tag nor a text match is intentionally absent here -- callers
@@ -1875,9 +1839,6 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             report.get("discovery_article_context", ""), len(all_symbols)
         )
         return report
-
-    _posture_adjusted_edge = staticmethod(decision_math.posture_adjusted_edge)
-    _optimal_position_count = staticmethod(decision_math.optimal_position_count)
 
     def _autonomous_universe(self) -> AutonomousUniverse:
         """Instance-cached like _portfolio_memory(): called up to 4x/iteration
@@ -2514,19 +2475,13 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 else None
             )
             signal["symbol_news_score"] = int(symbol_news_scores.get(symbol, 0))
-            signal["posture_adjusted_edge"] = self._posture_adjusted_edge(
+            signal["posture_adjusted_edge"] = decision_math.posture_adjusted_edge(
                 signal,
                 risk_posture,
                 llm_purchase_score,
                 signal["symbol_news_score"],
             )
         report["portfolio_risk_posture"] = risk_posture
-        signal_snapshot.write_snapshot(
-            str(self.parameters.get("portfolio_signal_snapshot_file", "")),
-            self.get_datetime().isoformat(),
-            risk_posture,
-            signal_snapshot.build_snapshot_entries(signals, held),
-        )
         eligible = [
             signal
             for signal in signals
@@ -2622,7 +2577,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             # pipeline's own share of the shared account -- the full account
             # if crypto is disabled, half of it otherwise -- existing
             # holdings plus spendable cash) and candidate quality actually
-            # support -- see _optimal_position_count, _account_total_value_dollars,
+            # support -- see decision_math.optimal_position_count, _account_total_value_dollars,
             # and _crypto_reserve_dollars.
             total_capital = self._account_total_value_dollars() - self._crypto_reserve_dollars()
             min_order_dollars = float(self.parameters.get("portfolio_min_order_dollars", 1.0))
@@ -2643,7 +2598,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                     max_positions,
                 )
             else:
-                effective_max_positions = self._optimal_position_count(
+                effective_max_positions = decision_math.optimal_position_count(
                     float(total_capital), min_order_dollars, candidate_edges, max_positions
                 )
             report["portfolio_effective_max_positions"] = effective_max_positions

@@ -14,7 +14,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
-import trade_counter
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
 from runtime_state import DuckDBStateStore
 from trade_memory import RotationForecast
@@ -104,7 +103,6 @@ class BrokerRuntimeSupport:
     """Common order, position, and restart-safe persistence helpers."""
 
     _RUNTIME_STATE_DATABASE_PARAMETER = "runtime_state_database_file"
-    _TRADE_COUNT_PARAMETER = "portfolio_trade_count_file"
     _DELETE_EMPTY_ONLY_WHEN_NONE = False
 
     def _runtime_state(self) -> DuckDBStateStore | None:
@@ -235,9 +233,5 @@ class BrokerRuntimeSupport:
                 color="red",
             )
             return False
-        trade_counter.record_trade(
-            str(self.parameters.get(self._TRADE_COUNT_PARAMETER, "")),
-            self.get_datetime().date().isoformat(),
-        )
         self._invalidate_orders_cache()
         return True

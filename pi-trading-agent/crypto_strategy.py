@@ -17,7 +17,6 @@ Lumibot's own scheduler never blocks waiting for a stock-market open/close
 that will never come for a 24/7 asset).
 """
 
-import faulthandler
 import math
 import os
 import re
@@ -38,7 +37,6 @@ import numpy as np
 
 import decision_math
 import email_render
-import signal_snapshot
 from autonomous_universe import AutonomousUniverse
 from market_sessions import is_next_calendar_day, nyse_is_open
 from llm_news import LLMNewsAnalyzer, LLMNewsAssessment, purchase_veto_reason
@@ -75,7 +73,6 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
     """Run a dip-signal crypto rotation only while NYSE regular hours are closed."""
 
     _RUNTIME_STATE_DATABASE_PARAMETER = "crypto_runtime_state_database_file"
-    _TRADE_COUNT_PARAMETER = "crypto_trade_count_file"
     _DELETE_EMPTY_ONLY_WHEN_NONE = True
 
     parameters = {
@@ -175,17 +172,6 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
                 "reconciling next cycle.",
                 color="yellow",
             )
-
-    def on_abrupt_closing(self) -> None:
-        """Capture every thread before Lumibot begins blocking shutdown work."""
-        raw_path = self.parameters.get("shutdown_diagnostic_file")
-        if not raw_path:
-            return
-        try:
-            with open(str(raw_path), "w", encoding="utf-8") as handle:
-                faulthandler.dump_traceback(file=handle, all_threads=True)
-        except OSError:
-            pass
 
     def _crypto_state_guard(self) -> threading.RLock:
         return self._crypto_state_lock
@@ -1417,13 +1403,6 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
         eligible.sort(key=lambda signal: float(signal["posture_adjusted_edge"]), reverse=True)
         report["crypto_candidates"] = len(eligible)
         report["crypto_holdings"] = ", ".join(sorted(held_working)) or "none"
-        signal_snapshot.write_snapshot(
-            str(self.parameters.get("crypto_signal_snapshot_file", "")),
-            datetime.now(timezone.utc).isoformat(),
-            posture,
-            signal_snapshot.build_snapshot_entries(signals_by_symbol.values(), held),
-        )
-
         # Opportunistic Opportunity: evaluated exactly once, as a single
         # non-looped decision, reserving both legs via claimed_symbols so it
         # never competes with the up-to-max-positions build loop below.

@@ -76,15 +76,12 @@ _CRYPTO_PARAMETER_KEYS = (
 _CRYPTO_STATE_FILES = {
     "crypto_holding_state_file": ".crypto_holding_state.json",
     "crypto_runtime_state_database_file": ".crypto_runtime_state.duckdb",
-    "crypto_signal_snapshot_file": ".crypto_signal_snapshot.json",
-    "crypto_trade_count_file": ".crypto_trade_count.json",
     "crypto_memory_database_file": ".crypto_portfolio_memory.duckdb",
     "crypto_trade_memory_database_file": ".crypto_trade_memory.duckdb",
     "crypto_email_state_file": ".crypto_last_email_report",
     "crypto_universe_database_file": ".crypto_universe.duckdb",
     "crypto_rotation_state_file": ".crypto_rotation_state.json",
     "crypto_opportunistic_swap_state_file": ".crypto_opportunistic_swap_state.json",
-    "shutdown_diagnostic_file": ".crypto_shutdown_diagnostic.log",
 }
 
 
