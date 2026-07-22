@@ -4,6 +4,7 @@ Backed by embedded DuckDB, like ``trade_memory.py``, ``portfolio_memory.py``,
 and ``symbol_reference.py``.
 """
 
+import hashlib
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -23,6 +24,22 @@ class AutonomousUniverse:
     ASSETS_URL_PAPER = "https://paper-api.alpaca.markets/v2/assets"
     ASSETS_URL_LIVE = "https://api.alpaca.markets/v2/assets"
     _SYMBOL = re.compile(r"^[A-Z]{1,5}$")
+    _EQUITY_ORDER_VERSION = "distributed-v1"
+
+    @staticmethod
+    def _distributed_equity_order(symbols: set[str]) -> list[str]:
+        """Return a stable market-wide order instead of ticker clustering.
+
+        Alphabetical batches made each day almost entirely one ticker prefix
+        (AA*, then AB*, and so on). A stable digest keeps cursor persistence
+        deterministic while spreading each batch across the full directory.
+        """
+        return sorted(
+            symbols,
+            key=lambda symbol: hashlib.blake2b(
+                symbol.encode("ascii"), digest_size=8
+            ).digest(),
+        )
 
     @staticmethod
     def _default_symbol_filter(item: dict[str, Any]) -> str | None:
@@ -61,10 +78,33 @@ class AutonomousUniverse:
         with self._open() as conn:
             refreshed_value = self._get_state(conn, "refreshed")
             cursor_value = self._get_state(conn, "cursor")
+            order_version = self._get_state(conn, "order_version")
             symbols = [
                 row[0] for row in conn.execute("SELECT symbol FROM universe_symbols ORDER BY rank").fetchall()
             ]
             conn.commit()
+        if (
+            symbols
+            and self.asset_class == "us_equity"
+            and order_version != self._EQUITY_ORDER_VERSION
+        ):
+            # One-time migration for databases populated by the old
+            # alphabetical rotation. Starting the new cursor at zero is more
+            # honest than pretending the old numeric offset has meaning in a
+            # completely different order.
+            symbols = self._distributed_equity_order(set(symbols))
+            cursor_value = "0"
+            with self._open() as conn:
+                conn.execute("DELETE FROM universe_symbols")
+                conn.executemany(
+                    "INSERT INTO universe_symbols (symbol, rank) VALUES (?, ?)",
+                    [(symbol, rank) for rank, symbol in enumerate(symbols)],
+                )
+                self._set_state(conn, "cursor", cursor_value)
+                self._set_state(
+                    conn, "order_version", self._EQUITY_ORDER_VERSION
+                )
+                conn.commit()
         try:
             refreshed = date.fromisoformat(refreshed_value) if refreshed_value else date(1970, 1, 1)
         except ValueError:
@@ -78,12 +118,15 @@ class AutonomousUniverse:
                 timeout=20,
             )
             response.raise_for_status()
-            symbols = sorted(
-                {
-                    symbol
-                    for symbol in (self._symbol_filter(item) for item in response.json())
-                    if symbol
-                }
+            refreshed_symbols = {
+                symbol
+                for symbol in (self._symbol_filter(item) for item in response.json())
+                if symbol
+            }
+            symbols = (
+                self._distributed_equity_order(refreshed_symbols)
+                if self.asset_class == "us_equity"
+                else sorted(refreshed_symbols)
             )
             # Keep rotating from the persisted position after a metadata
             # refresh.  Resetting to zero here meant a large alphabetically
@@ -99,6 +142,10 @@ class AutonomousUniverse:
                     )
                 self._set_state(conn, "cursor", str(cursor))
                 self._set_state(conn, "refreshed", today.isoformat())
+                if self.asset_class == "us_equity":
+                    self._set_state(
+                        conn, "order_version", self._EQUITY_ORDER_VERSION
+                    )
                 conn.commit()
         else:
             cursor = int(cursor_value or 0) % len(symbols)

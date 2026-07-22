@@ -63,6 +63,8 @@ def test_config_secrets_can_be_supplied_without_storing_them_in_json(
     assert config["ALPACA_SECRET_KEY"] == "environment-secret"
     assert config["EMAIL_SMTP_PASSWORD"] == "environment-email-secret"
     assert config["PORTFOLIO_MEMORY_MIN_CORRELATION"] == pytest.approx(0.10)
+    assert config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] == 96
+    assert config["PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER"] == pytest.approx(0.5)
     assert config["CRYPTO_MEMORY_MIN_CORRELATION"] == pytest.approx(0.10)
 
 
@@ -506,9 +508,12 @@ def test_autonomous_universe_next_batch_rotates_via_duckdb(tmp_path: Path, monke
 
     first = universe.next_batch("key", "secret")
     second = universe.next_batch("key", "secret")
+    expected = AutonomousUniverse._distributed_equity_order(
+        {"AAPL", "MSFT", "NVDA", "TSLA"}
+    )
 
-    assert first == ["AAPL", "MSFT"]
-    assert second == ["NVDA", "TSLA"]
+    assert first == expected[:2]
+    assert second == expected[2:]
 
 
 def test_autonomous_universe_refresh_preserves_rotation_cursor(
@@ -525,8 +530,36 @@ def test_autonomous_universe_refresh_preserves_rotation_cursor(
         lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload),
     )
 
-    assert universe.next_batch("key", "secret") == ["AAPL", "MSFT"]
-    assert universe.next_batch("key", "secret") == ["NVDA", "TSLA"]
+    expected = AutonomousUniverse._distributed_equity_order(
+        {"AAPL", "MSFT", "NVDA", "TSLA"}
+    )
+    assert universe.next_batch("key", "secret") == expected[:2]
+    assert universe.next_batch("key", "secret") == expected[2:]
+
+
+def test_existing_alphabetical_universe_migrates_to_distributed_order(
+    tmp_path: Path,
+) -> None:
+    universe = AutonomousUniverse(
+        tmp_path / "universe.duckdb", refresh_days=7, batch_size=2
+    )
+    symbols = ["AAPL", "MSFT", "NVDA", "TSLA"]
+    with universe._open() as conn:
+        conn.executemany(
+            "INSERT INTO universe_symbols (symbol, rank) VALUES (?, ?)",
+            [(symbol, rank) for rank, symbol in enumerate(symbols)],
+        )
+        universe._set_state(conn, "cursor", "2")
+        universe._set_state(conn, "refreshed", date.today().isoformat())
+        conn.commit()
+
+    expected = AutonomousUniverse._distributed_equity_order(set(symbols))
+    assert universe.next_batch("key", "secret") == expected[:2]
+
+    with duckdb.connect(str(tmp_path / "universe.duckdb")) as conn:
+        assert conn.execute(
+            "SELECT value FROM universe_state WHERE name = 'order_version'"
+        ).fetchone()[0] == AutonomousUniverse._EQUITY_ORDER_VERSION
 
 
 def test_autonomous_universe_excludes_unpriceable_symbols_from_future_batches(
@@ -550,8 +583,7 @@ def test_autonomous_universe_excludes_unpriceable_symbols_from_future_batches(
     # batch, so it never resurfaces once it's confirmed to have no price data.
     assert "MSFT" not in first
     assert "MSFT" not in second
-    assert first == ["AAPL"]
-    assert second == ["NVDA", "TSLA"]
+    assert set(first + second) == {"AAPL", "NVDA", "TSLA"}
 
 
 def test_autonomous_universe_asset_class_parameter_changes_the_query(
@@ -622,6 +654,30 @@ def test_autonomous_universe_remember_refreshes_recency_of_a_re_mentioned_symbol
             ).fetchall()
         ]
     assert learned == ["AAA", "CCC"]
+
+
+def test_remembered_discovery_signal_is_rechecked_without_becoming_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    universe = AutonomousUniverse(
+        tmp_path / "universe.duckdb", refresh_days=7, batch_size=2
+    )
+    payload = [
+        {"symbol": symbol, "tradable": True, "fractionable": True}
+        for symbol in ["AAPL", "MSFT", "NVDA", "TSLA"]
+    ]
+    monkeypatch.setattr(
+        autonomous_universe.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            raise_for_status=lambda: None, json=lambda: payload
+        ),
+    )
+    first = universe.next_batch("key", "secret")
+    universe.remember([first[0]])
+
+    assert first[0] in universe.next_batch("key", "secret")
+    assert universe.managed_symbols() == []
 
 
 def test_autonomous_candidates_are_not_managed_until_a_buy_is_confirmed(
@@ -1316,6 +1372,43 @@ def test_qualified_position_count_uses_every_fundable_good_candidate() -> None:
     assert decision_math.qualified_position_count(100.0, 5.0, 12, 15) == 12
     assert decision_math.qualified_position_count(24.0, 5.0, 12, 15) == 4
     assert decision_math.qualified_position_count(100.0, 5.0, 12, 3) == 3
+
+
+def test_qualified_position_count_reports_zero_when_no_slot_is_usable() -> None:
+    assert decision_math.qualified_position_count(100.0, 5.0, 0, 15) == 0
+    assert decision_math.qualified_position_count(4.0, 5.0, 12, 15) == 0
+    assert decision_math.qualified_position_count(100.0, 5.0, 12, 0) == 0
+
+
+def test_risky_posture_uses_a_smaller_but_positive_profit_floor() -> None:
+    assert decision_math.effective_profit_floor(0.30, "conservative", 0.5) == pytest.approx(0.30)
+    assert decision_math.effective_profit_floor(0.30, "risky", 0.5) == pytest.approx(0.15)
+    assert decision_math.effective_profit_floor(-1.0, "risky", 0.5) == 0.0
+
+
+def test_signal_rejection_reason_is_the_same_gate_used_for_eligibility() -> None:
+    signal = {
+        "dip": 4.0,
+        "qualifies": True,
+        "observations": 30,
+        "expected_profit": 0.12,
+        "oos_observations": 12,
+        "oos_expected_profit": 0.05,
+        "learned_edge_ready": False,
+    }
+    arguments = {
+        "dip_threshold_percent": 2.5,
+        "minimum_observations": 20,
+        "minimum_profit_percent": 0.15,
+        "oos_minimum_observations": 10,
+        "oos_minimum_profit_percent": 0.0,
+    }
+
+    assert decision_math.portfolio_signal_rejection_reason(signal, **arguments) == (
+        "historical edge below floor"
+    )
+    signal["expected_profit"] = 0.16
+    assert decision_math.portfolio_signal_rejection_reason(signal, **arguments) is None
 
 
 def test_score_articles_attributes_score_to_only_the_tagged_symbol() -> None:

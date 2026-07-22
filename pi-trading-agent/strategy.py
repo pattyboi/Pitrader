@@ -53,6 +53,7 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         "portfolio_stop_loss_percent": 0.5,
         "portfolio_holding_horizon_max_days": 15,
         "portfolio_risk_posture": "conservative",
+        "portfolio_risky_edge_floor_multiplier": 0.5,
         "portfolio_memory_min_correlation": 0.10,
     }
 
@@ -488,6 +489,11 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 f"Risk posture: {report.get('portfolio_risk_posture', 'unavailable')}",
                 f"Holdings: {report.get('portfolio_holdings', 'unavailable')}",
                 f"Signal candidates: {report.get('portfolio_candidates', 'unavailable')}",
+                f"Signal scan: {report.get('portfolio_signal_summary', 'unavailable')}",
+                f"Rejected by gate: {report.get('portfolio_rejection_summary', 'unavailable')}",
+                f"Effective net-profit floor: "
+                f"{report.get('portfolio_effective_minimum_profit', 'unavailable')} "
+                f"(configured {report.get('portfolio_configured_minimum_profit', 'unavailable')})",
                 f"Effective max positions today: "
                 f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
                 f"(configured ceiling {self.parameters.get('portfolio_max_positions', 'unavailable')})",
@@ -507,6 +513,8 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 f"Opportunistic Opportunity: {report.get('opportunistic_opportunity_status', 'unavailable')}",
                 f"Opportunistic Opportunity probability: {report.get('opportunistic_opportunity_probability', 'unavailable')}",
                 f"Opportunistic Opportunity evidence: {report.get('opportunistic_opportunity_explanation', 'unavailable')}",
+                "Rejected dip signals:",
+                *[f"- {item}" for item in report.get("portfolio_rejected_signals", [])],
                 "Portfolio actions this iteration:",
                 *[f"- {action}" for action in report.get("portfolio_actions", [])],
                 "Notable scored headlines:",
@@ -566,6 +574,13 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             ("Risk posture", report.get("portfolio_risk_posture", "unavailable")),
             ("Holdings", report.get("portfolio_holdings", "unavailable")),
             ("Signal candidates", report.get("portfolio_candidates", "unavailable")),
+            ("Signal scan", report.get("portfolio_signal_summary", "unavailable")),
+            ("Rejected by gate", report.get("portfolio_rejection_summary", "unavailable")),
+            (
+                "Effective net-profit floor",
+                f"{report.get('portfolio_effective_minimum_profit', 'unavailable')} "
+                f"(configured {report.get('portfolio_configured_minimum_profit', 'unavailable')})",
+            ),
             (
                 "Effective max positions today",
                 f"{report.get('portfolio_effective_max_positions', 'unavailable')} "
@@ -618,6 +633,9 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         sections = "".join(
             [
                 self._email_kv_section("Snapshot", snapshot_rows),
+                self._email_bullet_section(
+                    "Rejected dip signals", report.get("portfolio_rejected_signals", [])
+                ),
                 self._email_bullet_section("Portfolio actions", report.get("portfolio_actions", [])),
                 self._email_kv_section("News & Risk Signals", signal_rows),
                 self._email_bullet_section(nightly_title, nightly_items),
@@ -1373,11 +1391,20 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         win_probability: float | None = None
         if returns:
             net_returns = np.asarray(returns, dtype=np.float64) - round_trip_cost
+            effective_profit_floor = decision_math.effective_profit_floor(
+                float(self.parameters["portfolio_min_expected_profit_percent"]),
+                str(self.parameters.get("portfolio_risk_posture", "conservative")),
+                float(
+                    self.parameters.get(
+                        "portfolio_risky_edge_floor_multiplier", 0.5
+                    )
+                ),
+            )
             walk_forward_returns = decision_math.walk_forward_net_returns(
                 returns,
                 round_trip_cost,
                 int(self.parameters.get("portfolio_oos_min_observations", 10)),
-                float(self.parameters["portfolio_min_expected_profit_percent"]),
+                effective_profit_floor,
             )
             mean_net_return = float(net_returns.mean())
             variance = float(net_returns.var())
@@ -1948,7 +1975,12 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 os.environ.get("ALPACA_API_KEY", ""),
                 os.environ.get("ALPACA_API_SECRET", ""),
             )
-            report["discovered_symbols"] = ", ".join(discovered) or "none"
+            report["discovered_symbol_count"] = len(discovered)
+            displayed = discovered[:20]
+            suffix = f" (+{len(discovered) - len(displayed)} more)" if len(discovered) > 20 else ""
+            report["discovered_symbols"] = (
+                f"{', '.join(displayed)}{suffix}" if displayed else "none"
+            )
             return list(dict.fromkeys(symbols + discovered))
         except Exception as exc:
             # Discovery cannot turn a provider outage into a trade decision.
@@ -2314,7 +2346,19 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         self._invalidate_orders_cache()
         self._quote_cache = {}
         minimum_observations = int(self.parameters["portfolio_min_signal_observations"])
-        minimum_profit = float(self.parameters["portfolio_min_expected_profit_percent"])
+        configured_minimum_profit = float(
+            self.parameters["portfolio_min_expected_profit_percent"]
+        )
+        risk_posture = str(
+            self.parameters.get("portfolio_risk_posture", "conservative")
+        )
+        minimum_profit = decision_math.effective_profit_floor(
+            configured_minimum_profit,
+            risk_posture,
+            float(
+                self.parameters.get("portfolio_risky_edge_floor_multiplier", 0.5)
+            ),
+        )
         oos_minimum_observations = int(
             self.parameters.get("portfolio_oos_min_observations", 10)
         )
@@ -2322,6 +2366,10 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             self.parameters.get("portfolio_oos_min_net_profit_percent", 0.0)
         )
         max_positions = int(self.parameters["portfolio_max_positions"])
+        report["portfolio_configured_minimum_profit"] = (
+            f"{configured_minimum_profit:.3f}%"
+        )
+        report["portfolio_effective_minimum_profit"] = f"{minimum_profit:.3f}%"
 
         managed_symbols = self._managed_portfolio_symbols()
         positions_result = self._portfolio_held_positions(managed_symbols)
@@ -2422,7 +2470,6 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
         # The risky/conservative reasoning pattern only reshapes ranking and
         # tie-breaking below; the eligibility floor two lines down still
         # gates on the raw historical expected_profit, unaffected by posture.
-        risk_posture = str(self.parameters.get("portfolio_risk_posture", "conservative"))
         llm_purchase_score = llm_assessment.score if llm_assessment.available else None
         pending_backfill = {
             str(signal["symbol"]): signal.get("_memory_history", [])
@@ -2482,18 +2529,55 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
                 signal["symbol_news_score"],
             )
         report["portfolio_risk_posture"] = risk_posture
-        eligible = [
-            signal
+        assessed_signals = [
+            (
+                signal,
+                decision_math.portfolio_signal_rejection_reason(
+                    signal,
+                    dip_threshold_percent=float(
+                        self.parameters["dip_threshold_percent"]
+                    ),
+                    minimum_observations=minimum_observations,
+                    minimum_profit_percent=minimum_profit,
+                    oos_minimum_observations=oos_minimum_observations,
+                    oos_minimum_profit_percent=oos_minimum_profit,
+                ),
+            )
             for signal in signals
-            if bool(signal.get("qualifies"))
-            and int(signal["observations"]) >= minimum_observations
-            and float(signal["expected_profit"]) >= minimum_profit
-            and int(signal["oos_observations"]) >= oos_minimum_observations
-            and signal["oos_expected_profit"] is not None
-            and float(signal["oos_expected_profit"]) >= oos_minimum_profit
-            and decision_math.learned_edge_allows_purchase(signal)
         ]
+        eligible = [signal for signal, reason in assessed_signals if reason is None]
         eligible.sort(key=lambda signal: (float(signal["posture_adjusted_edge"]), float(signal["dip"])), reverse=True)
+        rejection_counts: dict[str, int] = {}
+        for _signal, reason in assessed_signals:
+            if reason is not None:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+        unavailable_count = max(0, len(symbols) - len(signals))
+        if unavailable_count:
+            rejection_counts["unavailable or below liquidity floor"] = unavailable_count
+        raw_signal_count = sum(bool(signal.get("qualifies")) for signal in signals)
+        rejection_summary = ", ".join(
+            f"{reason}: {count}" for reason, count in sorted(rejection_counts.items())
+        ) or "none"
+        report["portfolio_signal_summary"] = (
+            f"{len(symbols)} scanned; {len(signals)} fully evaluated; "
+            f"{raw_signal_count} dip signals; {len(eligible)} eligible"
+        )
+        report["portfolio_rejection_summary"] = rejection_summary
+        rejected_signals = [
+            (signal, reason)
+            for signal, reason in assessed_signals
+            if bool(signal.get("qualifies")) and reason is not None
+        ]
+        rejected_signals.sort(
+            key=lambda item: float(item[0].get("expected_profit") or -math.inf),
+            reverse=True,
+        )
+        report["portfolio_rejected_signals"] = [
+            f"{signal['symbol']}: {reason}; dip {float(signal['dip']):.2f}%, "
+            f"net edge {float(signal['expected_profit']):+.3f}%"
+            for signal, reason in rejected_signals[:10]
+            if signal.get("expected_profit") is not None
+        ]
         opportunity_probability = opportunity.get("probability")
         opportunity_edge = opportunity.get("predicted_edge")
         opportunity_is_eligible = (
@@ -2509,10 +2593,19 @@ class AssetRotationStrategy(BrokerRuntimeSupport, Strategy):
             and float(opportunity_edge) >= minimum_profit
             and not self.vars.portfolio_iteration_state.get("opportunistic_swap_done", False)
         )
-        # Persist only positions the strategy actually owns. Merely qualifying
-        # a discovered ticker must not grant permission to manage a manual
-        # account position in that symbol. New buys are remembered on fill.
-        self._remember_discovered_symbols(sorted(held))
+        # Keep raw discovery dip signals in the short learned/recheck window,
+        # even when a later edge gate rejects them. `learned_symbols` affects
+        # observation only; ownership permission remains isolated in
+        # `owned_symbols` and is still written only after a confirmed fill.
+        promising_discovered = {
+            str(signal["symbol"])
+            for signal in signals
+            if bool(signal.get("qualifies"))
+            and str(signal["symbol"]) in discovery_only_symbols
+        }
+        self._remember_discovered_symbols(
+            sorted(set(held) | promising_discovered)
+        )
         report["portfolio_candidates"] = ", ".join(
             f"{s['symbol']} net {s['expected_profit']:+.2f}%/{s['observations']} "
             f"(posture {s['posture_adjusted_edge']:+.2f}%); "

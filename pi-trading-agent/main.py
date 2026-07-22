@@ -270,7 +270,10 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_STOP_LOSS_PERCENT": 0.5,
         "PORTFOLIO_HOLDING_HORIZON_MAX_DAYS": 15,
         "PORTFOLIO_AUTONOMOUS_DISCOVERY": False,
-        "PORTFOLIO_DISCOVERY_BATCH_SIZE": 12,
+        # 96 discovered names plus the four default ETFs fit one 100-symbol
+        # history chunk. Signal math is vectorized and quote work remains
+        # bounded, making this a practical Pi-sized market scan.
+        "PORTFOLIO_DISCOVERY_BATCH_SIZE": 96,
         "PORTFOLIO_DISCOVERY_REFRESH_DAYS": 7,
         "PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS": 5.0,
         "PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME": 100000,
@@ -279,6 +282,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "PORTFOLIO_MIN_ORDER_DOLLARS": 5.0,
         "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY": 0.55,
         "PORTFOLIO_RISK_POSTURE": "conservative",
+        "PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER": 0.5,
         "PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES": 210,
         "PORTFOLIO_NIGHTLY_PREEVAL_ENABLED": True,
     }
@@ -313,6 +317,9 @@ def load_config(path: Path) -> dict[str, Any]:
     portfolio_cash_reserve = float(config["PORTFOLIO_CASH_RESERVE_DOLLARS"])
     portfolio_min_order = float(config["PORTFOLIO_MIN_ORDER_DOLLARS"])
     opportunity_min_probability = float(config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"])
+    risky_edge_floor_multiplier = float(
+        config["PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER"]
+    )
     second_iteration_offset_minutes = int(config["PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"])
     # Autonomous discovery expands the daily candidate universe beyond the
     # static seed list, so the cap on concurrent positions shouldn't be tied
@@ -333,13 +340,14 @@ def load_config(path: Path) -> dict[str, Any]:
         ("PORTFOLIO_TAKE_PROFIT_PERCENT", portfolio_take_profit_percent, 0.05, 100),
         ("PORTFOLIO_STOP_LOSS_PERCENT", portfolio_stop_loss_percent, 0.05, 100),
         ("PORTFOLIO_HOLDING_HORIZON_MAX_DAYS", portfolio_holding_horizon_max_days, 1, 60),
-        ("PORTFOLIO_DISCOVERY_BATCH_SIZE", discovery_batch_size, 1, 30),
+        ("PORTFOLIO_DISCOVERY_BATCH_SIZE", discovery_batch_size, 1, 200),
         ("PORTFOLIO_DISCOVERY_REFRESH_DAYS", discovery_refresh_days, 1, 90),
         ("PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS", discovery_min_price, 0, 1000),
         ("PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME", discovery_min_avg_volume, 0, 100_000_000),
         ("PORTFOLIO_CASH_RESERVE_DOLLARS", portfolio_cash_reserve, 0, 1000),
         ("PORTFOLIO_MIN_ORDER_DOLLARS", portfolio_min_order, 1, 1000),
         ("PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY", opportunity_min_probability, 0.5, 0.95),
+        ("PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER", risky_edge_floor_multiplier, 0.1, 1.0),
         # Minutes after market open for the day's second evaluation. Lower
         # bound keeps it a meaningfully later, independent read rather than
         # a near-duplicate of the open window; upper bound keeps it inside
@@ -373,6 +381,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["PORTFOLIO_CASH_RESERVE_DOLLARS"] = portfolio_cash_reserve
     config["PORTFOLIO_MIN_ORDER_DOLLARS"] = portfolio_min_order
     config["PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY"] = opportunity_min_probability
+    config["PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER"] = risky_edge_floor_multiplier
     config["PORTFOLIO_SECOND_ITERATION_OFFSET_MINUTES"] = second_iteration_offset_minutes
 
     # Crypto trading runs as a separate process (main_crypto.py, its own
@@ -762,6 +771,7 @@ _PORTFOLIO_PARAMETER_KEYS = (
     "PORTFOLIO_MIN_ORDER_DOLLARS",
     "PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY",
     "PORTFOLIO_RISK_POSTURE",
+    "PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER",
     "NEWS_RSS_ENABLED",
     "NEWS_RSS_FEED_URLS",
     "SYMBOL_REFERENCE_ENABLED",

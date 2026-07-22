@@ -13,9 +13,7 @@ import numpy as np
 # How strongly the risky/conservative reasoning pattern reshapes a symbol's
 # historical edge in posture_adjusted_edge: conservative leans on consistency
 # (penalizing variance and bad-news days harder), risky leans on raw edge
-# (barely discounting variance or negative news). These never change the
-# expected-profit eligibility threshold itself, only which already-qualifying
-# candidate looks best and which holding looks weakest.
+# (barely discounting variance or negative news).
 POSTURE_VARIANCE_PENALTY = {"conservative": 0.6, "risky": 0.15}
 POSTURE_CONSISTENCY_WEIGHT = {"conservative": 1.0, "risky": 0.25}
 # The LLM score is a signed purchase signal: constructive assessments improve
@@ -32,6 +30,24 @@ POSTURE_LLM_SCORE_WEIGHT = {"conservative": 0.10, "risky": 0.15}
 POSTURE_LEARNED_EDGE_WEIGHT = {"conservative": 0.25, "risky": 0.6}
 POSTURE_MAX_ADJUSTMENT_PERCENT = 3.0
 SYMBOL_NEWS_SCORE_WEIGHT = 0.05
+
+
+def effective_profit_floor(
+    configured_floor_percent: float,
+    posture: str,
+    risky_multiplier: float = 0.5,
+) -> float:
+    """Return the posture-aware net-profit hurdle used by every entry gate.
+
+    Conservative mode preserves the configured hurdle. Risky mode can accept
+    a smaller *positive* measured edge, but never turns a positive configured
+    floor into permission to buy a forecasted loser.
+    """
+    configured = max(0.0, float(configured_floor_percent))
+    if str(posture).lower() != "risky":
+        return configured
+    multiplier = max(0.0, min(1.0, float(risky_multiplier)))
+    return configured * multiplier
 
 
 def llm_exposure_multiplier(llm_score: float | int | None) -> float:
@@ -55,6 +71,41 @@ def learned_edge_allows_purchase(
         return True
     learned_edge = signal.get("learned_edge")
     return learned_edge is not None and float(learned_edge) >= 0.0
+
+
+def portfolio_signal_rejection_reason(
+    signal: dict[str, float | int | str | bool | None],
+    *,
+    dip_threshold_percent: float,
+    minimum_observations: int,
+    minimum_profit_percent: float,
+    oos_minimum_observations: int,
+    oos_minimum_profit_percent: float,
+) -> str | None:
+    """Return the first entry gate a portfolio signal fails, or ``None``.
+
+    Keeping this classification beside the decision math prevents the email
+    diagnostics from becoming a second, subtly different eligibility path.
+    """
+    if float(signal.get("dip") or 0.0) < float(dip_threshold_percent):
+        return "below dip threshold"
+    if not bool(signal.get("qualifies")):
+        return "no comparable historical dips"
+    if int(signal.get("observations") or 0) < int(minimum_observations):
+        return "insufficient historical samples"
+    expected_profit = signal.get("expected_profit")
+    if expected_profit is None or float(expected_profit) < float(minimum_profit_percent):
+        return "historical edge below floor"
+    if int(signal.get("oos_observations") or 0) < int(oos_minimum_observations):
+        return "insufficient walk-forward samples"
+    oos_expected_profit = signal.get("oos_expected_profit")
+    if oos_expected_profit is None or float(oos_expected_profit) < float(
+        oos_minimum_profit_percent
+    ):
+        return "walk-forward edge below floor"
+    if not learned_edge_allows_purchase(signal):
+        return "learned edge veto"
+    return None
 
 
 def walk_forward_net_returns(
@@ -173,11 +224,11 @@ def qualified_position_count(
 ) -> int:
     """Return every fundable qualified slot up to the configured ceiling."""
     if configured_max_positions < 1:
-        return 1
+        return 0
     if available_symbol_count < 1 or total_capital <= 0 or min_order_dollars <= 0:
-        return 1
-    feasible_cap = max(1, int(total_capital // min_order_dollars))
-    return max(1, min(configured_max_positions, feasible_cap, available_symbol_count))
+        return 0
+    feasible_cap = int(total_capital // min_order_dollars)
+    return max(0, min(configured_max_positions, feasible_cap, available_symbol_count))
 
 
 def optimal_position_count(

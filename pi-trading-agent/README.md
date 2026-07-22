@@ -129,15 +129,16 @@ currently dipping is scored as a neutral `0%` expected edge (it is never
 force-rotated just because something else dipped).
 
 `PORTFOLIO_RISK_POSTURE` (`conservative` by default, or `risky`) reshapes how
-that ranking reads the same observations the agent already collects, without
-ever changing `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` itself or which
-candidates clear it in the first place. `conservative` favors a symbol with a
+that ranking reads the same observations the agent already collects.
+`conservative` preserves `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT`; `risky`
+multiplies that positive hurdle by `PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER`
+(default `0.5`) in both the historical and walk-forward selection paths.
+`conservative` favors a symbol with a
 steadier history — it penalizes return variance and a negative news-score day
 harder. `risky` favors raw historical edge — it barely discounts variance or a
-bad-news day. The adjustment is capped at ±3 percentage points, so it can
-reorder which qualifying candidate looks best and which holding looks
-weakest, but it can never turn a trade that fails the minimum-profit floor
-into one that passes.
+bad-news day. The ranking adjustment is capped at ±3 percentage points, and
+neither posture can bypass the walk-forward minimum or a negative learned-edge
+veto.
 
 Replacements are staged in two steps: the old position sells first, the
 replacement is bought as soon as the sale fills (only its sale budget is
@@ -187,8 +188,10 @@ fractional trading for the account and symbol.
 
 `PORTFOLIO_AUTONOMOUS_DISCOVERY` is a separate, off-by-default extension. It
 uses the Alpaca asset directory (the paper or live host matching the
-configured trading mode) to rotate through a small batch of active, tradable
-US-equity symbols each day. A discovered symbol is also checked, every day it
+configured trading mode) to rotate through a bounded batch of active, tradable
+US-equity symbols twice per trading day. The persisted order is hash-distributed
+across the market rather than alphabetically clustered, and the default batch
+of 96 plus the four default ETFs fits one 100-symbol history request. A discovered symbol is also checked, every day it
 is evaluated, against `PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS` and
 `PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME` — a low-priced or thinly traded symbol is
 dropped before the historical-dip criteria are even considered, since a small
@@ -420,7 +423,7 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_STOP_LOSS_PERCENT` | Unrealized loss (vs. the broker's own cost basis) at which a holding is sold, checked every iteration from the day it's bought | `0.5` |
 | `PORTFOLIO_HOLDING_HORIZON_MAX_DAYS` | Backstop: force-exits a holding after this many days regardless of price, even if neither the take-profit nor stop-loss bound has been hit | `15` |
 | `PORTFOLIO_AUTONOMOUS_DISCOVERY` | Lets portfolio mode gradually scan Alpaca's active US equities | `false` |
-| `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per daily scan (bounded to protect API usage) | `12` |
+| `PORTFOLIO_DISCOVERY_BATCH_SIZE` | New symbols evaluated per scan; default plus four seed ETFs fits one 100-symbol history chunk | `96` |
 | `PORTFOLIO_DISCOVERY_REFRESH_DAYS` | Days before the Alpaca asset directory is refreshed | `7` |
 | `PORTFOLIO_DISCOVERY_MIN_PRICE_DOLLARS` | Minimum last price for a symbol to stay in the evaluated universe; `0` disables | `5.0` |
 | `PORTFOLIO_DISCOVERY_MIN_AVG_VOLUME` | Minimum recent average daily share volume for a symbol to stay in the evaluated universe; `0` disables | `100000` |
@@ -428,7 +431,8 @@ source owner-readable only; never place secrets in command-line arguments.
 | `PORTFOLIO_CASH_RESERVE_DOLLARS` | Cash left uncommitted for price movement and fees | `2.0` |
 | `PORTFOLIO_MIN_ORDER_DOLLARS` | Smallest order the portfolio may submit | `5.0` |
 | `PORTFOLIO_OPPORTUNISTIC_MIN_PROBABILITY` | Historical A/B win probability required for an Opportunistic Opportunity (still limited to at most one A/B swap per day) | `0.55` |
-| `PORTFOLIO_RISK_POSTURE` | `conservative` favors consistency; `risky` gives the LLM opinion and learned edge more ranking weight. Never lowers `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` | `"conservative"` |
+| `PORTFOLIO_RISK_POSTURE` | `conservative` preserves the configured edge hurdle; `risky` uses the multiplier below while still enforcing walk-forward and learned-edge vetoes | `"conservative"` |
+| `PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER` | Fraction of `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` required in risky posture | `0.5` |
 | `EMAIL_REPORT_ENABLED` | Turns the daily summary on or off | `false` |
 | `EMAIL_SMTP_HOST` | Outgoing mail server | `"smtp.gmail.com"` |
 | `EMAIL_SMTP_PORT` | Outgoing mail server port | `587` |
@@ -1029,9 +1033,10 @@ Once at least `PORTFOLIO_MEMORY_MIN_OBSERVATIONS` pooled signals are settled
 (default 20) and fit correlation reaches `PORTFOLIO_MEMORY_MIN_CORRELATION`
 (default 0.10), the forecast is blended into that day's ranking. It can shift
 which already-qualifying candidate looks best or which current holding looks
-weakest, and a validated forecast below zero blocks a new entry. Raw
-`PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` and out-of-sample floors still apply,
-so learned memory can reject but cannot manufacture an otherwise invalid trade.
+weakest, and a validated forecast below zero blocks a new entry. A
+posture-adjusted positive `PORTFOLIO_MIN_EXPECTED_PROFIT_PERCENT` hurdle and
+the out-of-sample floors still apply, so learned memory can reject but cannot
+manufacture a losing trade.
 A risky posture leans into this learned edge
 more; a conservative posture trusts the raw historical backtest more until
 the learned edge has proven itself.
