@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
-from runtime_state import DuckDBStateStore
+from runtime_state import RuntimeStateStore, create_runtime_state_store
 from trade_memory import RotationForecast
 
 
@@ -103,16 +103,28 @@ class BrokerRuntimeSupport:
     """Common order, position, and restart-safe persistence helpers."""
 
     _RUNTIME_STATE_DATABASE_PARAMETER = "runtime_state_database_file"
+    _RUNTIME_STATE_REDIS_URL_PARAMETER = "runtime_state_redis_url"
+    _RUNTIME_STATE_REDIS_PREFIX_PARAMETER = "runtime_state_redis_prefix"
     _DELETE_EMPTY_ONLY_WHEN_NONE = False
 
-    def _runtime_state(self) -> DuckDBStateStore | None:
+    def _runtime_state(self) -> RuntimeStateStore | None:
         raw = self.parameters.get(self._RUNTIME_STATE_DATABASE_PARAMETER)
         if not raw:
             return None
         path = Path(str(raw))
+        redis_url = self.parameters.get(self._RUNTIME_STATE_REDIS_URL_PARAMETER)
+        redis_url = str(redis_url).strip() if redis_url else None
+        redis_prefix = self.parameters.get(self._RUNTIME_STATE_REDIS_PREFIX_PARAMETER)
+        redis_prefix = str(redis_prefix).strip() if redis_prefix else None
+        identity = ("redis" if redis_url else "duckdb", path, redis_url, redis_prefix)
         cached = getattr(self, "_runtime_state_store", None)
-        if cached is None or cached.database_path != path:
-            cached = DuckDBStateStore(path)
+        if cached is None or getattr(cached, "identity", None) != identity:
+            cached = create_runtime_state_store(
+                path,
+                redis_url=redis_url,
+                redis_key_prefix=redis_prefix,
+            )
+            cached.identity = identity
             self._runtime_state_store = cached
         return cached
 

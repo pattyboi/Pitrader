@@ -31,7 +31,7 @@ import rss_news
 import runtime_state
 import safe_http
 from portfolio_memory import PortfolioMemory, PortfolioMemoryInput
-from runtime_state import DuckDBStateStore
+from runtime_state import DuckDBStateStore, RedisStateStore
 from symbol_reference import SymbolReference
 from crypto_strategy import CryptoRotationStrategy, _crypto_asset_symbol_filter
 from strategy import AssetRotationStrategy
@@ -67,6 +67,10 @@ def test_config_secrets_can_be_supplied_without_storing_them_in_json(
     assert config["PORTFOLIO_DISCOVERY_BATCH_SIZE"] == 96
     assert config["PORTFOLIO_RISKY_EDGE_FLOOR_MULTIPLIER"] == pytest.approx(0.5)
     assert config["CRYPTO_MEMORY_MIN_CORRELATION"] == pytest.approx(0.10)
+    assert config["RUNTIME_STATE_REDIS_URL"] is None
+    assert config["RUNTIME_STATE_REDIS_PREFIX"] == "pi-trading:runtime:portfolio:"
+    assert config["CRYPTO_RUNTIME_STATE_REDIS_URL"] is None
+    assert config["CRYPTO_RUNTIME_STATE_REDIS_PREFIX"] == "pi-trading:runtime:crypto:"
 
 
 def test_live_trading_requires_an_independent_environment_acknowledgement(
@@ -600,6 +604,53 @@ def test_duckdb_runtime_state_allows_a_second_process(
     clock[0] = store._CACHE_TTL_SECONDS + 0.1
     assert store.get("one") == (True, 2)
     store.close()
+
+
+def test_redis_runtime_state_migrates_from_and_mirrors_to_duckdb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redis_values: dict[str, bytes] = {}
+
+    class FakeRedisConnection:
+        def __init__(self, url: str):
+            assert url == "redis://127.0.0.1:6379/0"
+
+        def command(self, command: str, *parts: str):
+            if command == "GET":
+                return redis_values.get(parts[0])
+            if command == "SET":
+                key, value = parts
+                redis_values[key] = value.encode("utf-8")
+                return "OK"
+            if command == "DEL":
+                redis_values.pop(parts[0], None)
+                return 1
+            raise AssertionError(f"unexpected Redis command: {command}")
+
+    monkeypatch.setattr(runtime_state, "_RedisConnection", FakeRedisConnection)
+    database_path = tmp_path / "runtime.duckdb"
+    backup_store = DuckDBStateStore(database_path)
+    backup_store.set("portfolio", {"symbols": ["SPY"]})
+    store = RedisStateStore(
+        "redis://127.0.0.1:6379/0",
+        key_prefix="test:portfolio:",
+        backup_store=backup_store,
+    )
+
+    assert store.get("portfolio") == (True, {"symbols": ["SPY"]})
+    assert redis_values["test:portfolio:portfolio"] == b'{"symbols":["SPY"]}'
+
+    store.set("portfolio", {"symbols": ["QQQ"]})
+    backup_store.close()
+    assert DuckDBStateStore(database_path).get("portfolio") == (
+        True,
+        {"symbols": ["QQQ"]},
+    )
+
+    store.delete("portfolio")
+    backup_store.close()
+    assert "test:portfolio:portfolio" not in redis_values
+    assert DuckDBStateStore(database_path).get("portfolio") == (False, None)
 
 
 def test_portfolio_runtime_state_migrates_legacy_json_to_duckdb(tmp_path: Path) -> None:

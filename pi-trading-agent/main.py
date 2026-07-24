@@ -257,6 +257,8 @@ def load_config(path: Path) -> dict[str, Any]:
     # Autonomous discovery, when enabled, expands the configured seed
     # watchlist through a bounded scan.
     portfolio_defaults = {
+        "RUNTIME_STATE_REDIS_URL": None,
+        "RUNTIME_STATE_REDIS_PREFIX": "pi-trading:runtime:portfolio:",
         "PORTFOLIO_SYMBOLS": [asset_a, asset_b],
         "PORTFOLIO_MAX_POSITIONS": 1,
         "PORTFOLIO_FILL_QUALIFIED_SLOTS": True,
@@ -288,6 +290,15 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in portfolio_defaults.items():
         config.setdefault(key, default)
+    if config["RUNTIME_STATE_REDIS_URL"] is not None:
+        redis_url = str(config["RUNTIME_STATE_REDIS_URL"]).strip()
+        if not redis_url.startswith("redis://"):
+            raise ValueError("RUNTIME_STATE_REDIS_URL must be null or a redis:// URL")
+        config["RUNTIME_STATE_REDIS_URL"] = redis_url
+    redis_prefix = str(config["RUNTIME_STATE_REDIS_PREFIX"]).strip()
+    if not redis_prefix:
+        raise ValueError("RUNTIME_STATE_REDIS_PREFIX must not be empty")
+    config["RUNTIME_STATE_REDIS_PREFIX"] = redis_prefix
     raw_symbols = config["PORTFOLIO_SYMBOLS"]
     if not isinstance(raw_symbols, list):
         raise TypeError("PORTFOLIO_SYMBOLS must be a JSON array of symbols")
@@ -393,6 +404,8 @@ def load_config(path: Path) -> dict[str, Any]:
     # (strategy.py) and CryptoRotationStrategy._account_half_value_dollars
     # (crypto_strategy.py) -- rather than a fixed configured dollar figure.
     crypto_defaults = {
+        "CRYPTO_RUNTIME_STATE_REDIS_URL": None,
+        "CRYPTO_RUNTIME_STATE_REDIS_PREFIX": "pi-trading:runtime:crypto:",
         "CRYPTO_ENABLED": False,
         "CRYPTO_SYMBOLS": ["BTC", "ETH"],
         "CRYPTO_MAX_POSITIONS": 1,
@@ -430,6 +443,17 @@ def load_config(path: Path) -> dict[str, Any]:
     }
     for key, default in crypto_defaults.items():
         config.setdefault(key, default)
+    if config["CRYPTO_RUNTIME_STATE_REDIS_URL"] is not None:
+        crypto_redis_url = str(config["CRYPTO_RUNTIME_STATE_REDIS_URL"]).strip()
+        if not crypto_redis_url.startswith("redis://"):
+            raise ValueError(
+                "CRYPTO_RUNTIME_STATE_REDIS_URL must be null or a redis:// URL"
+            )
+        config["CRYPTO_RUNTIME_STATE_REDIS_URL"] = crypto_redis_url
+    crypto_redis_prefix = str(config["CRYPTO_RUNTIME_STATE_REDIS_PREFIX"]).strip()
+    if not crypto_redis_prefix:
+        raise ValueError("CRYPTO_RUNTIME_STATE_REDIS_PREFIX must not be empty")
+    config["CRYPTO_RUNTIME_STATE_REDIS_PREFIX"] = crypto_redis_prefix
     _require_booleans(
         config,
         "CRYPTO_ENABLED",
@@ -744,6 +768,8 @@ _PORTFOLIO_PARAMETER_KEYS = (
     "ASSET_A",
     "ASSET_B",
     "CRYPTO_ENABLED",
+    "RUNTIME_STATE_REDIS_URL",
+    "RUNTIME_STATE_REDIS_PREFIX",
     "DIP_THRESHOLD_PERCENT",
     "RECENT_HIGH_LOOKBACK_DAYS",
     "EMAIL_REPORT_ENABLED",

@@ -37,3 +37,5 @@ They are separate processes, not one process with two Lumibot strategies, becaus
 ## Config
 
 `main.py`'s `load_config` validates the entire `config.json` in one place, including all `CRYPTO_*` keys. `config_support.select_parameters()` then maps validated uppercase keys to each strategy's lowercase runtime names, and `resolve_state_paths()` supplies disjoint file manifests. Equity reads `CRYPTO_ENABLED` to decide whether to reserve half the shared account value; there is no fixed `CRYPTO_CASH_ALLOCATION_DOLLARS` setting.
+
+Restart-critical runtime state (`BrokerRuntimeSupport._runtime_state()`) is transactional DuckDB (`.runtime_state.duckdb`) by default. Setting `RUNTIME_STATE_REDIS_URL` (and `CRYPTO_RUNTIME_STATE_REDIS_URL`) to a local `redis://` URL switches to `runtime_state.RedisStateStore`, a write-through accelerator that keeps the DuckDB file as the durable backup, migrates existing keys on first read, and falls back to DuckDB on any Redis miss or failure — so Redis is a pure accelerator and never the source of truth. Keys are namespaced by `*_REDIS_PREFIX`; the tabular learning stores stay on DuckDB.

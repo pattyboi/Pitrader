@@ -75,6 +75,8 @@ class CryptoRotationStrategy(BrokerRuntimeSupport, Strategy):
     """Run a dip-signal crypto rotation only while NYSE regular hours are closed."""
 
     _RUNTIME_STATE_DATABASE_PARAMETER = "crypto_runtime_state_database_file"
+    _RUNTIME_STATE_REDIS_URL_PARAMETER = "crypto_runtime_state_redis_url"
+    _RUNTIME_STATE_REDIS_PREFIX_PARAMETER = "crypto_runtime_state_redis_prefix"
     _DELETE_EMPTY_ONLY_WHEN_NONE = True
 
     parameters = {

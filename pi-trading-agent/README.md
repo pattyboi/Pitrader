@@ -226,7 +226,7 @@ pi-trading-agent/
 ├── config_support.py   Shared config-to-strategy parameter/path mapping helpers
 ├── trade_memory.py      DuckDB journal and learning from past Asset A/B rotation signals
 ├── portfolio_memory.py  DuckDB journal and pooled learning from every evaluated symbol's daily context
-├── runtime_state.py    Transactional DuckDB store for restart-critical process state
+├── runtime_state.py    Runtime-state stores for restart-critical process state
 ├── news_context.py     Recent-news retrieval and transparent risk scoring
 ├── rss_news.py         Optional free RSS headline ingestion (no API key)
 ├── article_filter.py   Optional full-article fetch/scoring for discovery-only red flags
@@ -256,7 +256,21 @@ The installer later creates `.venv/`, which contains an isolated Python
 environment. Do not edit that directory. Restart-critical equity state,
 including the most recently sent report date, holding dates, pending rotations,
 iteration windows, and nightly pre-evaluation results, is stored transactionally
-in `.runtime_state.duckdb`. Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
+in `.runtime_state.duckdb` by default. If `RUNTIME_STATE_REDIS_URL` is set to a
+local `redis://` URL, those hot runtime keys are read from Redis first and
+mirrored to the DuckDB file as a durable backup/migration source. Crypto uses
+the separate `CRYPTO_RUNTIME_STATE_REDIS_URL` and key prefix settings.
+Leave the Redis URLs as `null` unless the local Redis server is reachable and
+the URL includes any required authentication, for example
+`redis://:PASSWORD@127.0.0.1:6379/0` or
+`redis://USERNAME:PASSWORD@127.0.0.1:6379/0`. If Redis is enabled but
+temporarily unavailable, runtime-state reads and writes fall back to the DuckDB
+backup; the URL should still be correct to avoid repeated failed connection
+attempts. Redis only accelerates the small restart-critical key/value state.
+The tabular learning stores below stay on DuckDB because they depend on SQL
+queries and batched historical reads.
+
+Decision memory creates `.trade_memory.duckdb`, a local DuckDB database of market
 snapshots, decisions, and fills (never credentials or balances). Portfolio
 memory keeps its own DuckDB database, `.portfolio_memory.duckdb`, of every
 evaluated symbol's daily context and settled next-session returns (see
